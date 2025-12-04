@@ -9,7 +9,7 @@ time.sleep(0.5)
 fc.set_flight_mode(3)
 
 # 解锁
-fc.unlock()
+fc.unlock()         #kadhfahlahiuhadfhdhdfakhahu
 time.sleep(2)
 
 # 起飞
