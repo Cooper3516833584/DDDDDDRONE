@@ -30,6 +30,7 @@ class Mission(object):
     def stop(self):
         self.navi.stop()
         logger.info("[MISSION] Mission stopped")
+
     def __init__(self, **kwargs):
         self.fc: FC_Like = kwargs["fc"]
         self.radar: LD_Radar = kwargs["radar"]
@@ -45,7 +46,14 @@ class Mission(object):
         fc.set_indicator_led(0, 0, 0)
         fc.set_action_log(True)
         logger.info("[MISSION] Mission Started")
+        time.sleep(1)
         navi.calibrate_basepoint()
+        while True:
+            time.sleep(0.5)
+            logger.info(navi.current_point)
+            if navi.current_point[0] != 0 or navi.current_point[1] != 0:
+                break
+        # navi.calibrate_basepoint()
         navi.pointing_takeoff((0, 0), CUREISE_HEIGHT)
         navi.set_yaw(0)
         navi.wait_for_yaw()
