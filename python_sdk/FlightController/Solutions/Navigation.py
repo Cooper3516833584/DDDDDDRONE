@@ -317,11 +317,16 @@ class Navigation(object):
             logger.warning("[NAVI] Radar pose timeout")
             return None
         self.radar.rt_pose_update_event.clear()
+
         current_x, current_y, current_yaw = self.radar.rt_pose
         current_x -= self.basepoint[0]
         current_y -= self.basepoint[1]
         logger_dbg.debug(f"[NAVI] Radar pose: {current_x}, {current_y}, {current_yaw}")
-        return current_x, current_y, current_yaw, current_x + current_y != 0
+
+
+        inited = getattr(self.radar, "_rt_pose_inited", [True, True, True])
+        available = bool(getattr(self.radar, "_rtpose_flag", False) and all(inited))
+        return float(current_x), float(current_y), float(current_yaw), available
 
     def _get_fusion_pose(self) -> Optional[Tuple[float, float, float, bool]]:
         if self.radar.rt_pose_update_event.is_set():
@@ -479,7 +484,16 @@ class Navigation(object):
         traj_list.append(waypoint)
         self.navigation_follow_trajectory(traj_list, wait=wait)  # type: ignore
 
-    def navigation_around_waypoint(self, waypoint, wait=True, dt: float = 1, degree: float = 2*np.pi, mode = "counterclockwise"):
+    def navigation_around_waypoint(
+            self,
+            waypoint,
+            wait=True,
+            dt: float = 0.2,
+            degree: float = 2 * np.pi,
+            mode: str = "counterclockwise",
+            radius: Optional[float] = None,
+            pos_thres: float = 10.0,
+    ):
         """
         创建圆形轨迹并让无人机进行圆形巡航
         waypoint: (x, y, [z]) 圆心坐标 / cm / 匿名(ROS)坐标系 / 基地原点
@@ -488,80 +502,136 @@ class Navigation(object):
         degree: 转过的角度 / rad
         mode: 转向 / 默认为俯视逆时针
         """
-        logger.debug(f"[NAVI] Navigation in a circle around waypoint: {waypoint}")
-        
-        waypoint_cur = np.array([self.current_x, self.current_y])
-        radius = np.linalg.norm(np.array(waypoint) - np.array(waypoint_cur)) 
-        first_angle = np.arctan2(waypoint_cur[1] - waypoint[1], waypoint_cur[0] - waypoint[0])  # 计算起始角度
-        angle = first_angle
-        angle_increment = dt * 35 / radius
-        traj_list = []
-        
-        if mode == "counterclockwise":
-            angle += degree
-            while angle > first_angle:
-                x = waypoint[0] + radius * np.cos(angle)
-                y = waypoint[1] + radius * np.sin(angle)
-                z = self.current_height  # 高度不变
-                traj_list.append([x, y, z])
-                angle -= angle_increment
-            traj_list.append([waypoint[0] + radius*np.cos(first_angle), waypoint[1] + radius*np.sin(first_angle), self.current_height])
-            traj_list.reverse()
-        if mode == "clockwise":
-            angle -= degree
-            while angle <= first_angle:
-                x = waypoint[0] + radius * np.cos(angle)
-                y = waypoint[1] + radius * np.sin(angle)
-                z = self.current_height  # 高度不变
-                traj_list.append([x, y, z])
-                angle += angle_increment
-            traj_list.append([waypoint_cur[0], waypoint_cur[1], self.current_height])
-            traj_list.reverse()
-        
-        self.navigation_follow_trajectory(traj_list, wait=wait)  # type: ignore
+        center = np.asarray(waypoint[:2], dtype=float)
+        cur = np.asarray([float(self.current_x), float(self.current_y)], dtype=float)
 
-    def _trajectory_task(self, traj_list: Union[List[Tuple[float, ...]], np.ndarray]):
+        r_meas = float(np.linalg.norm(cur - center))
+        r = float(r_meas if radius is None else radius)
+        r = max(r, 1e-3)
+
+        start_angle = float(np.arctan2(cur[1] - center[1], cur[0] - center[0]))
+
+        if mode not in ("counterclockwise", "clockwise"):
+            raise ValueError("mode must be 'counterclockwise' or 'clockwise'")
+
+        direction = 1.0 if mode == "counterclockwise" else -1.0
+        total = float(abs(degree))
+
+        speed = float(max(self.navi_speed, 1e-3))
+        dt = float(max(dt, 1e-3))
+
+        # 角步进：v*dt/r
+        angle_step = speed * dt / r
+        steps = int(np.ceil(total / angle_step))
+        steps = max(steps, 1)
+
+        angles = start_angle + direction * np.linspace(0.0, total, steps + 1)
+
+        # 高度保持：优先用定高目标值（更稳），否则用当前高度
+        z = float(self.height_pid.setpoint if self.keep_height_flag else self.current_height)
+
+        traj_list = []
+        for a in angles:
+            x = float(center[0] + r * np.cos(a))
+            y = float(center[1] + r * np.sin(a))
+            traj_list.append([x, y, z])
+
+        self.navigation_follow_trajectory(traj_list, wait=wait, pos_thres=pos_thres)
+ 
+    def _trajectory_task(
+        self,
+        traj_list: Union[List[Tuple[float, ...]], np.ndarray],
+        pos_thres: float = 10.0,
+        timeout_per_point: float = 6.0,
+    ):
+        """
+        轨迹跟随任务（改进版）
+        - 改成：先设置目标点 -> 再等待到达（避免“先等旧目标达成再切点”的跳点问题）
+        - 用欧式距离判定是否到点（更适合绕圆）
+        - 支持pos_thres（绕杆建议8~12cm）
+        """
         logger.debug("[NAVI] Trajectory task started")
         self.traj_running_event.set()
+
+        pos_thres = float(max(pos_thres, 1.0))
+        th2 = pos_thres * pos_thres
+
         len_t = len(traj_list)
+
         for n, point in enumerate(traj_list):
-            while not self._reached_waypoint(30):
-                time.sleep(0.02)
-                if not self.traj_running_event.is_set():
-                    self.traj_running_event.set()
-                    logger.debug("[NAVI] Trajectory task forced to stop")
-                    self.traj_list_before_stop = traj_list[n:]
-                    return
-                if not (self.running and self.navigation_flag):
-                    logger.debug("[NAVI] Trajectory task forced to stop")
-                    return
+            if not (self.running and self.navigation_flag):
+                logger.debug("[NAVI] Trajectory task forced to stop (nav not running)")
+                return
+
+            # 外部请求停止：clear event
+            if not self.traj_running_event.is_set():
+                self.traj_running_event.set()
+                logger.debug("[NAVI] Trajectory task forced to stop")
+                self.traj_list_before_stop = traj_list[n:]
+                return
+
             x, y = float(point[0]), float(point[1])
             self.navi_x_pid.setpoint = x
             self.navi_y_pid.setpoint = y
             if len(point) > 2:
                 self.height_pid.setpoint = float(point[2])
+
             self.traj_progress = (n + 1) / len_t
-            # logger.debug(f"[NAVI] Trajectory task: {x}, {y}")
+
+            # 等待到达当前点
+            t0 = time.perf_counter()
+            while True:
+                time.sleep(0.02)
+
+                if not self.traj_running_event.is_set():
+                    self.traj_running_event.set()
+                    logger.debug("[NAVI] Trajectory task forced to stop")
+                    self.traj_list_before_stop = traj_list[n:]
+                    return
+
+                if not (self.running and self.navigation_flag):
+                    logger.debug("[NAVI] Trajectory task forced to stop (nav not running)")
+                    return
+
+                dx = float(self.current_x) - x
+                dy = float(self.current_y) - y
+                if dx * dx + dy * dy <= th2:
+                    break
+
+                if timeout_per_point > 0 and (time.perf_counter() - t0) > timeout_per_point:
+                    logger.warning("[NAVI] Trajectory point timeout, skipping to next point")
+                    break
+
         self.traj_running_event.clear()
         logger.debug("[NAVI] Trajectory task finished")
 
-    def navigation_follow_trajectory(self, traj_list: Union[List[Tuple[float, ...]], np.ndarray], wait=True):
+    def navigation_follow_trajectory(
+        self,
+        traj_list: Union[List[Tuple[float, ...]], np.ndarray],
+        wait=True,
+        pos_thres: float = 10.0,
+    ):
         """
-        跟随轨迹导航
-
-        traj_list: 轨迹点列表 / cm / 匿名(ROS)坐标系 / 基地原点
-        wait: 是否阻塞直到到达目标点
+        跟随轨迹导航（改进版）
+        - 允许传入pos_thres并传递给轨迹任务
         """
         logger.debug(f"[NAVI] Running on trajectory with {len(traj_list)} points")
         self.navi_x_pid.tunings = self.pid_tunings["navi"]
         self.navi_y_pid.tunings = self.pid_tunings["navi"]
         self.navi_x_pid.output_limits = (-self.navi_speed, self.navi_speed)
         self.navi_y_pid.output_limits = (-self.navi_speed, self.navi_speed)
+
         if wait:
-            self._trajectory_task(traj_list)
-            self.wait_for_waypoint()
+            self._trajectory_task(traj_list, pos_thres=pos_thres)
+            # 最后一段再确认一次到点（用更小阈值更贴轨）
+            self.wait_for_waypoint(time_thres=0.5, pos_thres=max(8, int(pos_thres)), timeout=10)
         else:
-            t = threading.Thread(target=self._trajectory_task, args=(traj_list,), daemon=True)
+            t = threading.Thread(
+                target=self._trajectory_task,
+                args=(traj_list,),
+                kwargs={"pos_thres": pos_thres},
+                daemon=True,
+            )
             t.start()
             self._thread_list.append(t)
             self.traj_running_event.wait()
@@ -667,7 +737,17 @@ class Navigation(object):
             and abs(self.current_y - self.navi_y_pid.setpoint) < pos_thres
         )
 
-    def pointing_takeoff(self, point, target_height=140):
+    def pointing_takeoff(
+            self,
+            point,
+            target_height=140,
+            first_lift=60,
+            lock_pos_thres=15,
+            lock_pos_time=1.0,
+            lock_timeout=12,
+            hover_timeout=12,
+            height_timeout=15,
+    ):
         """
         定点起飞
 
@@ -675,27 +755,49 @@ class Navigation(object):
         target_height: 起飞高度 / cm
         """
         logger.info(f"[NAVI] Takeoff at {point}")
+
+        # 1) 起飞阶段先关掉闭环，避免线程在不合适的模式下干预
         self.navigation_flag = False
         self.keep_height_flag = False
-        self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
-        self.fc.unlock()
-        # inital_yaw = self.fc.state.yaw.value
-        time.sleep(2)  # 等待电机启动
-        self.fc.take_off(60)
-        time.sleep(8)
-        #self.fc.wait_for_takeoff_done(timeout_s=9)
 
-        # self.fc.set_yaw(inital_yaw, 25)
-        self.fc.wait_for_hovering(2)
-        ######## 闭环定高
+        # 2) 程控模式 + 解锁 + 一键起飞抬离地面
+        self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
+        if not self.fc.state.unlock.value:
+            self.fc.unlock()
+        time.sleep(1.5)  # 给电机启动一点时间
+
+        self.fc.take_off(int(first_lift))
+
+        # 不再硬等8秒：直接等悬停稳定（更快更可靠）
+        self.fc.wait_for_hovering(hover_timeout)
+
+        # 3) 切到定点模式，准备开启“水平锁点 + 定高”
         self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
-        self.set_height(target_height)
-        self.keep_height_flag = True
-        self.wait_for_height()
-        self.direct_set_waypoint(point)  # 初始化路径点
-        self.switch_pid("hover")
         time.sleep(0.1)
+
+        # 先把当前高度作为定高起点，避免切模式瞬间高度漂
+        try:
+            h_now = float(self.fc.state.alt_add.value)
+        except Exception:
+            h_now = float(first_lift)
+        self.set_height(max(h_now, float(first_lift)))
+        self.keep_height_flag = True
+
+        # 4) 立刻锁点到目标point（只取x,y；高度由set_height控制）
+        self.switch_pid("hover")
+        self.direct_set_waypoint([float(point[0]), float(point[1])])
         self.navigation_flag = True
+
+        # 低高度先把位置锁回point，再爬高（解决“先飘很久后才回原点”）
+        self.wait_for_waypoint(
+            time_thres=lock_pos_time,
+            pos_thres=lock_pos_thres,
+            timeout=lock_timeout,
+        )
+
+        # 5) 在锁点状态下爬升到目标高度（原地竖直爬升）
+        self.set_height(float(target_height))
+        self.wait_for_height(timeout=height_timeout)
 
     def pointing_landing(self, point):
         """

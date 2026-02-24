@@ -168,14 +168,16 @@ class Mission(object):
             logger.warning(f"[CAM] Failed to set WB: {e}")
 
     def snap_from_frame(self, frame, tag: str):
-        if frame is None: return
+        if frame is None:
+            return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         save_path = os.path.join(self.photos_dir, "%s_%s.jpg" % (tag, ts))
         cv2.imwrite(save_path, frame)
         logger.info("[CAM] Snapshot saved: %s" % save_path)
 
     def snap_at_point(self, tag: str):
-        if self.cam is None: return
+        if self.cam is None:
+            return
         frame_to_save = None
         if self.vision_task.running:
             _, _, _, frame_to_save = self.vision_task.get_result()
@@ -184,7 +186,8 @@ class Mission(object):
                 self.cam.grab()
                 time.sleep(0.01)
             ret, tmp = self.cam.read()
-            if ret: frame_to_save = tmp
+            if ret:
+                frame_to_save = tmp
 
         if frame_to_save is not None:
             self.snap_from_frame(frame_to_save, tag)
@@ -200,7 +203,11 @@ class Mission(object):
         circle_speed = 15
         cruise_height = 125
         vertical_speed = 20
-        R = 77  # 安全半径
+        R = 77   # 安全半径（cm）
+
+        # 绕杆参数（配合 Navigation.py 的修复：更密轨迹 + 更严到点阈值）
+        CIRCLE_DT = 0.2
+        CIRCLE_POS_THRES = 10  # cm，建议 8~12
 
         # ---------- 启动导航 ----------
         navi.set_navigation_speed(navigation_speed)
@@ -212,6 +219,7 @@ class Mission(object):
             navi.start("radar")
 
         logger.info("[MISSION] Navigation started (radar)")
+
         # 给雷达 5-6 秒预热防止超时
         time.sleep(6.0)
 
@@ -222,6 +230,7 @@ class Mission(object):
         fc.set_action_log(True)
         logger.info("[MISSION] Mission Started")
 
+        # 注意：pointing_takeoff 已在 Navigation.py 中修复为“低高度先锁点再爬高”
         navi.pointing_takeoff(BASE_POINT, cruise_height)
         navi.set_yaw(0)
         navi.wait_for_yaw()
@@ -295,7 +304,7 @@ class Mission(object):
                 logger.info("[MISSION] Arrived at B_safe area")
                 break
 
-            # 起飞保护 (1米)
+            # 起飞保护（避免刚出发时误触发中途停）
             if dist_from_start < 15:
                 time.sleep(0.1)
                 continue
@@ -325,9 +334,6 @@ class Mission(object):
         # ==========================================
         # 3. 绕 B 半圈 (外侧) -> 到达 B_back
         # ==========================================
-        # 几何分析：从下方(B_safe) 绕到 上方(B_back)
-        # 假设B在右侧，逆时针(CCW)是从外侧绕行; 若B在左侧，CCW是内侧。
-        # 这里默认采用逆时针 (Counter-Clockwise) 形成胶囊形状
         navi.set_navigation_speed(circle_speed)
         time.sleep(0.5)
 
@@ -335,8 +341,11 @@ class Mission(object):
         navi.navigation_around_waypoint(
             waypoint=Pole_B_Center,
             wait=True,
-            degree=np.pi,  # 半圈 (180度)
-            mode="counterclockwise"  # 逆时针: 下 -> 右 -> 上
+            degree=np.pi,                  # 半圈
+            mode="counterclockwise",        # 下 -> 右 -> 上
+            radius=R,                      # 固定安全半径，避免贴杆
+            dt=CIRCLE_DT,                  # 更密轨迹点
+            pos_thres=CIRCLE_POS_THRES,    # 更严到点阈值，减少切弦
         )
         logger.info("[MISSION] Reached B Back side")
 
@@ -346,15 +355,12 @@ class Mission(object):
         navi.set_navigation_speed(navigation_speed)
         logger.info(f"[MISSION] Fly linear to A Back: {A_back}")
 
-        # 此时飞机已经在 B_back 附近了，直接飞去 A_back
         navi.navigation_to_waypoint(A_back, wait=True)
         logger.info("[MISSION] Reached A Back side")
 
         # ==========================================
         # 5. 绕 A 半圈 (外侧) -> 回到 A_safe
         # ==========================================
-        # 几何分析：从上方(A_back) 绕回 下方(A_safe)
-        # 继续逆时针 (CCW) 即可形成闭环
         navi.set_navigation_speed(circle_speed)
         time.sleep(0.5)
 
@@ -362,8 +368,11 @@ class Mission(object):
         navi.navigation_around_waypoint(
             waypoint=Pole_A_Center,
             wait=True,
-            degree=np.pi,  # 半圈
-            mode="counterclockwise"  # 逆时针: 上 -> 左 -> 下
+            degree=np.pi,                  # 半圈
+            mode="counterclockwise",        # 上 -> 左 -> 下
+            radius=R,
+            dt=CIRCLE_DT,
+            pos_thres=CIRCLE_POS_THRES,
         )
         logger.info("[MISSION] Returned to A_safe")
 
@@ -401,7 +410,8 @@ if __name__ == "__main__":
                 fc.stablize()
                 fc.land()
                 for _ in range(100):
-                    if fc.state.alt_add.value < 10: break
+                    if fc.state.alt_add.value < 10:
+                        break
                     time.sleep(0.1)
                 fc.lock()
         except Exception:
