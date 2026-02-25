@@ -161,7 +161,6 @@ class Mission(object):
         logger.info("[CAM] Camera opened: %s" % name)
 
         try:
-            self.cam.set(cv2.CAP_PROP_AUTO_WB, 0)
             self.cam.set(cv2.CAP_PROP_WB_TEMPERATURE, 4600)
             logger.info("[CAM] WB Locked (Temp: 4600)")
         except Exception as e:
@@ -201,7 +200,7 @@ class Mission(object):
 
         navigation_speed = 25
         circle_speed = 15
-        cruise_height = 125
+        cruise_height = 110
         vertical_speed = 20
         R = 77   # 安全半径（cm）
 

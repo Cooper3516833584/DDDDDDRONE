@@ -749,10 +749,10 @@ class Navigation(object):
             height_timeout=15,
     ):
         """
-        定点起飞
-
-        point: (x, y) 坐标 / cm / 匿名(ROS)坐标系 / 基地原点
-        target_height: 起飞高度 / cm
+        定点起飞（修复版）
+        - 修复问题：在地面时 self.fc.hovering 可能本来就为 True，导致 wait_for_hovering() 立即返回，
+          随后切模式/开导航会把 take_off 指令“打断”，表现为电机不转、飞机不抬。
+        - 做法：take_off 后先等待“起飞确实开始/完成”（vel_z/alt_add 变化），再等待进入悬停稳定。
         """
         logger.info(f"[NAVI] Takeoff at {point}")
 
@@ -760,18 +760,43 @@ class Navigation(object):
         self.navigation_flag = False
         self.keep_height_flag = False
 
-        # 2) 程控模式 + 解锁 + 一键起飞抬离地面
+        # 2) 程控模式 + 解锁
         self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
         if not self.fc.state.unlock.value:
             self.fc.unlock()
-        time.sleep(1.5)  # 给电机启动一点时间
 
-        self.fc.take_off(int(first_lift))
+        # 等解锁状态回传（有些设备回传慢）
+        t0 = time.perf_counter()
+        while not self.fc.state.unlock.value and (time.perf_counter() - t0) < 3.0:
+            time.sleep(0.05)
 
-        # 不再硬等8秒：直接等悬停稳定（更快更可靠）
+        time.sleep(0.8)  # 给电机/状态一个缓冲时间
+
+        # 3) 一键起飞抬离地面
+        lift = int(max(40, first_lift))
+        self.fc.take_off(lift)
+
+        # 关键：等待起飞“确实开始/完成”，避免 hover 状态误判导致立即切模式打断起飞
+        time.sleep(0.8)  # 让 command_now / vel_z 有时间更新
+        ok = False
+        try:
+            ok = self.fc.wait_for_takeoff_done(timeout_s=8)
+        except TypeError:
+            # 兼容旧版接口
+            ok = self.fc.wait_for_takeoff_done(4, 8)
+
+        # 兜底：如果 vel_z 阈值没触发，但高度已经抬起来，也算起飞成功
+        try:
+            alt_now = float(self.fc.state.alt_add.value)
+        except Exception:
+            alt_now = 0.0
+        if (not ok) and alt_now < 10:
+            raise RuntimeError("[NAVI] Takeoff did not start (alt_add < 10cm). Check unlock/mode/propellers/FC safety.")
+
+        # 起飞完成后等待进入悬停稳定（此时 hovering 的判断才有意义）
         self.fc.wait_for_hovering(hover_timeout)
 
-        # 3) 切到定点模式，准备开启“水平锁点 + 定高”
+        # 4) 切到定点模式，准备开启“水平锁点 + 定高”
         self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
         time.sleep(0.1)
 
@@ -779,23 +804,23 @@ class Navigation(object):
         try:
             h_now = float(self.fc.state.alt_add.value)
         except Exception:
-            h_now = float(first_lift)
-        self.set_height(max(h_now, float(first_lift)))
+            h_now = float(lift)
+        self.set_height(max(h_now, float(lift)))
         self.keep_height_flag = True
 
-        # 4) 立刻锁点到目标point（只取x,y；高度由set_height控制）
+        # 5) 立刻锁点到目标 point（只取 x,y；高度由 set_height 控制）
         self.switch_pid("hover")
         self.direct_set_waypoint([float(point[0]), float(point[1])])
         self.navigation_flag = True
 
-        # 低高度先把位置锁回point，再爬高（解决“先飘很久后才回原点”）
+        # 低高度先把位置锁回 point，再爬高（解决“先飘很久后才回原点”）
         self.wait_for_waypoint(
             time_thres=lock_pos_time,
             pos_thres=lock_pos_thres,
             timeout=lock_timeout,
         )
 
-        # 5) 在锁点状态下爬升到目标高度（原地竖直爬升）
+        # 6) 在锁点状态下爬升到目标高度（原地竖直爬升）
         self.set_height(float(target_height))
         self.wait_for_height(timeout=height_timeout)
 
