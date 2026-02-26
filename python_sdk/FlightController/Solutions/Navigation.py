@@ -824,41 +824,80 @@ class Navigation(object):
         self.set_height(float(target_height))
         self.wait_for_height(timeout=height_timeout)
 
-    def pointing_landing(self, point):
+    def pointing_landing(
+        self,
+        point,
+        approach_height=35,
+        approach_pos_thres=12,
+        settle_time_thres=0.5,
+        settle_timeout=4,
+        height_timeout=5,
+        touchdown_alt_thres=8,
+        touchdown_timeout=12,
+        lock_timeout=4,
+    ):
         """
-        定点降落
+        定点降落(快速版)
 
         point: (x, y) / cm / 匿名(ROS)坐标系 / 基地原点
+        approach_height: 进入自动降落前的对点高度 / cm
         """
         logger.info(f"[NAVI] Landing at {point}")
+        x, y = float(point[0]), float(point[1])
+
+        # 阶段1: 在HOLD_POS下先对点并下探到较低高度(减少低空长时间悬停)
         self.navigation_flag = True
         self.keep_height_flag = True
-        self.navigation_to_waypoint(point)
-        self.wait_for_waypoint() # 2024/3/9 +
-
-        ########  方案 1  ########
         self.switch_pid("land")
-        time.sleep(0.5)
-        self.set_height(50)
-        self.wait_for_height()
-        self.navigation_to_waypoint(point) # 2024/3/9 +
-        self.wait_for_waypoint() # 2024/3/9 +
-        self.set_height(30)
-        time.sleep(1.5)
-        self.navigation_to_waypoint(point) # 2024/3/9 +
-        self.wait_for_waypoint() # 2024/3/9 +
-        self.set_height(20)
-        time.sleep(2)
-        self.navigation_to_waypoint(point) # 2024/3/9 +
-        self.wait_for_waypoint() 
-        self.set_height(0)
+        self.navigation_to_waypoint([x, y], wait=True)
+        self.wait_for_waypoint(
+            time_thres=max(0.3, float(settle_time_thres)),
+            pos_thres=max(8, int(approach_pos_thres)),
+            timeout=max(1.0, float(settle_timeout)),
+        )
 
-        # self.fc.land()
-        time.sleep(3)
-        # self.fc.wait_for_lock(5)
-        self.fc.lock()
+        self.set_height(float(max(10, approach_height)))
+        self.wait_for_height(time_thres=0.3, height_thres=10, timeout=max(1.0, float(height_timeout)))
+        self.direct_set_waypoint([x, y])
+        self.wait_for_waypoint(
+            time_thres=0.3,
+            pos_thres=max(8, int(approach_pos_thres)),
+            timeout=max(1.0, float(settle_timeout)),
+        )
+
+        # 阶段2: 关闭导航闭环，切给飞控一键降落，避免PID慢速“磨地”
         self.navigation_flag = False
         self.keep_height_flag = False
+        self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
+        time.sleep(0.1)
+        self.fc.stablize()
+        self.fc.land()
+
+        # 等待落地(高度足够低或飞控已自动上锁)
+        t0 = time.perf_counter()
+        landed = False
+        alt_thres = float(max(3, touchdown_alt_thres))
+        while time.perf_counter() - t0 < max(1.0, float(touchdown_timeout)):
+            time.sleep(0.1)
+            try:
+                alt_now = float(self.fc.state.alt_add.value)
+            except Exception:
+                alt_now = 999.0
+            if alt_now <= alt_thres or (not self.fc.state.unlock.value):
+                landed = True
+                break
+
+        if not landed:
+            logger.warning("[NAVI] Landing timeout, force lock")
+            self.fc.lock()
+            return
+
+        try:
+            ok = self.fc.wait_for_lock(timeout_s=lock_timeout)
+        except TypeError:
+            ok = self.fc.wait_for_lock(lock_timeout)
+        if not ok:
+            self.fc.lock()
 
     def _waypoint_param_switch(self):
         tuning = self.pid_tunings["hover"]
