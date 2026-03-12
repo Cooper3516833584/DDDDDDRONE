@@ -499,7 +499,7 @@ class Navigation(object):
         waypoint: (x, y, [z]) 圆心坐标 / cm / 匿名(ROS)坐标系 / 基地原点
         wait: 是否阻塞直到完成圆形巡航
         dt: 轨迹精度 / s
-        degree: 转过的角度 / rad
+        degree: 转过的角度 / rad，可为负值，负值表示反向（与mode指定的方向相反）
         mode: 转向 / 默认为俯视逆时针
         """
         center = np.asarray(waypoint[:2], dtype=float)
@@ -514,7 +514,7 @@ class Navigation(object):
         if mode not in ("counterclockwise", "clockwise"):
             raise ValueError("mode must be 'counterclockwise' or 'clockwise'")
 
-        direction = 1.0 if mode == "counterclockwise" else -1.0
+        direction = (1.0 if mode == "counterclockwise" else -1.0) * (1.0 if degree >= 0 else -1.0)
         total = float(abs(degree))
 
         speed = float(max(self.navi_speed, 1e-3))
