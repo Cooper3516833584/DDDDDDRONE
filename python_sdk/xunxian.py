@@ -11,7 +11,7 @@ from loguru import logger
 from FlightController.Solutions import Vision
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
-from FlightController.Solutions.Navigation import Navigation
+from FlightController.Solutions.Navigation import Navigation, PARAMS
 
 BASE_POINT = np.array([0.0, 0.0], dtype=float)
 LANDING_POINT = np.array([0.0, 0.0], dtype=float)
@@ -166,6 +166,26 @@ class Mission(object):
         except Exception as e:
             logger.warning(f"[CAM] Failed to set WB: {e}")
 
+    def wait_for_radar_pose_ready(self, timeout_sec: float = 8.0):
+        """
+        Wait until radar pose stream has at least one update.
+        This gives a clear failure reason before basepoint calibration.
+        """
+        deadline = time.perf_counter() + timeout_sec
+        while time.perf_counter() < deadline:
+            if self.radar.rt_pose_update_event.wait(0.2):
+                self.radar.rt_pose_update_event.clear()
+                logger.info("[MISSION] Radar pose stream ready")
+                return
+
+        if not self.radar.connected:
+            raise RuntimeError(
+                "Radar data not received from FC. Check radar wiring/forwarding on flight controller."
+            )
+        raise RuntimeError(
+            "Radar connected but pose is not updated. Check radar packet stream and solver parameters."
+        )
+
     def snap_from_frame(self, frame, tag: str):
         if frame is None:
             return
@@ -209,6 +229,10 @@ class Mission(object):
         CIRCLE_POS_THRES = 10  # cm，建议 8~12
 
         # ---------- 启动导航 ----------
+        # Diagnostic setting for low-rate radar streams: trigger map/pose resolve on every radar update.
+        PARAMS.RADAR_SKIP = 1
+        logger.warning("[MISSION] PARAMS.RADAR_SKIP overridden to 1 for radar diagnostics")
+
         navi.set_navigation_speed(navigation_speed)
         navi.set_vertical_speed(vertical_speed)
 
@@ -219,11 +243,11 @@ class Mission(object):
 
         logger.info("[MISSION] Navigation started (radar)")
 
-        # 给雷达 5-6 秒预热防止超时
-        time.sleep(6.0)
+        # Wait for real radar pose updates instead of blind sleeping.
+        self.wait_for_radar_pose_ready(timeout_sec=8.0)
 
         # ---------- 校准基地点 ----------
-        navi.calibrate_basepoint()
+        navi.calibrate_basepoint(wait=False)
 
         # ---------- 起飞 ----------
         fc.set_action_log(True)
@@ -391,7 +415,7 @@ if __name__ == "__main__":
     fc.wait_for_connection()
 
     radar = LD_Radar()
-    radar.start()
+    radar.start(fc)
     time.sleep(0.5)
 
     mission = Mission(fc, radar)
