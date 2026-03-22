@@ -5,12 +5,9 @@ from typing import Optional, Tuple
 
 import numpy as np
 from loguru import logger
-from serial.tools.list_ports import comports
 
 from FlightController import FC_Controller
-from FlightController.Base import get_fc_com
 from FlightController.Components import LD_Radar
-from FlightController.Components.LDRadar_Driver import get_radar_com
 from FlightController.Solutions.Navigation import PARAMS
 
 
@@ -29,52 +26,39 @@ def wait_first_pose(radar: LD_Radar, timeout_sec: float) -> Optional[Tuple[float
     return None
 
 
-def list_serial_ports() -> str:
-    ports = sorted(comports(), key=lambda p: p.device)
-    if not ports:
-        return "None"
-    return ", ".join([f"{p.device}({p.description})" for p in ports])
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Radar-only localization test. No flight commands are sent."
     )
+    # 【核心修改点 1】：把默认 source 改为 direct，默认雷达端口改为 /dev/ttyUSB0
     parser.add_argument("--source", choices=("fc", "direct"), default="direct", help="Radar source mode")
-    parser.add_argument("--fc-port", default=None, help="FC serial port for source=fc, e.g. COM5 or /dev/ttyACM0")
-    parser.add_argument("--radar-port", default=None, help="Radar serial port for source=direct")
+    parser.add_argument("--fc-port", default="/dev/ttyACM0", help="FC serial port for source=fc")
+    parser.add_argument("--radar-port", default="/dev/ttyUSB0", help="Radar serial port for source=direct")
     parser.add_argument("--radar-type", default="LD06", choices=("LD06", "LD08"))
     parser.add_argument("--first-timeout", type=float, default=15.0, help="Seconds to wait for first pose")
-    parser.add_argument("--list-ports", action="store_true", help="List available serial ports and exit")
     args = parser.parse_args()
-
-    if args.list_ports:
-        logger.info(f"[TEST] Serial ports: {list_serial_ports()}")
-        return
 
     fc = None
     radar = LD_Radar()
 
     try:
         if args.source == "fc":
-            fc_port = args.fc_port or get_fc_com()
-            if not fc_port:
-                raise RuntimeError(
-                    f"No FC serial port detected. Use --fc-port to specify one. Detected ports: {list_serial_ports()}"
-                )
             fc = FC_Controller()
-            fc.start_listen_serial(serial_dev=fc_port, print_state=False)
+            fc.start_listen_serial(serial_dev=args.fc_port, print_state=False)
             fc.wait_for_connection()
             radar.start(fc, subtask_skip=1)
-            logger.info(f"[TEST] Radar source: FC forwarding ({fc_port})")
+            logger.info(f"[TEST] Radar source: FC forwarding ({args.fc_port})")
         else:
-            radar_port = args.radar_port or get_radar_com()
-            if not radar_port:
-                raise RuntimeError(
-                    f"No radar serial port detected. Use --radar-port to specify one. Detected ports: {list_serial_ports()}"
-                )
-            radar.start(radar_port, args.radar_type, subtask_skip=1)
-            logger.info(f"[TEST] Radar source: direct serial ({radar_port})")
+            # 【核心修改点 2】：增加权限和连接状态的友好检查
+            if not os.path.exists(args.radar_port):
+                logger.error(f"找不到端口 {args.radar_port}！请检查雷达是否插好。")
+                return
+            if not os.access(args.radar_port, os.R_OK | os.W_OK):
+                logger.error(f"没有读写权限！请先在终端执行: sudo chmod 666 {args.radar_port}")
+                return
+
+            radar.start(args.radar_port, args.radar_type, subtask_skip=1)
+            logger.info(f"[TEST] Radar source: direct serial ({args.radar_port})")
 
         radar.start_resolve_pose(
             size=PARAMS.MAP_SIZE,

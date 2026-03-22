@@ -976,3 +976,125 @@ class Navigation(object):
                 return
     def radar_find_target(self,TARGET_NUM):
         self.radar.get_target_points(TARGET_NUM)
+
+    def pointing_takeoff(
+        self,
+        point,
+        target_height=140,
+        first_lift=60,
+        lock_pos_thres=15,
+        lock_pos_time=1.0,
+        lock_timeout=12,
+        hover_timeout=12,
+        height_timeout=15,
+    ):
+        """
+        Take off and then enter closed-loop hold/navigation.
+
+        This override is tolerant to FC status-report lag:
+        it retries one-key takeoff once and can fallback to `safe_takeoff`
+        before treating the attempt as failed.
+        """
+        logger.info(f"[NAVI] Takeoff at {point}")
+
+        # 1) Keep navigation loops disabled during raw FC takeoff stage.
+        self.navigation_flag = False
+        self.keep_height_flag = False
+
+        # 2) PROGRAM mode + unlock.
+        self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
+        if not self.fc.state.unlock.value:
+            self.fc.unlock()
+
+        # Wait unlock feedback (some FC firmwares report slowly).
+        t0 = time.perf_counter()
+        while not self.fc.state.unlock.value and (time.perf_counter() - t0) < 3.0:
+            time.sleep(0.05)
+
+        time.sleep(0.8)  # Buffer for motor/state updates.
+        lift = int(max(40, first_lift))
+
+        try:
+            alt_before = float(self.fc.state.alt_add.value)
+        except Exception:
+            alt_before = 0.0
+
+        def _wait_takeoff_done(timeout_s: float) -> bool:
+            try:
+                return bool(self.fc.wait_for_takeoff_done(timeout_s=timeout_s))
+            except TypeError:
+                # Backward compatibility for older signatures.
+                return bool(self.fc.wait_for_takeoff_done(4, timeout_s))
+
+        def _current_alt() -> float:
+            try:
+                return float(self.fc.state.alt_add.value)
+            except Exception:
+                return 0.0
+
+        def _takeoff_started(alt_ref: float, alt_now: float, wait_ok: bool) -> bool:
+            # Some FCs under-report vel_z, but altitude still rises in reality.
+            return bool(wait_ok or alt_now >= 10 or (alt_now - alt_ref) >= 5)
+
+        self.fc.take_off(lift)
+        time.sleep(0.8)  # Give command_now / vel_z time to update.
+        ok = _wait_takeoff_done(timeout_s=8)
+        alt_now = _current_alt()
+
+        # Retry once if first confirmation failed.
+        if not _takeoff_started(alt_before, alt_now, ok):
+            logger.warning("[NAVI] First takeoff attempt not confirmed, retrying once")
+            self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
+            if not self.fc.state.unlock.value:
+                self.fc.unlock()
+                time.sleep(0.5)
+            self.fc.take_off(lift)
+            time.sleep(1.0)
+            ok = _wait_takeoff_done(timeout_s=10)
+            alt_now = _current_alt()
+
+        # Last fallback for firmwares with strict one-key timing windows.
+        if not _takeoff_started(alt_before, alt_now, ok):
+            if hasattr(self.fc, "safe_takeoff"):
+                logger.warning("[NAVI] Falling back to FC safe_takeoff")
+                try:
+                    self.fc.safe_takeoff(
+                        target_height=max(int(lift), 80),
+                        climb_speed=20,
+                        first_lift=lift,
+                    )
+                except Exception:
+                    logger.exception("[NAVI] safe_takeoff fallback failed")
+            alt_now = _current_alt()
+
+        if alt_now < 10:
+            raise RuntimeError(
+                "[NAVI] Takeoff did not start (alt_add < 10cm). Check unlock/mode/propellers/FC safety."
+            )
+
+        # Ensure FC reports hovering before enabling closed-loop hold.
+        self.fc.wait_for_hovering(hover_timeout)
+
+        # 3) Switch to HOLD_POS and enable closed-loop control.
+        self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
+        time.sleep(0.1)
+
+        try:
+            h_now = float(self.fc.state.alt_add.value)
+        except Exception:
+            h_now = float(lift)
+        self.set_height(max(h_now, float(lift)))
+        self.keep_height_flag = True
+
+        self.switch_pid("hover")
+        self.direct_set_waypoint([float(point[0]), float(point[1])])
+        self.navigation_flag = True
+
+        self.wait_for_waypoint(
+            time_thres=lock_pos_time,
+            pos_thres=lock_pos_thres,
+            timeout=lock_timeout,
+        )
+
+        self.set_height(float(target_height))
+        self.wait_for_height(timeout=height_timeout)

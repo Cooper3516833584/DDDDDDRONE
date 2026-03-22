@@ -252,6 +252,7 @@ class Mission(object):
         # ---------- 起飞 ----------
         fc.set_action_log(True)
         logger.info("[MISSION] Mission Started")
+        time.sleep(3.0)
 
         # 注意：pointing_takeoff 已在 Navigation.py 中修复为“低高度先锁点再爬高”
         navi.pointing_takeoff(BASE_POINT, cruise_height)
@@ -415,7 +416,7 @@ if __name__ == "__main__":
     fc.wait_for_connection()
 
     radar = LD_Radar()
-    radar.start(fc)
+    radar.start()
     time.sleep(0.5)
 
     mission = Mission(fc, radar)
