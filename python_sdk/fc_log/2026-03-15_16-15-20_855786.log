@@ -1,0 +1,6 @@
+2026-03-15 16:15:21.989 | INFO     | FlightController.Components.LDRadar_Driver:get_radar_com:27 - [RADAR] Found radar hwid on port COM12
+2026-03-15 16:15:22.111 | INFO     | FlightController.Components.LDRadar_Driver:start:105 - [RADAR] Listenning thread started
+2026-03-15 16:15:22.111 | INFO     | FlightController.Components.LDRadar_Driver:start:112 - [RADAR] Map resolve thread started
+2026-03-15 16:15:22.112 | INFO     | __main__:main:77 - [TEST] Radar source: direct serial (COM12)
+2026-03-15 16:15:22.112 | INFO     | __main__:main:85 - [TEST] Radar pose solver started
+2026-03-15 16:15:37.123 | INFO     | FlightController.Components.LDRadar_Driver:stop:158 - [RADAR] Stopped all threads
