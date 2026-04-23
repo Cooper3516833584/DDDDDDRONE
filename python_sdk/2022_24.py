@@ -3,16 +3,17 @@ import os, sys, time, threading, re
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import glob
-from datetime import datetime
 from typing import Optional, Tuple 
 import numpy as np
 import cv2
 from loguru import logger 
-from FlightController.Solutions import Vision
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Components.UartScreen import UARTScreen
 from FlightController.Solutions.Navigation import Navigation
+from FlightController.Solutions.cargocarrier_vision import (
+    detect_target, detection_to_result, ensure_camera_size
+)
 
 BASE_POINT = np.array([0.0,0.0], dtype = float)
 LANDING_POINT = np.array([0.0,0.0], dtype=float)
@@ -53,7 +54,7 @@ def try_open_camera(prefer_size = (800, 600)) -> Tuple[Optional[cv2.VideoCapture
     
     #索引方式探测
     for i in range(4):
-        cap = cv2.VideoCapture(i)
+        cap = cv2.VideoCapture(i, cv2.CAP_V4L2) if sys.platform.startswith("linux") else cv2.VideoCapture(i)
         if not cap.isOpened():
             try:
                 cap.release()
@@ -89,9 +90,44 @@ def try_open_camera(prefer_size = (800, 600)) -> Tuple[Optional[cv2.VideoCapture
     raise Exception("Failed to open camera")
 
 class VisionTask():
-    def __init__(self):
-        self.cam = None
+    """视觉任务类，持有摄像头cap，使用cargocarrier_vision内部函数进行目标检测"""
+
+    # 用于判断是否足够靠近目标的像素距离阈值
+    CLOSE_THRESHOLD_PX = 30
+
+    # (color, shape) -> target_id 映射，基于 target_features 构建
+    _CS_TO_ID: dict = {}
+
+    def __init__(self, cap: Optional[cv2.VideoCapture]):
+        self.cap = cap
         self._stop_flag = False
+        self._last_result = None
+
+    @classmethod
+    def _ensure_cs_map(cls):
+        if cls._CS_TO_ID:
+            return
+        color_map = {"red": "red", "blu": "blue"}
+        shape_map = {"tri": "triangle", "cir": "circle", "squ": "square"}
+        for tid, feat in target_features.items():
+            name = feat["name"]  # e.g. "1 red tri"
+            parts = name.split()
+            if len(parts) >= 3:
+                c = color_map.get(parts[1], parts[1])
+                s = shape_map.get(parts[2], parts[2])
+                cls._CS_TO_ID[(c, s)] = tid
+
+    def _detect_once(self) -> Optional[Tuple[float, float, str, str]]:
+        """从摄像头读取一帧并检测，返回 (angle_deg, line_length, color, shape) 或 None"""
+        if self.cap is None:
+            return None
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            logger.debug("[VISION] 摄像头读帧失败")
+            return None
+        frame = ensure_camera_size(frame)
+        detection, _ = detect_target(frame)
+        return detection_to_result(frame, detection)
 
     def get_target_angle(self) -> Optional[float]:
         """
@@ -99,49 +135,82 @@ class VisionTask():
         0度为x轴正方向，顺时针为正
         返回None表示未检测到目标
         """
-        # TODO: 实现视觉检测目标角度
-        return None
+        result = self._detect_once()
+        if result is None:
+            self._last_result = None
+            return None
+        angle_ccw, line_length, color, shape = result
+        self._last_result = result
+        # 逆时针角度(0~360, x正右y正上) -> 顺时针: cw = 360 - ccw
+        angle_cw = (360.0 - angle_ccw) % 360.0
+        return angle_cw
 
     def is_close_to_target(self) -> bool:
         """
         判断是否足够靠近目标点
         返回True表示已足够靠近
         """
-        # TODO: 实现视觉判断是否靠近目标
-        return False
+        result = self._detect_once()
+        if result is None:
+            self._last_result = None
+            return False
+        angle_ccw, line_length, color, shape = result
+        self._last_result = result
+        return line_length <= self.CLOSE_THRESHOLD_PX
 
     def get_target_by_vision(self, time_out = 120) -> Optional[Tuple[str, str]]:
         """
         通过视觉检测目标点，返回目标点编号字符串，如 ("3", "10")
         time_out: 超时时间/s，超过后返回None
         """
-        # TODO: 实现视觉检测目标点
+        self._ensure_cs_map()
+        found_ids = []
+        t0 = time.perf_counter()
+
+        while time.perf_counter() - t0 < time_out and not self._stop_flag:
+            result = self._detect_once()
+            if result is None:
+                time.sleep(0.05)
+                continue
+            angle_ccw, line_length, color, shape = result
+            self._last_result = result
+            key = (color, shape)
+            tid = self._CS_TO_ID.get(key)
+            if tid is None:
+                logger.debug(f"[VISION] 检测到未匹配目标: color={color}, shape={shape}")
+                time.sleep(0.05)
+                continue
+            if tid not in found_ids:
+                found_ids.append(tid)
+                logger.info(f"[VISION] 检测到目标: {tid} ({color} {shape}), 已找到 {len(found_ids)}/2")
+            if len(found_ids) >= 2:
+                return (found_ids[0], found_ids[1])
+            time.sleep(0.05)
+
+        if self._stop_flag:
+            logger.warning("[VISION] get_target_by_vision 被停止")
+        else:
+            logger.warning(f"[VISION] get_target_by_vision 超时，仅找到 {len(found_ids)} 个目标")
         return None
 
     def stop(self):
         self._stop_flag = True
-
+    
 class Mission(object):
-    def __init__(self, fc:FC_Controller, radar:LD_Radar):
+    def __init__(self, fc:FC_Controller, radar:LD_Radar, cap: Optional[cv2.VideoCapture] = None):
         self.fc = fc
         self.radar = radar
         self.navi = Navigation(fc = fc, radar = radar)
-        self.vision_task = VisionTask()
-        self.cam = None 
-        self.cam_name = None
+        self.vision_task = VisionTask(cap) if cap is not None else None
+        self.cam = cap
         self._emergency_stop = threading.Event()
-
-        
+           
     def stop(self):
         self._emergency_stop.set()
-        self.vision_task.stop()
+        if self.vision_task is not None:
+            self.vision_task.stop()
         try:
             self.navi.stop()
-        except Exception:
-            pass
-        try:
-            if self.cam is not None:
-                self.cam.release()
         except Exception:
             pass
         logger.info("[MISSION] Mission stopped")
@@ -151,90 +220,53 @@ class Mission(object):
         if self._emergency_stop.is_set():
             raise RuntimeError("Emergency stop triggered")
 
-    def _vision_approach_thread(self, modify_speed=15, freq=10):
+    def vision_approach(self, modify_speed=15, freq=10, timeout=60):
         """
-        视觉逼近线程：持续调用get_target_angle获取方向，调用move_by_direction移动
-        freq: 调用频率/Hz，不小于5Hz
+        视觉精调位置：单线程循环，以freq频率执行
+        每次循环：先判断是否靠近目标，若不够接近则根据方向逼近
+        靠近后自动停止，转为悬停；超时也会停止
         """
+        if self.vision_task is None:
+            logger.error("[MISSION] vision_task is None, cannot start vision approach")
+            return
+        vt = self.vision_task
         dt = 1.0 / max(freq, 5)
-        while not self.vision_task._stop_flag:
-            angle = self.vision_task.get_target_angle()
-            if angle is not None:
-                self.navi.move_by_direction(speed=modify_speed, direction_deg=angle)
-            else:
-                # 未检测到目标时悬停
-                self.navi.stop_move()
-                logger.debug("[VISION] No target detected, hovering")
-            time.sleep(dt)
-
-    def _vision_check_thread(self, freq=20, timeout=60):
-        """
-        视觉判断线程：持续调用is_close_to_target判断是否足够靠近
-        一旦靠近，停止逼近线程，转为悬停
-        freq: 检测频率/Hz（与视觉帧率一致）
-        timeout: 超时时间/s
-        """
-        dt = 1.0 / freq
+        vt._stop_flag = False
+        logger.info("[MISSION] Starting vision approach")
         t0 = time.perf_counter()
-        while not self.vision_task._stop_flag:
-            if self.vision_task.is_close_to_target():
-                logger.info("[VISION] Close enough to target, stopping approach")
-                self.vision_task._stop_flag = True
-                self.navi.stop_move()
-                return
+
+        while not vt._stop_flag:
+            # 超时检查
             if time.perf_counter() - t0 > timeout:
                 logger.warning("[VISION] Vision approach timeout, stopping")
-                self.vision_task._stop_flag = True
                 self.navi.stop_move()
-                return
+                break
+
+            # 单次检测，同时获取距离和方向
+            result = vt._detect_once()
+            if result is None:
+                self.navi.stop_move()
+                logger.debug("[VISION] No target detected, hovering")
+                time.sleep(dt)
+                continue
+
+            angle_ccw, line_length, color, shape = result
+            vt._last_result = result
+
+            # 先判断是否靠近目标
+            if line_length <= vt.CLOSE_THRESHOLD_PX:
+                logger.info("[VISION] Close enough to target, stopping approach")
+                self.navi.stop_move()
+                break
+
+            # 不够接近，根据方向逼近
+            angle_cw = (360.0 - angle_ccw) % 360.0
+            self.navi.move_by_direction(speed=modify_speed, direction_deg=angle_cw)
+
             time.sleep(dt)
-
-    def vision_approach(self, modify_speed=15, approach_freq=10, check_freq=20, timeout=60):
-        """
-        视觉精调位置：两个线程并行
-        - 逼近线程：以approach_freq频率获取目标方向并移动
-        - 判断线程：以check_freq频率判断是否靠近目标
-        靠近后自动停止逼近，转为悬停
-        """
-        self.vision_task._stop_flag = False
-        logger.info("[MISSION] Starting vision approach")
-
-        t_approach = threading.Thread(
-            target=self._vision_approach_thread,
-            args=(modify_speed, approach_freq),
-            daemon=True,
-        )
-        t_check = threading.Thread(
-            target=self._vision_check_thread,
-            args=(check_freq, timeout),
-            daemon=True,
-        )
-
-        t_approach.start()
-        t_check.start()
-
-        # 等待判断线程结束（无论成功或超时）
-        t_check.join()
-        # 确保逼近线程也结束
-        self.vision_task._stop_flag = True
-        t_approach.join(timeout=2.0)
 
         logger.info("[MISSION] Vision approach finished")
         
-    def setup_camera(self):
-        try:
-            cap, name = try_open_camera()
-            self.cam = cap
-            self.cam_name = name
-            logger.info(f"[CAM] Camera opened: {name}")
-            
-        except Exception as e:
-            logger.warning(f"[CAM] Failed to open camera: {e}")
-            self.cam = None
-            self.cam_name = None
-            return False
-        
-        return True
     
     def _motor_step_task(self, revolutions: float):
             self.fc.step_motor_rotate(revolutions, 1)
@@ -309,7 +341,7 @@ class Mission(object):
         #--------视觉精调位置--------
         self._check_emergency()
         logger.info("[MISSION] Starting vision-based fine approach for target 1")
-        self.vision_approach(modify_speed=modify_speed, approach_freq=10, check_freq=20, timeout=60)
+        self.vision_approach(modify_speed=modify_speed, freq=10, timeout=60)
         logger.info("[MISSION] Vision approach done, hovering at target 1")
 
         #--------并行执行电机控制和蜂鸣器发声--------
@@ -347,7 +379,7 @@ class Mission(object):
         #--------视觉精调位置--------
         self._check_emergency()
         logger.info("[MISSION] Starting vision-based fine approach to target 2")
-        self.vision_approach(modify_speed=modify_speed, approach_freq=10, check_freq=20, timeout=60)
+        self.vision_approach(modify_speed=modify_speed, freq=10, timeout=60)
         logger.info("[MISSION] Vision approach done, hovering at target 2")
 
         #--------并行执行电机控制和蜂鸣器发声--------
@@ -429,6 +461,22 @@ def main():
     fc = FC_Controller()
     fc.start_listen_serial(serial_dev="/dev/ttyAMA0", print_state=False)
     fc.wait_for_connection()
+    
+    # 尝试打开摄像头
+    cam = None
+    cam_name = None
+    try:
+        cam, cam_name = try_open_camera()
+        logger.info(f"[MANAGER] 摄像头已打开: {cam_name}")
+        # 摄像头预热：丢弃前几帧以获得稳定图像
+        for _ in range(8):
+            if cam is not None:
+                cam.read()
+            time.sleep(0.02)
+        logger.info("[MANAGER] 摄像头预热完成")
+    except Exception as e:
+        logger.error(f"[MANAGER] 摄像头打开失败: {e}，程序终止")
+        return
     
     screen = UARTScreen(fc)
     radar = None
@@ -535,7 +583,7 @@ def main():
         vision_result = None
         logger.info("[MANAGER] 进入视觉目标识别模式...")
         
-        vt = VisionTask()
+        vt = VisionTask(cam)
         
         def _vision_worker():
             nonlocal vision_result
@@ -610,7 +658,7 @@ def main():
             radar.start()
             time.sleep(0.5)
         
-        mission = Mission(fc, radar)
+        mission = Mission(fc, radar, cam)
         mission_thread = threading.Thread(
             target=run_mission_in_thread,
             args=(mission, t1, t2),
@@ -621,122 +669,131 @@ def main():
     logger.info("[MANAGER] 等待串口屏指令...")
     logger.info(f"[MANAGER] 支持的指令: 'tarset1'(串口屏选目标) / 'tarset2'(视觉选目标) / '{EMERGENCY_STOP_CMD}'")
     
-    while True:
-        # 如果正在通过串口屏获取目标点，由子线程自己处理串口数据，主线程等待
-        if acquiring_targets and acquire_mode == "screen":
-            time.sleep(0.1)
-            continue
-        
-        result = screen.wait_for_data(timeout=5.0)
-        if result is None:
-            continue
-        
-        dtype, value = result
-        if dtype != "str" or not isinstance(value, str):
-            continue
-        
-        value = value.strip()
-        
-        # ---- 紧急停止 ----
-        if value == EMERGENCY_STOP_CMD:
-            logger.warning("[MANAGER] 收到紧急停止指令!")
-            
-            # 停止目标获取过程
-            if acquiring_targets:
-                _stop_acquire.set()
-                if acquire_thread is not None and acquire_thread.is_alive():
-                    acquire_thread.join(timeout=5.0)
-                acquiring_targets = False
-                acquire_mode = None
-                collected_targets.clear()
-                logger.info("[MANAGER] 目标获取过程已停止并清空")
-            
-            # 停止运行中的任务
-            if mission is not None:
-                mission.stop()
-                if mission_thread is not None and mission_thread.is_alive():
-                    mission_thread.join(timeout=10.0)
-                emergency_land()
-                mission = None
-                mission_thread = None
-            
-            _stop_acquire.clear()
-            continue
-        
-        # ---- 选择目标获取模式 ----
-        match = pat_tarset.search(value)
-        if match:
-            mode = match.group(1)
-            
-            if mission_thread is not None and mission_thread.is_alive():
-                logger.warning("[MANAGER] 当前有任务正在运行，请先发送 'mission stop'")
+    try:
+        while True:
+            # 如果正在通过串口屏获取目标点，由子线程自己处理串口数据，主线程等待
+            if acquiring_targets and acquire_mode == "screen":
+                time.sleep(0.1)
                 continue
             
-            if acquiring_targets:
-                logger.warning("[MANAGER] 正在获取目标点中，请先发送 'mission stop' 取消")
+            result = screen.wait_for_data(timeout=5.0)
+            if result is None:
                 continue
             
-            _stop_acquire.clear()
-            collected_targets.clear()
-            vision_result = None
+            dtype, value = result
+            if dtype != "str" or not isinstance(value, str):
+                continue
             
-            if mode == "1":
-                # 串口屏模式：在子线程中阻塞收集
-                acquire_mode = "screen"
-                acquiring_targets = True
+            value = value.strip()
+            
+            # ---- 紧急停止 ----
+            if value == EMERGENCY_STOP_CMD:
+                logger.warning("[MANAGER] 收到紧急停止指令!")
                 
-                def _screen_acquire_wrapper():
-                    nonlocal acquiring_targets
-                    try:
-                        acquire_targets_by_screen()
-                    finally:
-                        acquiring_targets = False
-                
-                acquire_thread = threading.Thread(target=_screen_acquire_wrapper, daemon=True)
-                acquire_thread.start()
-                
-                # 定时检查收集是否完成
-                def _check_screen_acquire_done():
+                # 停止目标获取过程
+                if acquiring_targets:
+                    _stop_acquire.set()
                     if acquire_thread is not None and acquire_thread.is_alive():
-                        threading.Timer(0.5, _check_screen_acquire_done).start()
-                    else:
-                        if _stop_acquire.is_set():
-                            return
-                        if len(collected_targets) >= 2:
-                            start_mission_with_targets(collected_targets[0], collected_targets[1])
-                            collected_targets.clear()
-                        else:
-                            logger.warning(f"[MANAGER] 目标点不足(需2个，获{len(collected_targets)}个)")
+                        acquire_thread.join(timeout=5.0)
+                    acquiring_targets = False
+                    acquire_mode = None
+                    collected_targets.clear()
+                    logger.info("[MANAGER] 目标获取过程已停止并清空")
                 
-                _check_screen_acquire_done()
+                # 停止运行中的任务
+                if mission is not None:
+                    mission.stop()
+                    if mission_thread is not None and mission_thread.is_alive():
+                        mission_thread.join(timeout=10.0)
+                    emergency_land()
+                    mission = None
+                    mission_thread = None
+                
+                _stop_acquire.clear()
+                continue
             
-            elif mode == "2":
-                # 视觉模式：在子线程中阻塞获取
-                acquire_mode = "vision"
-                acquiring_targets = True
+            # ---- 选择目标获取模式 ----
+            match = pat_tarset.search(value)
+            if match:
+                mode = match.group(1)
                 
-                def _vision_acquire_wrapper():
-                    nonlocal acquiring_targets, collected_targets
-                    try:
-                        acquire_targets_by_vision()
-                        if not _stop_acquire.is_set() and vision_result is not None:
-                            collected_targets = list(vision_result)
+                if mission_thread is not None and mission_thread.is_alive():
+                    logger.warning("[MANAGER] 当前有任务正在运行，请先发送 'mission stop'")
+                    continue
+                
+                if acquiring_targets:
+                    logger.warning("[MANAGER] 正在获取目标点中，请先发送 'mission stop' 取消")
+                    continue
+                
+                _stop_acquire.clear()
+                collected_targets.clear()
+                vision_result = None
+                
+                if mode == "1":
+                    # 串口屏模式：在子线程中阻塞收集
+                    acquire_mode = "screen"
+                    acquiring_targets = True
+                    
+                    def _screen_acquire_wrapper():
+                        nonlocal acquiring_targets
+                        try:
+                            acquire_targets_by_screen()
+                        finally:
+                            acquiring_targets = False
+                    
+                    acquire_thread = threading.Thread(target=_screen_acquire_wrapper, daemon=True)
+                    acquire_thread.start()
+                    
+                    # 定时检查收集是否完成
+                    def _check_screen_acquire_done():
+                        if acquire_thread is not None and acquire_thread.is_alive():
+                            threading.Timer(0.5, _check_screen_acquire_done).start()
+                        else:
+                            if _stop_acquire.is_set():
+                                return
                             if len(collected_targets) >= 2:
                                 start_mission_with_targets(collected_targets[0], collected_targets[1])
+                                collected_targets.clear()
                             else:
-                                logger.warning(f"[MANAGER] 视觉目标点不足(需2个，获{len(collected_targets)}个)")
-                    finally:
-                        acquiring_targets = False
+                                logger.warning(f"[MANAGER] 目标点不足(需2个，获{len(collected_targets)}个)")
+                    
+                    _check_screen_acquire_done()
                 
-                acquire_thread = threading.Thread(target=_vision_acquire_wrapper, daemon=True)
-                acquire_thread.start()
+                elif mode == "2":
+                    # 视觉模式：在子线程中阻塞获取
+                    acquire_mode = "vision"
+                    acquiring_targets = True
+                    
+                    def _vision_acquire_wrapper():
+                        nonlocal acquiring_targets, collected_targets
+                        try:
+                            acquire_targets_by_vision()
+                            if not _stop_acquire.is_set() and vision_result is not None:
+                                collected_targets = list(vision_result)
+                                if len(collected_targets) >= 2:
+                                    start_mission_with_targets(collected_targets[0], collected_targets[1])
+                                else:
+                                    logger.warning(f"[MANAGER] 视觉目标点不足(需2个，获{len(collected_targets)}个)")
+                        finally:
+                            acquiring_targets = False
+                    
+                    acquire_thread = threading.Thread(target=_vision_acquire_wrapper, daemon=True)
+                    acquire_thread.start()
+                
+                else:
+                    logger.warning(f"[MANAGER] 未知目标获取模式: tarset{mode} (仅支持 tarset1 或 tarset2)")
+                
+                continue
             
-            else:
-                logger.warning(f"[MANAGER] 未知目标获取模式: tarset{mode} (仅支持 tarset1 或 tarset2)")
-            
-            continue
-        
-        logger.debug(f"[MANAGER] 忽略未知指令: {value}")
+            logger.debug(f"[MANAGER] 忽略未知指令: {value}")
+    finally:
+        # 释放摄像头资源
+        if cam is not None:
+            try:
+                cam.release()
+                logger.info("[MANAGER] 摄像头已释放")
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()

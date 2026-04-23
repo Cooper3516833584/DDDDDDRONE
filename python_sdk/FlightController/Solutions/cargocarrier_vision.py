@@ -335,12 +335,26 @@ def draw_debug_view(frame: np.ndarray, detection: Optional[Detection], result: R
 
 
 def open_camera(camera_index: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    import sys
+    # Linux优先使用V4L2，Windows使用DSHOW，其他平台使用默认后端
+    if sys.platform.startswith("linux"):
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+    elif sys.platform == "win32":
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
         cap = cv2.VideoCapture(camera_index)
 
     if not cap.isOpened():
+        try:
+            cap.release()
+        except Exception:
+            pass
         raise RuntimeError(f"Cannot open camera index {camera_index}")
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
@@ -434,7 +448,6 @@ def ooooocr(
         return capture_single_result(cap, target_color, target_shape)
     finally:
         cap.release()
-        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
