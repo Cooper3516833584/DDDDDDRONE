@@ -1,6 +1,7 @@
 import struct
+from queue import Empty, Queue
 from threading import Event
-from typing import Callable, List, Literal, Optional, Union
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
 from FlightController import FC_Controller, FC_Like
 from loguru import logger
@@ -18,6 +19,7 @@ class UARTScreen:
         self._data: Union[int, float, str, None] = None
         self._report_callback: Optional[Callable[[str], None]] = None
         self._data_update_event = Event()
+        self._data_queue: Queue = Queue()
         fc.register_uart_screen_callback(self._callback)
 
     def _callback(self, data: bytes):
@@ -46,16 +48,19 @@ class UARTScreen:
                 value = int.from_bytes(data[1:5], "little")
                 self._data = value
                 self._data_update_event.set()
+                self._data_queue.put(("int", value))
                 logger.debug(f"[UartScr] Int data: {value}")
             elif cmdtype == 0x02:  # 四字节小端浮点数
                 value = struct.unpack("<f", data[1:5])[0]
                 self._data = value
                 self._data_update_event.set()
+                self._data_queue.put(("float", value))
                 logger.debug(f"[UartScr] Float data: {value}")
             elif cmdtype == 0x03:  # 字符串
                 data = data[1:-2]
                 self._data = data.decode("utf-8")
                 self._data_update_event.set()
+                self._data_queue.put(("str", self._data))
                 logger.debug(f"[UartScr] String data: {self._data}")
 
     def send_command(self, cmd: str):
@@ -71,6 +76,18 @@ class UARTScreen:
     def register_report_callback(self, callback: Callable[[str], None]):
         """注册报告(以\\开头的串口数据)回调函数"""
         self._report_callback = callback
+
+    def wait_for_data(self, timeout: float = None) -> Optional[Tuple[str, Union[int, float, str]]]:
+        """
+        阻塞等待串口屏新数据，返回 (数据类型, 数据值)
+        数据类型: "int" / "float" / "str"
+        timeout: 超时秒数，None表示无限等待
+        超时返回None
+        """
+        try:
+            return self._data_queue.get(timeout=timeout)
+        except Empty:
+            return None
 
     def get_system_value(self, param: str) -> Union[int, float, str, None]:
         """获取系统参数"""

@@ -824,6 +824,113 @@ class Navigation(object):
         self.set_height(float(target_height))
         self.wait_for_height(timeout=height_timeout)
 
+    def adjust_height_and_hover(
+        self,
+        target_height: float,
+        point: Optional[Union[List[float], Tuple[float, float], np.ndarray]] = None,
+        height_timeout: float = 15.0,
+        pos_timeout: float = 12.0,
+        pos_thres: float = 20.0,
+        height_thres: float = 8.0,
+        lock_pos_time: float = 1.0,
+    ) -> None:
+        """
+        定点调整高度后悬停
+
+        功能：
+        1. 在当前位置或指定点调整飞行高度
+        2. 调整过程中保持水平位置锁定
+        3. 调整完成后稳定悬停
+
+        参数：
+        target_height: 目标飞行高度 / cm
+        point: 目标水平坐标 (x, y) / cm / 匿名(ROS)坐标系 / 基地原点
+            若为 None，则在当前位置调整高度
+        height_timeout: 高度调整超时时间 / s
+        pos_timeout: 位置锁定超时时间 / s (仅当 point 不为 None 时生效)
+        pos_thres: 位置到达阈值 / cm
+        height_thres: 高度到达阈值 / cm
+        lock_pos_time: 位置稳定时间阈值 / s
+
+        流程：
+        1. 确保处于 HOLD_POS_MODE（定点模式）
+        2. 开启高度保持与导航闭环
+        3. 若指定 point，则锁定水平位置
+        4. 设置目标高度并等待到达
+        5. 若指定 point，等待位置稳定
+
+        示例：
+        # 在当前点爬升到 200cm 高度
+        navi.adjust_height_and_hover(200)
+
+        # 移动到 (100, 50) 点并爬升到 150cm
+        navi.adjust_height_and_hover(150, point=[100, 50])
+        """
+        logger.info(f"[NAVI] Adjust height to {target_height}cm at {point if point else 'current position'}")
+
+        # 1) 确保处于定点模式
+        if self.fc.state.mode.value != self.fc.HOLD_POS_MODE:
+            self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
+            time.sleep(0.1)
+            logger.debug("[NAVI] Switched to HOLD_POS_MODE")
+
+        # 2) 开启高度保持与导航
+        self.keep_height_flag = True
+        self.navigation_flag = True
+
+        # 3) 若指定目标点，则锁定水平位置
+        if point is not None:
+            # 解析坐标点
+            if isinstance(point, (list, tuple, np.ndarray)):
+                x, y = float(point[0]), float(point[1])
+            else:
+                raise ValueError(f"Invalid point format: {point}, expected list/tuple/ndarray")
+
+            # 切换到悬停PID参数（更柔和）
+            self.switch_pid("hover")
+            
+            # 设置水平目标点
+            self.direct_set_waypoint([x, y])
+            logger.debug(f"[NAVI] Lock position to ({x}, {y})")
+
+            # 等待位置初步稳定（避免高度调整时水平漂移过大）
+            self.wait_for_waypoint(
+                time_thres=lock_pos_time,
+                pos_thres=pos_thres,
+                timeout=pos_timeout,
+            )
+        else:
+            # 使用当前位置，不改变水平目标
+            logger.debug("[NAVI] Keep current horizontal position")
+
+        # 4) 设置目标高度并等待到达
+        current_h = float(self.fc.state.alt_add.value) if hasattr(self.fc.state.alt_add, 'value') else self.current_height
+        logger.debug(f"[NAVI] Current height: {current_h:.1f}cm, Target: {target_height}cm")
+        
+        self.set_height(float(target_height))
+        self.wait_for_height(
+            time_thres=0.5,
+            height_thres=height_thres,
+            timeout=height_timeout,
+        )
+
+        # 5) 若指定了目标点，确保最终位置稳定
+        if point is not None:
+            self.wait_for_waypoint(
+                time_thres=lock_pos_time,
+                pos_thres=pos_thres,
+                timeout=pos_timeout,
+            )
+            logger.info(f"[NAVI] Adjusted to height {target_height}cm at ({x}, {y}) and hovering")
+        else:
+            logger.info(f"[NAVI] Adjusted to height {target_height}cm and hovering at current position")
+
+        # 6) 最终状态确认
+        logger.debug(
+            f"[NAVI] Final state - Height: {self.current_height:.1f}cm, "
+            f"Position: ({self.current_x:.1f}, {self.current_y:.1f})"
+        )
+
     def pointing_landing(
         self,
         point,
@@ -976,3 +1083,29 @@ class Navigation(object):
                 return
     def radar_find_target(self,TARGET_NUM):
         self.radar.get_target_points(TARGET_NUM)
+
+    def move_by_direction(self, speed: float = 5, direction_deg: float = 0):
+        """
+        以给定速度沿给定方向移动（临时覆盖导航控制）
+
+        speed: 速度 / cm/s (默认5，适合精调)
+        direction_deg: 方向角度 / deg，0度为x轴正方向，顺时针为正
+        """
+        self.navigation_flag = False  # 关闭水平导航PID
+        rad = np.deg2rad(direction_deg)
+        vel_x = int(speed * np.cos(rad))
+        vel_y = int(speed * np.sin(rad))
+        self.update_realtime_control(vel_x=vel_x, vel_y=vel_y)
+        logger.info(f"[NAVI] Move by direction: speed={speed}, dir={direction_deg}°, vel=({vel_x},{vel_y})")
+
+    def stop_move(self):
+        """
+        停止手动移动，重新开启导航并悬停在当前位置
+        """
+        self.update_realtime_control(vel_x=0, vel_y=0)
+        # 设置目标点为当前位置
+        self.navi_x_pid.setpoint = self.current_x
+        self.navi_y_pid.setpoint = self.current_y
+        self.navigation_flag = True  # 重新开启水平导航PID
+        logger.info("[NAVI] Stop move, hover at current position")
+

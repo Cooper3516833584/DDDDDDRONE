@@ -167,6 +167,100 @@ class FC_Protocol(FC_Base_Uart_Comunication):
         self._byte_temp2.reset(on_, "u8", int)
         self.send_data_to_fc(self._byte_temp1.bytes + self._byte_temp2.bytes, 0x06, True)
         self._action_log("set digital output", f"channel {channel} {on}")
+    
+    def step_motor_rotate(self, revolutions: float, step_delay_ms: float = 2, steps_per_rev: int = 2048) -> None:
+        """
+        控制ULN2003驱动板驱动28BYJ-48步进电机转动指定圈数
+        
+        驱动板上的in1,in2,in3,in4分别与飞控代码中的channel0,1,2,3相连
+        
+        Args:
+            revolutions: 转动圈数，正数为顺时针，负数为逆时针
+            step_delay_ms: 每一步之间的延迟（毫秒），影响电机转速
+            steps_per_rev: 每圈步数（28BYJ-48默认2048步/圈，半步模式）
+        
+        工作原理：
+        1. 使用8步半步序列控制电机，运行更平稳
+        2. 每步依次设置channel0-3（对应IN1-IN4）的高低电平
+        3. 通过控制步间延迟调整转速
+        4. 转动结束后关闭所有输出以释放电机
+        
+        注意：
+        - 每个步进都会发送4个数字输出命令到飞控
+        - 实际转速受通信延迟影响，step_delay_ms建议≥2ms
+        - 电机扭矩较小，不建议在高负载下使用
+        """
+        # 定义步进序列（8步半步序列，顺时针方向）
+        # 每个子列表表示 [IN1, IN2, IN3, IN4] 的状态（对应channel0,1,2,3）
+        step_sequence_cw = [
+            [1, 0, 0, 0],  # 步骤1: IN1高
+            [1, 1, 0, 0],  # 步骤2: IN1+IN2高
+            [0, 1, 0, 0],  # 步骤3: IN2高
+            [0, 1, 1, 0],  # 步骤4: IN2+IN3高
+            [0, 0, 1, 0],  # 步骤5: IN3高
+            [0, 0, 1, 1],  # 步骤6: IN3+IN4高
+            [0, 0, 0, 1],  # 步骤7: IN4高
+            [1, 0, 0, 1],  # 步骤8: IN4+IN1高
+        ]
+        
+        # 逆时针序列就是顺时针序列的反向
+        step_sequence_ccw = list(reversed(step_sequence_cw))
+        
+        # 选择方向和序列
+        if revolutions >= 0:
+            sequence = step_sequence_cw
+            direction = "clockwise"
+        else:
+            sequence = step_sequence_ccw
+            direction = "counterclockwise"
+            revolutions = -revolutions  # 取绝对值计算步数
+        
+        # 计算总步数
+        total_steps = int(revolutions * steps_per_rev)
+        
+        if total_steps == 0:
+            logger.debug("[FC] No steps to rotate, returning")
+            return
+        
+        logger.info(f"[FC] Starting stepper motor: {revolutions} revs {direction}, "
+                   f"{total_steps} steps, delay {step_delay_ms}ms")
+        
+        try:
+            # 循环执行步进
+            for step_count in range(total_steps):
+                # 获取当前步的引脚状态
+                step_index = step_count % len(sequence)
+                pin_states = sequence[step_index]
+                
+                # 设置四个引脚的状态（channel0-3对应IN1-IN4）
+                for channel, state in enumerate(pin_states):
+                    self.set_digital_output(channel, bool(state))
+                
+                # 步间延迟（转换为秒）
+                time.sleep(step_delay_ms / 1000.0)
+                
+                # 每1000步输出一次进度（可选）
+                if step_count % 1000 == 0 and step_count > 0:
+                    progress = (step_count / total_steps) * 100
+                    logger.debug(f"[FC] Stepper progress: {progress:.1f}%")
+            
+            # 转动完成后关闭所有输出，释放电机
+            for channel in range(4):
+                self.set_digital_output(channel, False)
+            
+            self._action_log("step motor rotate", 
+                           f"{revolutions} revs {direction}, {total_steps} steps")
+            logger.info(f"[FC] Stepper motor rotation completed")
+            
+        except Exception as e:
+            # 发生异常时立即关闭所有输出
+            for channel in range(4):
+                try:
+                    self.set_digital_output(channel, False)
+                except:
+                    pass
+            logger.error(f"[FC] Stepper motor error: {e}")
+            raise
 
     def set_pod(self, state: int, time: int) -> None:
         """
