@@ -1211,7 +1211,7 @@ class Navigation(object):
         以给定速度沿给定方向移动（临时覆盖导航控制）
 
         speed: 速度 / cm/s (默认5，适合精调)
-        direction_deg: 方向角度 / deg，0度为x轴正方向，顺时针为正
+        direction_deg: 方向角度 / deg，0度为x轴正方向，逆时针为正
         """
         self.navigation_flag = False  # 关闭水平导航PID
         rad = np.deg2rad(direction_deg)
