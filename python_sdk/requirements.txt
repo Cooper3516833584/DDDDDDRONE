@@ -1,16 +1,16 @@
-PySide6-Addons==6.4.0.1
-PySide6-Essentials==6.4.0.1
-PySide6==6.4.0.1
+# N97 Ubuntu 20.04 / Python 3.8 runtime requirements
+# Generated from project imports + env_probe output on the N97 machine.
+# Install with: python3 -m pip install --user -r requirements_n97_runtime.txt
+
+attrs==19.3.0
 loguru==0.5.3
+matplotlib==3.7.5
 numpy==1.24.4
-onnxruntime-gpu==1.13.1
-onnxruntime==1.10.0
+onnxruntime==1.16.3
 opencv-contrib-python==4.8.0.74
-opencv-python==4.6.0.66
 pupil-apriltags==1.0.4.post10
 pyrealsense2==2.51.1.4348
 pyserial==3.5
-pywin32==300
 pyzbar==0.1.9
 scipy==1.10.1
 simple-pid==2.0.0
