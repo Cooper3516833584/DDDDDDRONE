@@ -1,0 +1,22 @@
+# Non-ROS2 Python requirements for STM32MP257 / Debian 12 / ARM64
+# Target: Python 3.11, CPU-only runtime
+#
+# Notes:
+# - Do NOT install ROS2 Python packages with pip. rclpy, geometry_msgs,
+#   nav_msgs, sensor_msgs, std_msgs, tf2_ros, etc. must come from ROS2/apt.
+# - Prefer Debian apt packages for OpenCV / NumPy / SciPy / Matplotlib on ARM64:
+#     sudo apt install -y python3-opencv python3-numpy python3-scipy python3-matplotlib
+# - pyzbar also needs the system library:
+#     sudo apt install -y libzbar0
+# - pupil-apriltags may need native build tools on ARM64:
+#     sudo apt install -y build-essential cmake python3-dev
+# - pyrealsense2 is intentionally NOT included here because the N97 version
+#   is x86_64/Python-3.8 oriented and is risky on Debian 12 ARM64/Python 3.11.
+
+attrs==19.3.0
+loguru==0.5.3
+onnxruntime==1.16.3
+pupil-apriltags==1.0.4.post10
+pyserial==3.5
+pyzbar==0.1.9
+simple-pid==2.0.0
