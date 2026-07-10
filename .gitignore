@@ -1,0 +1,5 @@
+# Root-level Excel workbooks
+/*.xls
+/*.xlsx
+/*.xlsm
+/*.xlsb
