@@ -6,7 +6,7 @@ import secrets
 import struct
 from typing import List, Optional, Tuple
 
-from .models import MAX_PAYLOAD_LEN, PROTOCOL_VERSION, MessageType
+from .models import FC_STATE_LAYOUT_V1, MAX_PAYLOAD_LEN, PROTOCOL_VERSION, MessageType
 
 
 MAGIC = b"\xA5\x5A"
@@ -16,6 +16,11 @@ HMAC_LEN = 8
 HEADER_LEN = HEADER_STRUCT.size
 CRC_LEN = CRC_STRUCT.size
 MIN_FRAME_LEN = HEADER_LEN + CRC_LEN + HMAC_LEN
+FAST_TELEMETRY_MAGIC = b"\xC3\x3C"
+FAST_TELEMETRY_VERSION = 1
+FAST_TELEMETRY_HEADER = struct.Struct(">2sBBIH")
+FAST_TELEMETRY_CORE = struct.Struct("<iiHBB")
+FAST_TELEMETRY_LEN = FAST_TELEMETRY_HEADER.size + FAST_TELEMETRY_CORE.size + CRC_LEN
 
 
 class ProtocolError(ValueError):
@@ -27,6 +32,13 @@ class Frame:
     version: int
     msg_type: MessageType
     flags: int
+    session: int
+    seq: int
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class FastTelemetry:
     session: int
     seq: int
     payload: bytes
@@ -119,6 +131,37 @@ def unpack_frame(frame_bytes: bytes, key: bytes) -> Frame:
     return Frame(version, typed_msg, flags, session, seq, payload)
 
 
+def pack_fast_telemetry(payload: bytes, session: int, seq: int) -> bytes:
+    if len(payload) != 13 or payload[0] != FC_STATE_LAYOUT_V1:
+        raise ProtocolError("fast telemetry requires the compact FC_STATE core")
+    header = FAST_TELEMETRY_HEADER.pack(
+        FAST_TELEMETRY_MAGIC,
+        FAST_TELEMETRY_VERSION,
+        FC_STATE_LAYOUT_V1,
+        session & 0xFFFFFFFF,
+        seq & 0xFFFF,
+    )
+    protected = header + payload[1:]
+    return protected + CRC_STRUCT.pack(crc16_ccitt(protected))
+
+
+def unpack_fast_telemetry(frame_bytes: bytes) -> FastTelemetry:
+    if len(frame_bytes) != FAST_TELEMETRY_LEN:
+        raise ProtocolError("wrong fast telemetry length")
+    magic, version, layout, session, seq = FAST_TELEMETRY_HEADER.unpack(
+        frame_bytes[: FAST_TELEMETRY_HEADER.size]
+    )
+    if magic != FAST_TELEMETRY_MAGIC:
+        raise ProtocolError("bad fast telemetry magic")
+    if version != FAST_TELEMETRY_VERSION or layout != FC_STATE_LAYOUT_V1:
+        raise ProtocolError("unsupported fast telemetry version")
+    crc_offset = FAST_TELEMETRY_LEN - CRC_LEN
+    expected_crc = CRC_STRUCT.unpack(frame_bytes[crc_offset:])[0]
+    if expected_crc != crc16_ccitt(frame_bytes[:crc_offset]):
+        raise ProtocolError("fast telemetry crc mismatch")
+    return FastTelemetry(session, seq, bytes([layout]) + frame_bytes[FAST_TELEMETRY_HEADER.size:crc_offset])
+
+
 class FrameParser:
     def __init__(self, key: bytes):
         if not key:
@@ -168,6 +211,40 @@ class FrameParser:
                     self.stats.crc_failures += 1
                 elif "hmac" in str(exc):
                     self.stats.hmac_failures += 1
+                else:
+                    self.stats.discarded_bytes += 1
+
+
+class FastTelemetryParser:
+    def __init__(self):
+        self._buffer = bytearray()
+        self.stats = ParserStats()
+
+    def feed(self, data: bytes) -> List[FastTelemetry]:
+        self._buffer.extend(data)
+        frames = []
+        while True:
+            start = self._buffer.find(FAST_TELEMETRY_MAGIC)
+            if start < 0:
+                keep = 1 if self._buffer.endswith(FAST_TELEMETRY_MAGIC[:1]) else 0
+                self.stats.discarded_bytes += len(self._buffer) - keep
+                if keep:
+                    del self._buffer[:-keep]
+                else:
+                    self._buffer.clear()
+                return frames
+            if start:
+                self.stats.discarded_bytes += start
+                del self._buffer[:start]
+            if len(self._buffer) < FAST_TELEMETRY_LEN:
+                return frames
+            candidate = bytes(self._buffer[:FAST_TELEMETRY_LEN])
+            del self._buffer[:FAST_TELEMETRY_LEN]
+            try:
+                frames.append(unpack_fast_telemetry(candidate))
+            except ProtocolError as exc:
+                if "crc" in str(exc):
+                    self.stats.crc_failures += 1
                 else:
                     self.stats.discarded_bytes += 1
 

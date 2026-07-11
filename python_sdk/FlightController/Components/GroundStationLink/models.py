@@ -17,6 +17,7 @@ class MessageType(IntEnum):
     COMMAND_ACK = 5
     COMMAND_RESULT = 6
     ALARM = 7
+    LED_CONTROL = 8
 
 
 class CommandId(IntEnum):
@@ -60,6 +61,18 @@ class MissionState(IntEnum):
     FAILED = 8
 
 
+class GroundLinkMode(IntEnum):
+    """Aircraft radio role for one flight phase."""
+
+    COMMAND_RX = 1
+    TELEMETRY_TX = 2
+
+
+class LEDMode(IntEnum):
+    FLOW = 0
+    PIXELS = 1
+
+
 FC_STATE_LAYOUT_V1 = 0x81
 FC_STATE_STRUCT = struct.Struct("<BiiHBB")
 LEGACY_FC_STATE_STRUCT = struct.Struct("<hhhii hhh ii H B ? B B B")
@@ -67,6 +80,7 @@ EXTENSION_HEADER = struct.Struct("BB")
 MISSION_STATUS_HEADER = struct.Struct(">BBBBB")
 ACK_STRUCT = struct.Struct(">BBHBB")
 ALARM_HEADER = struct.Struct(">B")
+LED_CONTROL_HEADER = struct.Struct(">BBB")
 
 
 @dataclass(frozen=True)
@@ -247,3 +261,26 @@ class Alarm:
         if len(text) > MAX_PAYLOAD_LEN - ALARM_HEADER.size:
             raise ValueError("alarm message is too long")
         return ALARM_HEADER.pack(self.code) + text
+
+
+@dataclass(frozen=True)
+class LEDControl:
+    mode: LEDMode
+    brightness: int = 3
+    pixels: Tuple[Tuple[int, int, int], ...] = ()
+
+    def to_payload(self) -> bytes:
+        if not 0 <= self.brightness <= 20:
+            raise ValueError("LED brightness must be between 0 and 20")
+        if self.mode == LEDMode.FLOW:
+            if self.pixels:
+                raise ValueError("FLOW LED control cannot contain pixels")
+            return LED_CONTROL_HEADER.pack(self.mode, self.brightness, 0)
+        if self.mode != LEDMode.PIXELS or len(self.pixels) != 7:
+            raise ValueError("PIXELS LED control requires exactly 7 RGB values")
+        data = bytearray(LED_CONTROL_HEADER.pack(self.mode, self.brightness, 7))
+        for red, green, blue in self.pixels:
+            if not all(0 <= value <= 255 for value in (red, green, blue)):
+                raise ValueError("LED RGB values must be between 0 and 255")
+            data.extend((red, green, blue))
+        return bytes(data)

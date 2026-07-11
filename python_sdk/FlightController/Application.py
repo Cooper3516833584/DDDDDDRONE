@@ -17,6 +17,7 @@ class FC_Application(FC_Protocol):
         self._realtime_control_thread: threading.Thread = None  # type: ignore
         self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
         self._realtime_control_running = False
+        self._ground_station = None
 
     def set_height(self, source: int, height: int, speed: int) -> None:
         """
@@ -287,6 +288,155 @@ class FC_Application(FC_Protocol):
             self._realtime_control_data_in_xyzYaw[2] = vel_z
         if yaw is not None:
             self._realtime_control_data_in_xyzYaw[3] = yaw
+
+    @property
+    def ground_station(self):
+        """已启动的机载地面站门面，未启动时为 None。"""
+        return self._ground_station
+
+    @property
+    def ground_station_connected(self) -> bool:
+        return bool(
+            self._ground_station is not None
+            and self._ground_station.connected
+        )
+
+    @property
+    def ground_stop_requested(self) -> bool:
+        return bool(
+            self._ground_station is not None
+            and self._ground_station.stop_requested
+        )
+
+    def start_ground_station(
+        self,
+        key: Optional[bytes] = None,
+        stop_event: Optional[threading.Event] = None,
+        **link_options
+    ):
+        """启动机载 HC-14 地面站链路。
+
+        key 为空时从 GROUND_STATION_HMAC_KEY_HEX 环境变量读取。
+        返回的门面只收发状态、任务命令和 ACK，不直接执行飞行动作。
+        """
+        if self._ground_station is not None:
+            return self._ground_station
+
+        service_factory = link_options.pop("_service_factory", None)
+        if service_factory is None:
+            from FlightController.Components.GroundStationLink import (
+                AircraftGroundStation,
+            )
+
+            service_factory = AircraftGroundStation
+
+        if key is None:
+            station = service_factory.from_environment(
+                fc=self,
+                stop_event=stop_event,
+                **link_options
+            )
+        else:
+            station = service_factory(
+                fc=self,
+                key=key,
+                stop_event=stop_event,
+                **link_options
+            )
+        station.start()
+        self._ground_station = station
+        return station
+
+    def stop_ground_station(self) -> None:
+        station = self._ground_station
+        self._ground_station = None
+        if station is not None:
+            station.close()
+
+    def _require_ground_station(self):
+        if self._ground_station is None:
+            raise RuntimeError("ground station is not started")
+        return self._ground_station
+
+    def receive_ground_command(self, timeout: Optional[float] = None):
+        return self._require_ground_station().receive_command(timeout)
+
+    def ground_command_done(self) -> None:
+        self._require_ground_station().command_done()
+
+    @property
+    def ground_link_mode(self):
+        return self._require_ground_station().mode
+
+    def set_ground_link_mode(self, mode) -> None:
+        self._require_ground_station().set_mode(mode)
+
+    def enable_ground_command_reception(self) -> None:
+        """Use before takeoff: accept ground commands and return their ACKs."""
+        self._require_ground_station().enable_command_reception()
+
+    def enable_ground_telemetry(self) -> None:
+        """Use after takeoff: transmit state only; incoming commands are ignored."""
+        self._require_ground_station().enable_telemetry_transmission()
+
+    def accept_ground_command(self, command) -> None:
+        self._require_ground_station().accept(command)
+
+    def reject_ground_command(self, command, reason) -> None:
+        self._require_ground_station().reject(command, reason)
+
+    def complete_ground_command(self, command) -> None:
+        self._require_ground_station().complete(command)
+
+    def fail_ground_command(self, command, reason) -> None:
+        self._require_ground_station().fail(command, reason)
+
+    def prepare_ground_mission(self) -> None:
+        self._require_ground_station().prepare_new_mission()
+
+    def send_ground_status(
+        self,
+        state,
+        target1: Optional[int] = None,
+        target2: Optional[int] = None,
+        progress: int = 0,
+        error_code: int = 0,
+        message: str = "",
+    ) -> bool:
+        return self._require_ground_station().send_status(
+            state=state,
+            target1=target1,
+            target2=target2,
+            progress=progress,
+            error_code=error_code,
+            message=message,
+        )
+
+    def send_ground_alarm(self, code: int, message: str) -> bool:
+        return self._require_ground_station().send_alarm(code, message)
+
+    def send_ground_led(self, control) -> bool:
+        """Set the ground-station GPIO18 indicator while telemetry is enabled."""
+        return self._require_ground_station().send_led_control(control)
+
+    def set_ground_led_pixels(self, pixels, brightness: int = 3) -> bool:
+        from FlightController.Components.GroundStationLink import LEDControl, LEDMode
+
+        return self.send_ground_led(
+            LEDControl(LEDMode.PIXELS, brightness=brightness, pixels=tuple(pixels))
+        )
+
+    def reset_ground_led_flow(self, brightness: int = 3) -> bool:
+        from FlightController.Components.GroundStationLink import LEDControl, LEDMode
+
+        return self.send_ground_led(LEDControl(LEDMode.FLOW, brightness=brightness))
+
+    def send_ground_state(self) -> bool:
+        return self._require_ground_station().send_state()
+
+    def close(self, joined=True) -> None:
+        self.stop_ground_station()
+        return super().close(joined)
 
     def set_action_log(self, output: bool) -> None:
         """

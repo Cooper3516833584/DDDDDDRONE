@@ -14,13 +14,21 @@ from .models import (
     CommandAck,
     CommandId,
     FCStatePayload,
-    FLAG_UPLINK_WINDOW,
+    GroundLinkMode,
+    LEDControl,
     MessageType,
     MissionState,
     MissionStatus,
     RejectReason,
 )
-from .protocol import Frame, FrameParser, RecentResponseCache, new_session, pack_frame
+from .protocol import (
+    Frame,
+    FrameParser,
+    RecentResponseCache,
+    new_session,
+    pack_fast_telemetry,
+    pack_frame,
+)
 from .transport import HC14SerialTransport
 
 
@@ -49,11 +57,8 @@ class GroundStationLink:
         key: bytes,
         port: str = DEFAULT_HC14_PORT,
         baudrate: int = 9600,
-        telemetry_hz: float = 10.0,
-        heartbeat_seconds: float = 1.0,
+        telemetry_hz: float = 20.0,
         turnaround_seconds: float = 0.2,
-        uplink_window_interval_seconds: float = 2.0,
-        uplink_window_seconds: float = 0.8,
         stop_event: Optional[threading.Event] = None,
         state_provider: Optional[Callable[[], Optional[bytes]]] = None,
         queue_size: int = 32,
@@ -63,23 +68,19 @@ class GroundStationLink:
             raise ValueError("HMAC key is required")
         if telemetry_hz <= 0:
             raise ValueError("telemetry_hz must be positive")
-        if uplink_window_interval_seconds <= 0:
-            raise ValueError("uplink_window_interval_seconds must be positive")
-        if uplink_window_seconds <= 0:
-            raise ValueError("uplink_window_seconds must be positive")
         self._fc = fc
         self._key = key
         self._session = new_session()
         self._parser = FrameParser(key)
         self._peer_session = None  # type: Optional[int]
         self._telemetry_period = 1.0 / telemetry_hz
-        self._heartbeat_seconds = heartbeat_seconds
         self._turnaround_seconds = turnaround_seconds
-        self._uplink_window_interval_seconds = uplink_window_interval_seconds
-        self._uplink_window_seconds = uplink_window_seconds
         self._stop_event = stop_event
         self._state_provider = state_provider or self._snapshot_fc_state
         self._external_state_provider = state_provider is not None
+        self._batch_buffer = bytearray()
+        self._batch_count = 0
+        self._batch_lock = threading.Lock()
         self._queue = PriorityQueue(maxsize=queue_size)
         self._queue_counter = itertools.count()
         self._recent = RecentResponseCache(max_items=64)
@@ -88,7 +89,9 @@ class GroundStationLink:
         self._next_seq = 1
         self._stop = threading.Event()
         self._telemetry_thread = None  # type: Optional[threading.Thread]
-        self._telemetry_pause_until = 0.0
+        self._mode = GroundLinkMode.COMMAND_RX
+        self._mode_lock = threading.Lock()
+        self._mode_changed = threading.Event()
         self._last_rx_time = 0.0
         self._stop_lock = threading.Lock()
         self._stop_latched = False
@@ -110,6 +113,29 @@ class GroundStationLink:
     def connected(self) -> bool:
         return self._transport.connected
 
+    @property
+    def mode(self) -> GroundLinkMode:
+        with self._mode_lock:
+            return self._mode
+
+    def set_mode(self, mode: GroundLinkMode) -> None:
+        """Switch between pre-flight command reception and in-flight telemetry."""
+        try:
+            mode = GroundLinkMode(mode)
+        except ValueError as exc:
+            raise ValueError("invalid ground link mode") from exc
+        with self._mode_lock:
+            self._mode = mode
+        if mode == GroundLinkMode.COMMAND_RX:
+            self._clear_telemetry_batch()
+        self._mode_changed.set()
+
+    def enable_command_reception(self) -> None:
+        self.set_mode(GroundLinkMode.COMMAND_RX)
+
+    def enable_telemetry_transmission(self) -> None:
+        self.set_mode(GroundLinkMode.TELEMETRY_TX)
+
     def start(self) -> None:
         if self._telemetry_thread is not None and self._telemetry_thread.is_alive():
             return
@@ -124,6 +150,7 @@ class GroundStationLink:
 
     def close(self) -> None:
         self._stop.set()
+        self._clear_telemetry_batch()
         self._transport.stop()
         if self._telemetry_thread is not None:
             self._telemetry_thread.join(timeout=2.0)
@@ -175,7 +202,9 @@ class GroundStationLink:
         progress: int = 0,
         error_code: int = 0,
         message: str = "",
-    ) -> None:
+    ) -> bool:
+        if self.mode != GroundLinkMode.TELEMETRY_TX:
+            return False
         status = MissionStatus(
             state=state,
             target1=target1,
@@ -185,27 +214,50 @@ class GroundStationLink:
             message=message,
         )
         self._send_message(MessageType.MISSION_STATUS, status.to_payload())
+        return True
 
-    def report_alarm(self, code: int, message: str) -> None:
+    def report_alarm(self, code: int, message: str) -> bool:
+        if self.mode != GroundLinkMode.TELEMETRY_TX:
+            return False
         self._send_message(MessageType.ALARM, Alarm(code, message).to_payload())
+        return True
 
-    def send_fc_state_now(self, *, uplink_window: bool = False) -> bool:
+    def report_led_control(self, control: LEDControl) -> bool:
+        """Send a low-rate, authenticated GPIO18 indicator update to the ground."""
+        if self.mode != GroundLinkMode.TELEMETRY_TX:
+            return False
+        self._send_message(MessageType.LED_CONTROL, control.to_payload())
+        return True
+
+    def send_fc_state_now(self) -> bool:
+        if self.mode != GroundLinkMode.TELEMETRY_TX:
+            return False
         payload = self._state_provider()
         if payload is None:
             return False
         FCStatePayload.from_payload(payload)
-        flags = FLAG_UPLINK_WINDOW if uplink_window else 0
-        self._send_message(MessageType.FC_STATE, payload, flags=flags)
-        if uplink_window:
-            self._telemetry_pause_until = max(
-                self._telemetry_pause_until,
-                time.monotonic() + self._uplink_window_seconds,
-            )
+        frame_bytes = pack_fast_telemetry(
+            payload=payload[:13], session=self._session, seq=self._next_frame_seq()
+        )
+        batch = None
+        with self._batch_lock:
+            self._batch_buffer.extend(frame_bytes)
+            self._batch_count += 1
+            if self._batch_count >= 3:
+                batch = bytes(self._batch_buffer)
+                self._batch_buffer.clear()
+                self._batch_count = 0
+        if batch is not None:
+            self._write(batch)
         return True
+
+    def _clear_telemetry_batch(self) -> None:
+        with self._batch_lock:
+            self._batch_buffer.clear()
+            self._batch_count = 0
 
     def _on_connected(self) -> None:
         self._peer_session = None
-        self._send_message(MessageType.HEARTBEAT, b"\x02")
         logger.info("[GroundLink] HC-14 connected")
 
     def _on_disconnected(self, error: Optional[Exception]) -> None:
@@ -214,11 +266,10 @@ class GroundStationLink:
             logger.warning("[GroundLink] HC-14 disconnected: {}", error)
 
     def _on_bytes(self, data: bytes) -> None:
+        if self.mode != GroundLinkMode.COMMAND_RX:
+            return
         now = time.monotonic()
         self._last_rx_time = now
-        self._telemetry_pause_until = max(
-            self._telemetry_pause_until, now + 1.5
-        )
         for frame in self._parser.feed(data):
             if frame.msg_type == MessageType.HEARTBEAT:
                 self._peer_session = frame.session
@@ -228,6 +279,8 @@ class GroundStationLink:
                 self._handle_command(frame)
 
     def _handle_command(self, frame: Frame) -> None:
+        if self.mode != GroundLinkMode.COMMAND_RX:
+            return
         with self._recent_lock:
             cached = self._recent.get(frame.session, frame.seq)
         if cached is not None:
@@ -331,12 +384,20 @@ class GroundStationLink:
     def _build_frame(
         self, msg_type: MessageType, payload: bytes, flags: int = 0
     ) -> bytes:
+        return pack_frame(
+            msg_type,
+            payload,
+            self._session,
+            self._next_frame_seq(),
+            self._key,
+            flags=flags,
+        )
+
+    def _next_frame_seq(self) -> int:
         with self._seq_lock:
             seq = self._next_seq
             self._next_seq = 1 if seq >= 0xFFFF else seq + 1
-        return pack_frame(
-            msg_type, payload, self._session, seq, self._key, flags=flags
-        )
+        return seq
 
     def _write(self, data: bytes) -> None:
         delay = self._turnaround_seconds - (time.monotonic() - self._last_rx_time)
@@ -349,34 +410,28 @@ class GroundStationLink:
 
     def _telemetry_loop(self) -> None:
         next_state = 0.0
-        next_heartbeat = 0.0
-        next_uplink_window = 0.0
-        last_state_sent = 0.0
-        while not self._stop.wait(0.01):
+        while not self._stop.is_set():
+            if self.mode != GroundLinkMode.TELEMETRY_TX:
+                self._mode_changed.wait(0.05)
+                self._mode_changed.clear()
+                next_state = 0.0
+                continue
             now = time.monotonic()
             if not self.connected:
+                self._stop.wait(0.01)
                 continue
-            if now >= self._telemetry_pause_until and now >= next_state:
+            if now >= next_state:
                 if self._external_state_provider or bool(
                     self._fc is not None and getattr(self._fc, "connected", False)
                 ):
                     try:
-                        open_uplink_window = now >= next_uplink_window
-                        if self.send_fc_state_now(
-                            uplink_window=open_uplink_window
-                        ):
-                            last_state_sent = now
-                            if open_uplink_window:
-                                next_uplink_window = (
-                                    now + self._uplink_window_interval_seconds
-                                )
+                        if self.send_fc_state_now():
+                            pass
                     except (ValueError, TypeError) as exc:
                         logger.warning("[GroundLink] FC state snapshot failed: {}", exc)
                 next_state = now + self._telemetry_period
-            if now >= self._telemetry_pause_until and now >= next_heartbeat:
-                if now - last_state_sent >= self._heartbeat_seconds:
-                    self._send_message(MessageType.HEARTBEAT, b"\x02")
-                next_heartbeat = now + self._heartbeat_seconds
+            remaining = next_state - time.monotonic()
+            self._stop.wait(max(0.0, min(0.01, remaining)))
 
     def _snapshot_fc_state(self) -> Optional[bytes]:
         if self._fc is None:
