@@ -313,6 +313,23 @@ def main():
     else:
         print("No /dev/serial/by-id entries found.")
 
+    video_by_id = sorted(glob.glob("/dev/v4l/by-id/*"))
+    print("\n=== Stable video paths and indexes ===")
+    if video_by_id:
+        for path in video_by_id:
+            print("{} -> {}".format(path, os.path.realpath(path)))
+    else:
+        print("No /dev/v4l/by-id entries found.")
+    for sysfs_path in sorted(glob.glob("/sys/class/video4linux/video*")):
+        node_name = os.path.basename(sysfs_path)
+        name_path = os.path.join(sysfs_path, "name")
+        try:
+            with open(name_path, "r", encoding="utf-8") as name_file:
+                product_name = name_file.read().strip()
+        except OSError:
+            product_name = "unknown"
+        print("/dev/{} name={!r}".format(node_name, product_name))
+
     serial_ok = probe_serial_devices()
     camera_ok = probe_cameras()
 
@@ -346,7 +363,7 @@ class StreamState:
         self.finished = threading.Event()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Display two cameras from the airborne computer over SSH."
     )
@@ -358,8 +375,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs=2,
         metavar=("FIRST", "SECOND"),
-        default=(0, 2),
-        help="remote OpenCV camera indexes (default: 0 2)",
+        default=(2, 0),
+        help="remote OpenCV camera indexes (default: front 2, downward 0)",
     )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
@@ -382,7 +399,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="reject hosts not already present in the local SSH known-hosts file",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -631,8 +648,8 @@ def run_viewer(args: argparse.Namespace) -> int:
         cv2.destroyAllWindows()
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv=None) -> int:
+    args = parse_args(argv)
     try:
         validate_args(args)
         return run_viewer(args)
