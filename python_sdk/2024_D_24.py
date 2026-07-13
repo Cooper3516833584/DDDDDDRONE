@@ -14,6 +14,11 @@ from FlightController.Solutions.Navigation import Navigation
 from FlightController.Components.RosMapper import RosMapper
 from FlightController.Components.RosNode import RosNodeRunner
 from FlightController.Components.RosManager import RosManager
+from FlightController.Components.GroundStationLink import (
+    CommandId,
+    MissionState,
+    RejectReason,
+)
 import vision_of_tf
 from vision_of_tf import (
     _detect_qrcodes,
@@ -25,6 +30,9 @@ from vision_of_tf import (
 # ============ 可调参数 ============
 CRUISE_SPEED = 22            # 水平导航速度 cm/s
 CRUISE_HEIGHT = 120          # 巡航高度 cm (待定)
+QR_UPPER_HEIGHT = 150.0      # 上层二维码扫描高度 cm
+QR_LOWER_HEIGHT = 90.0       # 下层二维码扫描高度 cm
+LANDING_SCAN_HEIGHT = 30.0   # 黑色圆形降落标记扫描高度 cm
 VERTICAL_SPEED = 22          # 垂直速度 cm/s
 QR_SEARCH_STEP = 50          # QR 搜索步长 cm
 QR_SEARCH_MAX = 300          # QR 搜索最大距离 cm
@@ -43,6 +51,10 @@ QR_GRID_Z_STEP = 60          # QR 网格纵向 (z) 间距 cm
 QR_GRID_Y_STEP = 40          # QR 网格横向 (y) 间距 cm
 QR_SCAN_TOTAL_ROUNDS = 4     # 总巡检轮数
 QR_SCAN_PER_ROUND = 6        # 每轮 QR 数量
+INVENTORY_TOTAL = QR_SCAN_TOTAL_ROUNDS * QR_SCAN_PER_ROUND
+LASER_CHANNEL = 1            # 沿用当前任务代码预留的数字输出通道
+GROUND_LED_WHITE = ((255, 255, 255),) * 7
+GROUND_LED_OFF = ((0, 0, 0),) * 7
 # =================================
 
 
@@ -66,11 +78,15 @@ class Mission(object):
         self._last_qr_offset: Optional[tuple] = None
         # QR 多轮扫描状态
         self._qr_round: int = 0           # 当前轮次 (0-based, 每轮结束后递增)
-        self._qr_positions: dict = {}      # {"A1": (x,y), "A2": ..., "B1": ...}
+        self._qr_positions: dict = {}      # {货物编号: "A1", ...}
 
     def stop(self):
         self.navi.stop()
         logger.info("[MISSION] Mission stopped")
+
+    @property
+    def inventory_results(self) -> dict:
+        return dict(self._qr_positions)
 
     # ================================================================
     #  TODO 汇总 (按优先级排列)
@@ -81,7 +97,7 @@ class Mission(object):
     #
     #  [TODO-2] 视觉识别位置闭环 — ✅ 已接入 vision_of_tf
     #    detect_qr_code() → vision_of_tf.detect_qrcode_offset()
-    #    detect_landing_spot() → vision_of_tf.detect_black_circle/rectangle_offset()
+    #    detect_landing_spot() → vision_of_tf.detect_black_circle_offset()
     #    vision_qr_approach() → 根据 y_px 偏移量左右精调使 QR 居中
     #
     #  [TODO-3] 激光笔控制
@@ -143,7 +159,7 @@ class Mission(object):
         speed: float = BARRIER_APPROACH_SPEED,
         anomaly_threshold: float = BARRIER_ANOMALY_THRESH,
         timeout: float = 60.0,
-    ):
+    ) -> bool:
         """障碍物板距离判定与位置闭环。
 
         识别到 QR 码后调用，以 10Hz 频率检测到障碍物板的距离，
@@ -173,6 +189,19 @@ class Mission(object):
         t0 = time.perf_counter()
 
         while True:
+            if time.perf_counter() - t0 > timeout:
+                navi.stop_move()
+                final_distance = (
+                    "unavailable"
+                    if prev_distance is None
+                    else f"{prev_distance:.1f}cm"
+                )
+                logger.warning(
+                    f"[BARRIER] Timeout after {timeout}s, "
+                    f"last valid distance={final_distance}"
+                )
+                return False
+
             # ---- 1. 雷达测距 ----
             distance = self._measure_barrier_distance()
 
@@ -191,7 +220,7 @@ class Mission(object):
                     f"[BARRIER] Converged: {distance:.1f}cm within "
                     f"±{tolerance}cm of {target_distance}cm"
                 )
-                break
+                return True
 
             # ---- 3. 异常数据过滤 ----
             if prev_distance is not None and abs(distance - prev_distance) > anomaly_threshold:
@@ -223,45 +252,29 @@ class Mission(object):
             # ---- 4. 发送速度指令 ----
             navi.move_by_direction(speed=speed, direction_deg=prev_direction)
 
-            # ---- 5. 超时保护 ----
-            if time.perf_counter() - t0 > timeout:
-                navi.stop_move()
-                logger.warning(
-                    f"[BARRIER] Timeout after {timeout}s, "
-                    f"final distance = {distance:.1f} cm"
-                )
-                break
-
-            # ---- 6. 10Hz 循环 ----
+            # ---- 5. 10Hz 循环 ----
             time.sleep(0.1)
-
-        # 恢复导航闭环
-        navi.stop_move()
-        logger.info("[BARRIER] Align finished, navigation PID restored")
 
     # ================================================================
     #  [TODO-3] 激光笔控制
     # ================================================================
-    def laser_on(self, channel: int = 1):
+    def laser_on(self, channel: int = LASER_CHANNEL):
         """
-        [TODO-3] 打开激光笔
+        打开激光笔
 
         Args:
             channel: 飞控数字输出通道号 (需根据实际接线确认)
 
-        实现思路:
-          fc.set_digital_output(channel, True)
-          或 fc.set_PWM_output(channel, 100)
         """
-        logger.info(f"[LASER] Laser ON (channel={channel}) — placeholder")
-        # self.fc.set_digital_output(channel, True)
+        logger.info(f"[LASER] Laser ON (channel={channel})")
+        self.fc.set_digital_output(channel, True)
 
-    def laser_off(self, channel: int = 1):
+    def laser_off(self, channel: int = LASER_CHANNEL):
         """
-        [TODO-3] 关闭激光笔
+        关闭激光笔
         """
-        logger.info(f"[LASER] Laser OFF (channel={channel}) — placeholder")
-        # self.fc.set_digital_output(channel, False)
+        logger.info(f"[LASER] Laser OFF (channel={channel})")
+        self.fc.set_digital_output(channel, False)
 
     # ================================================================
     #  视觉函数 — 封装 vision_of_tf
@@ -325,7 +338,7 @@ class Mission(object):
         px_thresh: float = VISION_PX_THRESH,
         z_px_thresh: float = VISION_Z_PX_THRESH,
         height_step: float = VISION_HEIGHT_STEP,
-    ):
+    ) -> bool:
         """QR 码双轴视觉位置闭环。
 
         坐标系约定 (前视摄像头):
@@ -374,7 +387,7 @@ class Mission(object):
                 logger.info(
                     f"[VISION] QR centered: y={y_px:.0f}px, z={z_px:.0f}px"
                 )
-                return
+                return True
 
             # ---- 3. 水平方向校正 (y_px → y正) ----
             # y_px > 0: QR 在画面左侧 → 飞机向左 (yaw + 90°)
@@ -392,7 +405,7 @@ class Mission(object):
             # z_px > 0: QR 在画面上方 → 飞机上升
             # z_px < 0: QR 在画面下方 → 飞机下降
             if not z_ok:
-                delta_h = height_step * (-1 if z_px > 0 else 1)
+                delta_h = height_step * (1 if z_px > 0 else -1)
                 new_h = navi.current_height + delta_h
                 # 钳制在合理范围 (不低于 30cm)
                 new_h = max(30.0, new_h)
@@ -405,6 +418,7 @@ class Mission(object):
         # 超时
         navi.stop_move()
         logger.warning(f"[VISION] QR approach timeout after {timeout}s")
+        return False
 
     # ================================================================
     #  QR 多轮扫描: 每轮 6 个 QR, 共 4 轮
@@ -412,46 +426,70 @@ class Mission(object):
     #  扫描顺序固定 (2列 × 3行网格):
     #    右上→右下→中下→中上→左上→左下
     #
-    #  QR 编号不由扫描顺序决定, 每轮占一个连续的编号段:
-    #    第1轮: 1~6 → A1~A6     第2轮: 7~12 → B1~B6
-    #    第3轮: 13~18 → C1~C6   第4轮: 19~24 → D1~D6
-    #
-    #  每个位置的名字由摄像头解码出的实际编号决定:
-    #    例: 第1轮在"右上"位读到 3 → 记录为 A3 的位置
-    #        第2轮在"中下"位读到 11 → 记录为 B5 的位置
+    #  QR 内容是货物编号 1~24，位置由实际扫描格位决定:
+    #    第1轮格位 → A1~A6      第2轮格位 → B1~B6
+    #    第3轮格位 → C1~C6      第4轮格位 → D1~D6
     # ================================================================
 
-    def _qr_position_name(self, qr_number: int) -> str:
-        """将 QR 编号映射为位置名称。
+    def _report_inventory_item(self, qr_number: int, position_name: str):
+        """向地面站上报盘点结果，并让 7 颗 LED 全白闪烁约 1 秒。"""
+        progress = min(100, round(len(self._qr_positions) * 100 / INVENTORY_TOTAL))
+        self.fc.send_ground_status(
+            MissionState.RUNNING,
+            progress=progress,
+            message=f"INV:ITEM:{qr_number}:{position_name}",
+        )
+        self.fc.set_ground_led_pixels(GROUND_LED_WHITE, brightness=4)
+        laser_started = False
+        try:
+            self.laser_on()
+            laser_started = True
+            time.sleep(0.5)
+        finally:
+            try:
+                if laser_started:
+                    self.laser_off()
+            finally:
+                time.sleep(0.5)
+                self.fc.set_ground_led_pixels(GROUND_LED_OFF, brightness=0)
 
-        例: 1→A1, 2→A2, ..., 6→A6,
-            7→B1, ..., 12→B6,
-            13→C1, ..., 24→D6
-        """
-        round_idx = (qr_number - 1) // QR_SCAN_PER_ROUND
-        round_letter = chr(ord("A") + round_idx)
-        index_in_round = ((qr_number - 1) % QR_SCAN_PER_ROUND) + 1
-        return f"{round_letter}{index_in_round}"
-
-    def _single_qr_action(self, label: str) -> int:
+    def _single_qr_action(
+        self, position_name: str, label: str, scan_height: float
+    ) -> int:
         """单个 QR 码格位的完整动作序列:
           1. barrier_distance_align()   — 障碍物板距离闭环 75±5cm
           2. vision_qr_approach()      — 双轴视觉精调 (z高低 + y左右)
-          3. 解码 QR 编号 → 决定位置名称
-          4. 记录坐标到 self._qr_positions
+          3. 解码 QR 货物编号
+          4. 记录货物编号对应的实际格位，并上报地面站
           5. 激光笔指示 + 动作
 
         Returns:
             解码出的 QR 编号 (number), 解码失败则返回 0
         """
         navi = self.navi
-        logger.info(f"[QR-{label}] barrier + vision + laser")
+        logger.info(
+            f"[QR-{label}] height={scan_height:.0f}cm + barrier + vision + laser"
+        )
+
+        # Step 0: 每个格位都先回到该层的固定扫描高度，避免视觉精调累积漂移
+        navi.set_height(scan_height)
+        navi.wait_for_height()
+        if abs(navi.current_height - scan_height) >= 8.0:
+            logger.error(
+                f"[QR-{label}] scan height not reached: "
+                f"current={navi.current_height:.1f}cm, target={scan_height:.1f}cm"
+            )
+            return 0
 
         # Step 1: 障碍物板距离闭环
-        self.barrier_distance_align()
+        if not self.barrier_distance_align():
+            logger.error(f"[QR-{label}] barrier distance not aligned, skipping QR")
+            return 0
 
         # Step 2: 双轴视觉精调 (z + y)
-        self.vision_qr_approach()
+        if not self.vision_qr_approach():
+            logger.error(f"[QR-{label}] QR not centered, skipping decode/action")
+            return 0
 
         # Step 3: 解码 QR 编号 (打开摄像头读一帧)
         verified = self._detect_qr_number_and_offset()
@@ -461,19 +499,26 @@ class Mission(object):
             logger.warning(f"[QR-{label}] QR decode failed, cannot record")
             return 0
 
-        # Step 4: 用实际编号生成位置名, 记录坐标
-        pos_name = self._qr_position_name(qr_number)
-        current_pt = (float(navi.current_x), float(navi.current_y))
-        self._qr_positions[pos_name] = current_pt
+        if not 1 <= qr_number <= INVENTORY_TOTAL:
+            logger.warning(f"[QR-{label}] cargo number out of range: {qr_number}")
+            return 0
+        previous_position = self._qr_positions.get(qr_number)
+        if previous_position is not None and previous_position != position_name:
+            logger.warning(
+                f"[QR-{label}] duplicate cargo #{qr_number}: "
+                f"already recorded at {previous_position}"
+            )
+            return 0
+
+        # Step 4: 货物编号跟随二维码内容，位置跟随当前实际扫描格位
+        self._qr_positions[qr_number] = position_name
         logger.info(
-            f"[QR-{label}] decoded #{qr_number} → {pos_name}, "
-            f"pos=({current_pt[0]:.1f}, {current_pt[1]:.1f})"
+            f"[QR-{label}] decoded cargo #{qr_number} → {position_name}, "
+            f"map=({navi.current_x:.1f}, {navi.current_y:.1f})"
         )
 
-        # Step 5: 激光笔 + 动作
-        # self.laser_on()
-        time.sleep(0.5)
-        # self.laser_off()
+        # Step 5: 激光笔 0.5 秒 + 地面站全白灯 1 秒
+        self._report_inventory_item(qr_number, position_name)
 
         return qr_number
 
@@ -491,8 +536,8 @@ class Mission(object):
            ②→③: y正 40cm (左移)     ④→⑤: y正 40cm (左移)
            ⑤→⑥: z负 60cm (下降)
 
-        QR 编号不由扫描顺序决定; 每个格位上实际放的是哪个 QR 卡片,
-        由摄像头解码出的文本决定。位置名 (A1~D6) 始终跟编号走。
+        QR 编号不由扫描顺序决定；二维码文本是货物编号，位置名由当前
+        扫描轮次和格位决定。
         """
         navi = self.navi
         round_index = self._qr_round
@@ -503,14 +548,15 @@ class Mission(object):
         )
 
         # ---- 格位 1: 右上 (起始点) ----
-        self._single_qr_action(f"{round_letter}-G1(右上)")
+        self._single_qr_action(
+            f"{round_letter}1", f"{round_letter}-G1(右上)", QR_UPPER_HEIGHT
+        )
 
         # ---- 格位 2: 右下 (z负 60cm = 下降) ----
         logger.info(f"[MISSION]   ── z- {QR_GRID_Z_STEP}cm → G2(右下)")
-        new_h = max(30.0, navi.current_height - QR_GRID_Z_STEP)
-        navi.set_height(new_h)
-        navi.wait_for_height()
-        self._single_qr_action(f"{round_letter}-G2(右下)")
+        self._single_qr_action(
+            f"{round_letter}2", f"{round_letter}-G2(右下)", QR_LOWER_HEIGHT
+        )
 
         # ---- 格位 3: 中下 (y正 40cm = 左移) ----
         logger.info(f"[MISSION]   ── y+ {QR_GRID_Y_STEP}cm → G3(中下)")
@@ -519,14 +565,15 @@ class Mission(object):
         abs_dy = QR_GRID_Y_STEP * np.cos(yaw_rad)
         target = navi.current_point + np.array([abs_dx, abs_dy])
         navi.navigation_to_waypoint(target, wait=True)
-        self._single_qr_action(f"{round_letter}-G3(中下)")
+        self._single_qr_action(
+            f"{round_letter}3", f"{round_letter}-G3(中下)", QR_LOWER_HEIGHT
+        )
 
         # ---- 格位 4: 中上 (z正 60cm = 上升) ----
         logger.info(f"[MISSION]   ── z+ {QR_GRID_Z_STEP}cm → G4(中上)")
-        new_h = navi.current_height + QR_GRID_Z_STEP
-        navi.set_height(new_h)
-        navi.wait_for_height()
-        self._single_qr_action(f"{round_letter}-G4(中上)")
+        self._single_qr_action(
+            f"{round_letter}4", f"{round_letter}-G4(中上)", QR_UPPER_HEIGHT
+        )
 
         # ---- 格位 5: 左上 (y正 40cm = 左移) ----
         logger.info(f"[MISSION]   ── y+ {QR_GRID_Y_STEP}cm → G5(左上)")
@@ -535,23 +582,24 @@ class Mission(object):
         abs_dy = QR_GRID_Y_STEP * np.cos(yaw_rad)
         target = navi.current_point + np.array([abs_dx, abs_dy])
         navi.navigation_to_waypoint(target, wait=True)
-        self._single_qr_action(f"{round_letter}-G5(左上)")
+        self._single_qr_action(
+            f"{round_letter}5", f"{round_letter}-G5(左上)", QR_UPPER_HEIGHT
+        )
 
         # ---- 格位 6: 左下 (z负 60cm = 下降) ----
         logger.info(f"[MISSION]   ── z- {QR_GRID_Z_STEP}cm → G6(左下)")
-        new_h = max(30.0, navi.current_height - QR_GRID_Z_STEP)
-        navi.set_height(new_h)
-        navi.wait_for_height()
-        self._single_qr_action(f"{round_letter}-G6(左下)")
+        self._single_qr_action(
+            f"{round_letter}6", f"{round_letter}-G6(左下)", QR_LOWER_HEIGHT
+        )
 
         # 轮次结束, 递增计数器
         self._qr_round += 1
 
         # 打印本轮收集到的位置
         round_positions = {
-            k: (round(v[0], 1), round(v[1], 1))
-            for k, v in self._qr_positions.items()
-            if k.startswith(round_letter)
+            cargo_number: position_name
+            for cargo_number, position_name in self._qr_positions.items()
+            if position_name.startswith(round_letter)
         }
         logger.info(
             f"[MISSION] ╚══ QR Round {round_letter} COMPLETE, "
@@ -566,7 +614,7 @@ class Mission(object):
             )
 
     def detect_landing_spot(self) -> bool:
-        """调用 vision_of_tf 检测下视画面中的黑色形状 (圆/矩形)。
+        """调用 vision_of_tf 检测下视画面中的黑色圆形。
 
         若检测到，同时将偏移量缓存到 self._last_landing_offset，
         供 landing_vision_approach 初始参考。
@@ -579,14 +627,6 @@ class Mission(object):
         if result is not None:
             logger.info(f"[LANDING] Black circle: offset={result}")
             self._landing_offset_type = "circle"
-            self._last_landing_offset = result
-            return True
-
-        # 再尝试黑色矩形
-        result = vision_of_tf.detect_black_rectangle_offset(self.landing_camera_index)
-        if result is not None:
-            logger.info(f"[LANDING] Black rectangle: offset={result}")
-            self._landing_offset_type = "rectangle"
             self._last_landing_offset = result
             return True
 
@@ -607,10 +647,6 @@ class Mission(object):
         if result is not None:
             self._last_landing_offset = result
             return result
-        result = vision_of_tf.detect_black_rectangle_offset(self.landing_camera_index)
-        if result is not None:
-            self._last_landing_offset = result
-            return result
         return None
 
     def landing_vision_approach(
@@ -618,7 +654,7 @@ class Mission(object):
         timeout: float = 30.0,
         speed: float = LANDING_APPROACH_SPEED,
         px_thresh: float = VISION_PX_THRESH,
-    ):
+    ) -> bool:
         """落点视觉位置闭环。
 
         下视摄像头坐标系约定:
@@ -660,7 +696,7 @@ class Mission(object):
                 logger.info(
                     f"[LANDING] Centered over mark: x={x_px:.0f}px, y={y_px:.0f}px"
                 )
-                return
+                return True
 
             # ---- 3. 合成移动方向 ----
             # x_px > 0 → 画面上方(机头正前) → 向前分量
@@ -680,6 +716,23 @@ class Mission(object):
         # 超时
         navi.stop_move()
         logger.warning(f"[LANDING] Vision approach timeout after {timeout}s")
+        return False
+
+    def land_after_visual_alignment(self):
+        """停止导航输出并直接交给飞控执行降落和锁桨兜底。"""
+        navi = self.navi
+        fc = self.fc
+
+        navi.stop_move()
+        navi.set_navigation_state(False)
+        navi.set_keep_height_state(False)
+        fc.set_flight_mode(fc.PROGRAM_MODE)
+        time.sleep(0.1)
+        fc.stablize()
+        fc.land()
+        if not fc.wait_for_lock():
+            logger.warning("[LANDING] Auto lock timeout, forcing lock")
+            fc.lock()
 
     # ================================================================
     #  f1: QR 码扫描 → 搜索 → 动作 → 升回巡航高度
@@ -869,23 +922,32 @@ class Mission(object):
         navi.navigation_to_waypoint(target, wait=True)
 
         # ================================================================
-        #  Step H:  落点识别 + 视觉精调
+        #  Step H:  下降到 30cm，识别黑色圆形并视觉精调
         # ================================================================
-        logger.info("[MISSION] Step H: Landing spot detection + vision approach")
+        logger.info(
+            f"[MISSION] Step H: descend to {LANDING_SCAN_HEIGHT:.0f}cm, "
+            "detect black circle and center"
+        )
+        navi.set_height(LANDING_SCAN_HEIGHT)
+        navi.wait_for_height()
+        if abs(navi.current_height - LANDING_SCAN_HEIGHT) >= 8.0:
+            raise RuntimeError(
+                "Unable to reach landing scan height: "
+                f"current={navi.current_height:.1f}cm, "
+                f"target={LANDING_SCAN_HEIGHT:.1f}cm"
+            )
+
         landing_spot_found = self.detect_landing_spot()
-        if landing_spot_found:
-            logger.info("[MISSION]   Landing spot detected, visual centering...")
-            self.landing_vision_approach()
-            logger.info("[MISSION]   Landing spot centered, descending")
-        else:
-            logger.warning("[MISSION]   Landing spot not found, "
-                           "landing at current position")
+        if not landing_spot_found:
+            logger.info("[MISSION]   Black circle not found in initial scan, retrying")
+        if not self.landing_vision_approach():
+            raise RuntimeError("Black landing circle was not centered before timeout")
 
         # ================================================================
-        #  Step I:  定点降落 (在精调后的位置)
+        #  Step I:  视觉居中后直接调用飞控降落
         # ================================================================
-        logger.info("[MISSION] Step I: Landing")
-        navi.pointing_landing(navi.current_point)
+        logger.info("[MISSION] Step I: Black circle centered, FC landing")
+        self.land_after_visual_alignment()
         logger.info("[MISSION] ========== Mission Complete ==========")
 
 
@@ -950,9 +1012,40 @@ if __name__ == "__main__":
         mapper=mapper,
     )
 
+    # ---- 步骤 9: 等待地面站通过 HC-14 发送 START_MISSION ----
+    fc.start_ground_station()
+    fc.enable_ground_command_reception()
+    logger.info("[MANAGER] Waiting for ground-station start command")
+    ground_command = None
+    while ground_command is None:
+        command = fc.receive_ground_command(timeout=0.5)
+        if command is None:
+            continue
+        try:
+            if command.command.command_id == CommandId.START_MISSION:
+                fc.prepare_ground_mission()
+                fc.accept_ground_command(command)
+                ground_command = command
+                logger.info("[MANAGER] Ground-station start accepted")
+            elif command.command.command_id == CommandId.STOP_MISSION:
+                fc.complete_ground_command(command)
+            else:
+                fc.reject_ground_command(command, RejectReason.UNKNOWN_COMMAND)
+        finally:
+            fc.ground_command_done()
+
+    fc.enable_ground_telemetry()
+    fc.send_ground_status(
+        MissionState.RUNNING,
+        progress=0,
+        message="INV:START",
+    )
+
+    mission_error = None
     try:
         mission.run()
     except Exception as e:
+        mission_error = e
         logger.exception(f"[MANAGER] Mission Failed: {e}")
     finally:
         mission.stop()
@@ -964,6 +1057,41 @@ if __name__ == "__main__":
             ret = fc.wait_for_lock()
             if not ret:
                 fc.lock()
+
+        # 只有降落并锁桨后才向地面站报告最终结果。
+        results = mission.inventory_results
+        progress = min(100, round(len(results) * 100 / INVENTORY_TOTAL))
+        try:
+            fc.set_ground_led_pixels(GROUND_LED_OFF, brightness=0)
+            if mission_error is not None:
+                fc.send_ground_status(
+                    MissionState.FAILED,
+                    progress=progress,
+                    error_code=1,
+                    message=f"INV:FAILED:{type(mission_error).__name__}",
+                )
+                fc.fail_ground_command(ground_command, RejectReason.FC_OFFLINE)
+            elif len(results) != INVENTORY_TOTAL:
+                fc.send_ground_status(
+                    MissionState.FAILED,
+                    progress=progress,
+                    error_code=2,
+                    message=f"INV:INCOMPLETE:{len(results)}",
+                )
+                fc.fail_ground_command(
+                    ground_command, RejectReason.CAMERA_UNAVAILABLE
+                )
+            else:
+                fc.send_ground_status(
+                    MissionState.COMPLETED,
+                    progress=100,
+                    message=f"INV:COMPLETE:{len(results)}",
+                )
+                fc.complete_ground_command(ground_command)
+        except Exception as report_error:
+            logger.exception(
+                f"[MANAGER] Ground-station final report failed: {report_error}"
+            )
 
     logger.info("[MANAGER] Mission finished")
     fc.close()
