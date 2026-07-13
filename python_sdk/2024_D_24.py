@@ -31,13 +31,13 @@ from vision_of_tf import (
 
 # ============ 可调参数 ============
 CRUISE_SPEED = 22            # 水平导航速度 cm/s
-CRUISE_HEIGHT = 120          # 巡航高度 cm (待定)
+CRUISE_HEIGHT = 150          # 巡航高度 cm (待定)
 QR_UPPER_HEIGHT = 150.0      # 上层二维码扫描高度 cm
 QR_LOWER_HEIGHT = 90.0       # 下层二维码扫描高度 cm
 LANDING_SCAN_HEIGHT = 30.0   # 黑色圆形降落标记扫描高度 cm
 VERTICAL_SPEED = 22          # 垂直速度 cm/s
 QR_SEARCH_STEP = 50          # QR 搜索步长 cm
-QR_SEARCH_MAX = 300          # QR 搜索最大距离 cm
+QR_SEARCH_MAX = 250          # QR 搜索最大距离 cm
 BARRIER_TARGET_DIST = 75.0   # 障碍物板目标距离 cm
 BARRIER_TOLERANCE = 5.0      # 距离允许误差 cm (±)
 BARRIER_APPROACH_SPEED = 5  # 逼近速度 cm/s
