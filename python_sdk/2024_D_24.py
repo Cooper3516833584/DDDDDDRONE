@@ -3,6 +3,8 @@
 使用 ROS (fusion-ros) 作为位置闭环
 基于 2025_嵌赛.py 模板框架
 """
+import json
+import os
 import time
 from typing import Optional
 import numpy as np
@@ -52,6 +54,7 @@ QR_GRID_Y_STEP = 40          # QR 网格横向 (y) 间距 cm
 QR_SCAN_TOTAL_ROUNDS = 4     # 总巡检轮数
 QR_SCAN_PER_ROUND = 6        # 每轮 QR 数量
 INVENTORY_TOTAL = QR_SCAN_TOTAL_ROUNDS * QR_SCAN_PER_ROUND
+INVENTORY_RECORD_FILENAME = "2024_D_24_inventory.json"
 LASER_CHANNEL = 1            # 沿用当前任务代码预留的数字输出通道
 GROUND_LED_WHITE = ((255, 255, 255),) * 7
 GROUND_LED_OFF = ((0, 0, 0),) * 7
@@ -79,6 +82,11 @@ class Mission(object):
         # QR 多轮扫描状态
         self._qr_round: int = 0           # 当前轮次 (0-based, 每轮结束后递增)
         self._qr_positions: dict = {}      # {货物编号: "A1", ...}
+        self._inventory_record_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            INVENTORY_RECORD_FILENAME,
+        )
+        self._save_inventory_results()
 
     def stop(self):
         self.navi.stop()
@@ -87,6 +95,27 @@ class Mission(object):
     @property
     def inventory_results(self) -> dict:
         return dict(self._qr_positions)
+
+    def _save_inventory_results(self):
+        """将已识别的物理槽位和二维码数字原子写入任务同目录。"""
+        records = [
+            {
+                "position": position_name,
+                "qr_number": qr_number,
+            }
+            for qr_number, position_name in sorted(
+                self._qr_positions.items(), key=lambda item: item[1]
+            )
+        ]
+        temporary_path = self._inventory_record_path + ".tmp"
+        with open(temporary_path, "w", encoding="utf-8", newline="\n") as file:
+            json.dump(records, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        os.replace(temporary_path, self._inventory_record_path)
+        logger.info(
+            f"[INVENTORY] Saved {len(records)} records to "
+            f"{INVENTORY_RECORD_FILENAME}"
+        )
 
     # ================================================================
     #  TODO 汇总 (按优先级排列)
@@ -512,6 +541,7 @@ class Mission(object):
 
         # Step 4: 货物编号跟随二维码内容，位置跟随当前实际扫描格位
         self._qr_positions[qr_number] = position_name
+        self._save_inventory_results()
         logger.info(
             f"[QR-{label}] decoded cargo #{qr_number} → {position_name}, "
             f"map=({navi.current_x:.1f}, {navi.current_y:.1f})"
@@ -525,7 +555,12 @@ class Mission(object):
     def qr_code_action(self):
         """单轮 QR 码扫描 (6 个格位)。
 
-        扫描顺序: 右上(1) → 右下(2) → 中下(3) → 中上(4) → 左上(5) → 左下(6)
+        板面槽位布局（从左到右、从上到下）:
+           A1  A2  A3
+           A4  A5  A6
+
+        实际蛇形扫描顺序:
+           右上(3) → 右下(6) → 中下(5) → 中上(2) → 左上(1) → 左下(4)
 
         坐标系 (前视摄像头画面 → 飞机):
            画面左 → 飞机 y正    (move_by_direction yaw+90°)
@@ -547,18 +582,18 @@ class Mission(object):
             f"[MISSION] ╔══ QR Round {round_letter} START ══╗"
         )
 
-        # ---- 格位 1: 右上 (起始点) ----
+        # ---- 扫描点 G1: 右上 → 本面槽位 3 ----
         self._single_qr_action(
-            f"{round_letter}1", f"{round_letter}-G1(右上)", QR_UPPER_HEIGHT
+            f"{round_letter}3", f"{round_letter}-G1(右上)", QR_UPPER_HEIGHT
         )
 
-        # ---- 格位 2: 右下 (z负 60cm = 下降) ----
+        # ---- 扫描点 G2: 右下 → 本面槽位 6 ----
         logger.info(f"[MISSION]   ── z- {QR_GRID_Z_STEP}cm → G2(右下)")
         self._single_qr_action(
-            f"{round_letter}2", f"{round_letter}-G2(右下)", QR_LOWER_HEIGHT
+            f"{round_letter}6", f"{round_letter}-G2(右下)", QR_LOWER_HEIGHT
         )
 
-        # ---- 格位 3: 中下 (y正 40cm = 左移) ----
+        # ---- 扫描点 G3: 中下 → 本面槽位 5 ----
         logger.info(f"[MISSION]   ── y+ {QR_GRID_Y_STEP}cm → G3(中下)")
         yaw_rad = np.deg2rad(navi.current_yaw)
         abs_dx = -QR_GRID_Y_STEP * np.sin(yaw_rad)
@@ -566,16 +601,16 @@ class Mission(object):
         target = navi.current_point + np.array([abs_dx, abs_dy])
         navi.navigation_to_waypoint(target, wait=True)
         self._single_qr_action(
-            f"{round_letter}3", f"{round_letter}-G3(中下)", QR_LOWER_HEIGHT
+            f"{round_letter}5", f"{round_letter}-G3(中下)", QR_LOWER_HEIGHT
         )
 
-        # ---- 格位 4: 中上 (z正 60cm = 上升) ----
+        # ---- 扫描点 G4: 中上 → 本面槽位 2 ----
         logger.info(f"[MISSION]   ── z+ {QR_GRID_Z_STEP}cm → G4(中上)")
         self._single_qr_action(
-            f"{round_letter}4", f"{round_letter}-G4(中上)", QR_UPPER_HEIGHT
+            f"{round_letter}2", f"{round_letter}-G4(中上)", QR_UPPER_HEIGHT
         )
 
-        # ---- 格位 5: 左上 (y正 40cm = 左移) ----
+        # ---- 扫描点 G5: 左上 → 本面槽位 1 ----
         logger.info(f"[MISSION]   ── y+ {QR_GRID_Y_STEP}cm → G5(左上)")
         yaw_rad = np.deg2rad(navi.current_yaw)
         abs_dx = -QR_GRID_Y_STEP * np.sin(yaw_rad)
@@ -583,13 +618,13 @@ class Mission(object):
         target = navi.current_point + np.array([abs_dx, abs_dy])
         navi.navigation_to_waypoint(target, wait=True)
         self._single_qr_action(
-            f"{round_letter}5", f"{round_letter}-G5(左上)", QR_UPPER_HEIGHT
+            f"{round_letter}1", f"{round_letter}-G5(左上)", QR_UPPER_HEIGHT
         )
 
-        # ---- 格位 6: 左下 (z负 60cm = 下降) ----
+        # ---- 扫描点 G6: 左下 → 本面槽位 4 ----
         logger.info(f"[MISSION]   ── z- {QR_GRID_Z_STEP}cm → G6(左下)")
         self._single_qr_action(
-            f"{round_letter}6", f"{round_letter}-G6(左下)", QR_LOWER_HEIGHT
+            f"{round_letter}4", f"{round_letter}-G6(左下)", QR_LOWER_HEIGHT
         )
 
         # 轮次结束, 递增计数器
@@ -597,7 +632,7 @@ class Mission(object):
 
         # 打印本轮收集到的位置
         round_positions = {
-            cargo_number: position_name
+            position_name: cargo_number
             for cargo_number, position_name in self._qr_positions.items()
             if position_name.startswith(round_letter)
         }

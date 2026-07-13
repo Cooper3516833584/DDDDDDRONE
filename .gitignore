@@ -3,3 +3,11 @@
 /*.xlsx
 /*.xlsm
 /*.xlsb
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
+# Runtime inventory records
+/python_sdk/2024_D_24_inventory.json
+/python_sdk/2024_D_24_inventory.json.tmp
