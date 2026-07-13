@@ -42,8 +42,8 @@ BARRIER_TARGET_DIST = 75.0   # 障碍物板目标距离 cm
 BARRIER_TOLERANCE = 5.0      # 距离允许误差 cm (±)
 BARRIER_APPROACH_SPEED = 5  # 逼近速度 cm/s
 BARRIER_ANOMALY_THRESH = 20  # 连续两次测距差超过此值判定为异常
-QR_CAMERA_INDEX = 0          # 前视 USB 摄像头索引 (二维码识别)
-LANDING_CAMERA_INDEX = 2     # 下视 USB 摄像头索引 (落点识别)
+QR_CAMERA_INDEX = 2          # 前视 USB 摄像头索引 (0bda:3035, 二维码识别)
+LANDING_CAMERA_INDEX = 0     # 下视 USB 摄像头索引 (0c45:636b, 落点识别)
 VISION_APPROACH_SPEED = 5    # 视觉精调水平速度 cm/s
 VISION_PX_THRESH = 30        # 水平居中像素阈值
 VISION_Z_PX_THRESH = 40      # QR 垂直居中像素阈值
@@ -993,11 +993,10 @@ class Mission(object):
 if __name__ == "__main__":
     # ---- 步骤 1: 权限配置 ----
     rm = RosManager()
-    rm.chmod("/dev/ttyUSB0")   # 雷达
-    rm.chmod("/dev/ttyACM0")   # 飞控
-    rm.chmod("/dev/video0")    # 前视 USB 摄像头 (QR 识别)
-    rm.chmod("/dev/video1")    # T265
-    rm.chmod("/dev/video2")    # 下视 USB 摄像头 (落点识别)
+    rm.chmod("/dev/ttyUSB0")   # CP2102 雷达
+    rm.chmod("/dev/ttyACM0")   # LX 飞控
+    rm.chmod("/dev/video0")    # 下视 USB 摄像头采集节点 (落点识别)
+    rm.chmod("/dev/video2")    # 前视 USB 摄像头采集节点 (QR 识别)
 
     # ---- 步骤 2: 启动 ROS 包 (tmux 后台) ----
     rm.launch_package("ldlidar_stl_ros2", "ld19.launch.py")
