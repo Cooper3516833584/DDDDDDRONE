@@ -4,6 +4,7 @@
 基于 2025_嵌赛.py 模板框架
 """
 import time
+from typing import Optional
 import numpy as np
 from loguru import logger
 from FlightController import FC_Client, FC_Like
@@ -13,13 +14,35 @@ from FlightController.Solutions.Navigation import Navigation
 from FlightController.Components.RosMapper import RosMapper
 from FlightController.Components.RosNode import RosNodeRunner
 from FlightController.Components.RosManager import RosManager
+import vision_of_tf
+from vision_of_tf import (
+    _detect_qrcodes,
+    _open_usb_camera,
+    _select_nearest_to_image_center,
+    _center_to_first_y_offset,
+)
 
 # ============ 可调参数 ============
-CRUISE_SPEED = 22           # 水平导航速度 cm/s
-CRUISE_HEIGHT = 120         # 巡航高度 cm (待定)
-VERTICAL_SPEED = 22         # 垂直速度 cm/s
-QR_SEARCH_STEP = 50         # QR 搜索步长 cm
-QR_SEARCH_MAX = 300         # QR 搜索最大距离 cm
+CRUISE_SPEED = 22            # 水平导航速度 cm/s
+CRUISE_HEIGHT = 120          # 巡航高度 cm (待定)
+VERTICAL_SPEED = 22          # 垂直速度 cm/s
+QR_SEARCH_STEP = 50          # QR 搜索步长 cm
+QR_SEARCH_MAX = 300          # QR 搜索最大距离 cm
+BARRIER_TARGET_DIST = 75.0   # 障碍物板目标距离 cm
+BARRIER_TOLERANCE = 5.0      # 距离允许误差 cm (±)
+BARRIER_APPROACH_SPEED = 5  # 逼近速度 cm/s
+BARRIER_ANOMALY_THRESH = 20  # 连续两次测距差超过此值判定为异常
+QR_CAMERA_INDEX = 0          # 前视 USB 摄像头索引 (二维码识别)
+LANDING_CAMERA_INDEX = 2     # 下视 USB 摄像头索引 (落点识别)
+VISION_APPROACH_SPEED = 5    # 视觉精调水平速度 cm/s
+VISION_PX_THRESH = 30        # 水平居中像素阈值
+VISION_Z_PX_THRESH = 40      # QR 垂直居中像素阈值
+VISION_HEIGHT_STEP = 5      # QR 视觉精调单步高度调整量 cm
+LANDING_APPROACH_SPEED = 8   # 落点视觉精调速度 cm/s
+QR_GRID_Z_STEP = 60          # QR 网格纵向 (z) 间距 cm
+QR_GRID_Y_STEP = 40          # QR 网格横向 (y) 间距 cm
+QR_SCAN_TOTAL_ROUNDS = 4     # 总巡检轮数
+QR_SCAN_PER_ROUND = 6        # 每轮 QR 数量
 # =================================
 
 
@@ -35,8 +58,15 @@ class Mission(object):
         # [TODO-4] 串口屏 — 取消注释下面两行, 并从参数接收 screen
         # self.screen: UARTScreen = kwargs.get("screen", None)
         self.cruise_height = CRUISE_HEIGHT
-        # [TODO-2] 视觉位置闭环 — QR 码偏移量
-        self.qr_offset: tuple = (0.0, 0.0)
+        # 摄像头索引 (可通过 kwargs 覆盖)
+        self.qr_camera_index: int = kwargs.get("qr_camera_index", QR_CAMERA_INDEX)
+        self.landing_camera_index: int = kwargs.get(
+            "landing_camera_index", LANDING_CAMERA_INDEX
+        )
+        self._last_qr_offset: Optional[tuple] = None
+        # QR 多轮扫描状态
+        self._qr_round: int = 0           # 当前轮次 (0-based, 每轮结束后递增)
+        self._qr_positions: dict = {}      # {"A1": (x,y), "A2": ..., "B1": ...}
 
     def stop(self):
         self.navi.stop()
@@ -45,71 +75,169 @@ class Mission(object):
     # ================================================================
     #  TODO 汇总 (按优先级排列)
     # ================================================================
-    #  [TODO-1] 障碍物板距离判定
-    #    利用雷达实时扫描数据，在飞行过程中持续监控无人机到
-    #    前方/侧方障碍物的距离。当距离低于安全阈值时自动悬停
-    #    或绕行，防止碰撞。
-    #    涉及方法: check_barrier_distance()
+    #  [TODO-1] 障碍物板距离判定 — ✅ 已实现
+    #    barrier_distance_align() 利用雷达 285°~359° 扇区点云拟合直线，
+    #    10Hz 闭环将机身到障碍物的距离调整到 75±5cm。
     #
-    #  [TODO-2] 视觉识别位置闭环
-    #    将占位 detect_qr_code() 替换为真实的二维码检测，并实现
-    #    视觉精调闭环: 检测到 QR 后根据其在画面中的位置偏移量
-    #    (dx, dy) 微调无人机位姿，使 QR 码居中后再执行动作。
-    #    参考: 2022_24_noscreen_nomotor.py 的 vision_approach()
-    #    涉及方法: detect_qr_code(), vision_qr_approach()
+    #  [TODO-2] 视觉识别位置闭环 — ✅ 已接入 vision_of_tf
+    #    detect_qr_code() → vision_of_tf.detect_qrcode_offset()
+    #    detect_landing_spot() → vision_of_tf.detect_black_circle/rectangle_offset()
+    #    vision_qr_approach() → 根据 y_px 偏移量左右精调使 QR 居中
     #
     #  [TODO-3] 激光笔控制
     #    通过飞控的数字输出或 PWM 通道控制激光笔开关。
-    #    在检测到目标后点亮激光笔指示位置。
     #    涉及方法: laser_on(), laser_off()
     #
     #  [TODO-4] 串口屏通信
-    #    集成 UARTScreen 实现串口屏状态上报:
-    #    - 任务进度/当前步骤显示
-    #    - 传感器状态 (雷达/ROS/T265) 指示灯
-    #    - 电池电压显示
-    #    - 远程紧急停止指令监听
-    #    参考: 2025_嵌赛.py 的 UARTScreen 用法
+    #    集成 UARTScreen 实现串口屏状态上报。
     #    涉及位置: Mission.__init__(), __main__ 初始化段
     # ================================================================
 
     # ================================================================
-    #  [TODO-1] 障碍物板距离判定
+    #  [TODO-1] 障碍物板距离判定与位置闭环 (已实现)
     # ================================================================
-    def check_barrier_distance(self, min_safe_distance: float = 80.0) -> bool:
-        """
-        [TODO-1] 利用雷达数据检查前方/侧方障碍物距离是否安全
 
-        Args:
-            min_safe_distance: 最小安全距离 / cm
+    def _measure_barrier_distance(self) -> "Optional[float]":
+        """截取雷达 0°~75° CCW（机头→左侧）扇区点云，拟合直线后
+        返回无人机原点到该直线的垂直距离。
+
+        雷达坐标系: 0°=机头正前方, 角度顺时针增加(右转)
+        0°~75° CCW → 在雷达坐标中对应 285°~359°
 
         Returns:
-            True 表示安全，False 表示距离过近需要避让
-
-        实现思路:
-          1. 从 radar.map 读取当前航向前方 ±30° 范围的最短距离
-          2. 从 radar.map 读取当前机头左侧 (y正) ±30° 范围的最短距离
-          3. 若任一方向距离 < min_safe_distance → 触发避让
+            距离 / cm，点云不足 (≤5 点) 时返回 None
         """
-        # ---- 占位实现: 始终返回安全 ----
-        # radar = self.radar
-        # forward_deg = (self.navi.current_yaw) % 360          # 机头在雷达坐标系中的角度
-        # left_deg    = (self.navi.current_yaw + 90) % 360     # 左侧
-        # search_range = 30                                     # ±30°
-        #
-        # forward_dist = min(
-        #     radar.map[deg] for deg in range(forward_deg - search_range,
-        #                                     forward_deg + search_range)
-        #     if radar.map[deg] != -1
-        # )
-        # if forward_dist < min_safe_distance:
-        #     logger.warning(f"[BARRIER] Forward obstacle at {forward_dist}cm!")
-        #     return False
-        #
-        # left_dist = min(...) ...
-        #
-        # return True
-        return True
+        radar_map = self.radar.map
+        acc = radar_map.ACC            # 3，每度 3 个 bin
+        from_idx = int(285 * acc)      # 855
+        to_idx_excl = int(360 * acc)   # 1080 → range(855, 1080) 共 225 bin
+
+        pts_cm = []
+        for idx in range(from_idx, to_idx_excl):
+            d_mm = radar_map.data[idx]
+            if d_mm == -1:
+                continue
+            # 雷达坐标系 (0=fwd, cw) → 匿名坐标系 (x=fwd, y=left)
+            deg = idx / acc
+            rad = np.deg2rad(deg)
+            x_cm = d_mm * np.cos(rad) / 10.0    # 前向分量 cm
+            y_cm = -d_mm * np.sin(rad) / 10.0   # 左侧分量 cm
+            pts_cm.append([x_cm, y_cm])
+
+        pts = np.array(pts_cm)
+        if len(pts) < 5:
+            return None
+
+        # SVD 总最小二乘直线拟合
+        mean = pts.mean(axis=0)
+        _, _, vh = np.linalg.svd(pts - mean)
+        normal = vh[1]  # 拟合直线的法向量 (与直线垂直)
+
+        # 原点到直线的垂直距离 = |mean · normal|
+        return float(abs(np.dot(mean, normal)))
+
+    def barrier_distance_align(
+        self,
+        target_distance: float = BARRIER_TARGET_DIST,
+        tolerance: float = BARRIER_TOLERANCE,
+        speed: float = BARRIER_APPROACH_SPEED,
+        anomaly_threshold: float = BARRIER_ANOMALY_THRESH,
+        timeout: float = 60.0,
+    ):
+        """障碍物板距离判定与位置闭环。
+
+        识别到 QR 码后调用，以 10Hz 频率检测到障碍物板的距离，
+        通过前/后飞行将距离调整到 target_distance ± tolerance 内。
+
+        Args:
+            target_distance: 目标距离 / cm (默认 75)
+            tolerance: 允许误差 / cm (默认 ±5)
+            speed: 逼近速度 / cm/s (默认 5)
+            anomaly_threshold: 连续两次测距差阈值 / cm，
+                               超过则丢弃后一次数据，飞行方向延续
+            timeout: 闭环超时 / s
+
+        控制逻辑:
+            distance < target → 机头反方向 (后退, 远离障碍物)
+            distance > target → 机头正方向 (前进, 靠近障碍物)
+            |distance - target| < tolerance → 悬停, 退出
+        """
+        navi = self.navi
+        logger.info(
+            f"[BARRIER] Align start: target={target_distance}±{tolerance}cm, "
+            f"speed={speed}cm/s"
+        )
+
+        prev_distance: Optional[float] = None
+        prev_direction: float = 0.0  # 仅在 prev_distance 非 None 时有效
+        t0 = time.perf_counter()
+
+        while True:
+            # ---- 1. 雷达测距 ----
+            distance = self._measure_barrier_distance()
+
+            if distance is None:
+                logger.warning("[BARRIER] No valid radar points, hovering")
+                navi.stop_move()
+                time.sleep(0.1)
+                continue
+
+            logger.debug(f"[BARRIER] measured distance = {distance:.1f} cm")
+
+            # ---- 2. 到达目标区域 → 退出 ----
+            if abs(distance - target_distance) < tolerance:
+                navi.stop_move()
+                logger.info(
+                    f"[BARRIER] Converged: {distance:.1f}cm within "
+                    f"±{tolerance}cm of {target_distance}cm"
+                )
+                break
+
+            # ---- 3. 异常数据过滤 ----
+            if prev_distance is not None and abs(distance - prev_distance) > anomaly_threshold:
+                logger.warning(
+                    f"[BARRIER] Anomalous jump: {prev_distance:.1f}→{distance:.1f}cm "
+                    f"(>{anomaly_threshold}cm), discarding new reading"
+                )
+                # 丢弃新数据 (distance 回退), 延续上一周期的方向
+                distance = prev_distance
+            else:
+                prev_distance = distance
+                # 确定飞行方向
+                if distance < target_distance:
+                    # 太近 → 远离障碍物 → 机头反方向
+                    direction = (navi.current_yaw + 180) % 360
+                    logger.debug(
+                        f"[BARRIER] Too close ({distance:.1f} < {target_distance}), "
+                        f"backward dir={direction:.0f}°"
+                    )
+                else:
+                    # 太远 → 靠近障碍物 → 机头正方向
+                    direction = navi.current_yaw
+                    logger.debug(
+                        f"[BARRIER] Too far ({distance:.1f} > {target_distance}), "
+                        f"forward dir={direction:.0f}°"
+                    )
+                prev_direction = direction
+
+            # ---- 4. 发送速度指令 ----
+            navi.move_by_direction(speed=speed, direction_deg=prev_direction)
+
+            # ---- 5. 超时保护 ----
+            if time.perf_counter() - t0 > timeout:
+                navi.stop_move()
+                logger.warning(
+                    f"[BARRIER] Timeout after {timeout}s, "
+                    f"final distance = {distance:.1f} cm"
+                )
+                break
+
+            # ---- 6. 10Hz 循环 ----
+            time.sleep(0.1)
+
+        # 恢复导航闭环
+        navi.stop_move()
+        logger.info("[BARRIER] Align finished, navigation PID restored")
 
     # ================================================================
     #  [TODO-3] 激光笔控制
@@ -136,96 +264,422 @@ class Mission(object):
         # self.fc.set_digital_output(channel, False)
 
     # ================================================================
-    #  占位视觉函数 — 待实际视觉模块编写后替换
+    #  视觉函数 — 封装 vision_of_tf
     # ================================================================
 
     def detect_qr_code(self) -> bool:
-        """
-        [TODO-2] 二维码识别  (占位阶段 → 待视觉模块编写后替换)
+        """调用 vision_of_tf.detect_qrcode_offset 检测 QR 码。
+
+        每次调用打开/关闭摄像头，读取若干帧后返回。
 
         Returns:
             True 表示当前画面中检测到二维码
-
-        待实现:
-          - 从摄像头读取帧
-          - 运行 QR 码检测器 (如 OpenCV QRCodeDetector / zbar / pyzbar)
-          - 若检测到, 将二维码中心偏移 (dx, dy) 保存到 self.qr_offset
         """
-        # 实际实现示例:
-        #   ret, frame = self.cam.read()
-        #   if not ret: return False
-        #   result = qr_detector.detectAndDecode(frame)
-        #   if result[0]:
-        #       # 计算二维码在画面中的位置偏移
-        #       self.qr_offset = (center_x - 320, center_y - 240)
-        #       return True
-        #   return False
+        result = vision_of_tf.detect_qrcode_offset(self.qr_camera_index)
+        if result is not None:
+            # 存储偏移量供 vision_qr_approach 初始参考
+            self._last_qr_offset = result
+            return True
         return False
 
-    def vision_qr_approach(self, timeout: float = 30.0):
-        """
-        [TODO-2] 视觉位置闭环 — QR 码视觉精调
+    def _detect_qr_number_and_offset(self) -> "Optional[tuple]":
+        """打开摄像头逐帧检测 QR 码，返回 (number, z_px, y_px) 或 None。
 
-        检测到 QR 码后, 根据 QR 在画面中的偏移量微调无人机位置,
-        使 QR 码居中, 实现精确对准。
+        使用 vision_of_tf 内部的 _detect_qrcodes 获取解码文本，
+        从中解析出整数编号。一次调用完成打开/检测/关闭。
+        """
+        cap = _open_usb_camera(self.qr_camera_index, 1280, 720)
+        try:
+            # 预热
+            for _ in range(3):
+                cap.read()
+            # 最多 30 帧 (~3s)
+            for _ in range(30):
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                detections = _detect_qrcodes(frame)
+                if not detections:
+                    continue
+                image_center = (frame.shape[1] // 2, frame.shape[0] // 2)
+                selected = _select_nearest_to_image_center(
+                    detections, image_center
+                )
+                z_px, y_px = _center_to_first_y_offset(
+                    selected.center, image_center
+                )
+                try:
+                    number = int(selected.text.strip())
+                except (ValueError, AttributeError):
+                    continue
+                self._last_qr_offset = (z_px, y_px)
+                return number, z_px, y_px
+            return None
+        finally:
+            cap.release()
+
+    def vision_qr_approach(
+        self,
+        timeout: float = 30.0,
+        speed: float = VISION_APPROACH_SPEED,
+        px_thresh: float = VISION_PX_THRESH,
+        z_px_thresh: float = VISION_Z_PX_THRESH,
+        height_step: float = VISION_HEIGHT_STEP,
+    ):
+        """QR 码双轴视觉位置闭环。
+
+        坐标系约定 (前视摄像头):
+            画面水平向左 → 飞机 y正方向
+            画面竖直向上 → 飞机 z正方向
+
+        - y_px → 水平偏移: move_by_direction 左/右飞行
+        - z_px → 垂直偏移: navi.set_height 上/下调整
+
+        同时满足 |y_px| < px_thresh 且 |z_px| < z_px_thresh 时退出。
 
         Args:
-            timeout: 精调超时时间 / s
-
-        实现思路 (参考 2022_24_noscreen_nomotor.py vision_approach):
-          1. 持续读取 detect_qr_code() 的偏移结果
-          2. 用 move_by_direction() 以小速度 (3-5 cm/s) 沿偏移方向逼近
-          3. 当偏移量小于阈值时停止, stop_move()
-          4. 超时后也停止, 记录警告
+            timeout: 精调超时 / s
+            speed: 水平逼近速度 cm/s
+            px_thresh: 水平像素阈值
+            z_px_thresh: 垂直像素阈值
+            height_step: 单步高度调整量 cm
         """
-        logger.info(f"[VISION] QR vision approach started (timeout={timeout}s) — placeholder")
-        # ---- 占位: 跳过视觉精调 ----
-        # t0 = time.perf_counter()
-        # while time.perf_counter() - t0 < timeout:
-        #     found = self.detect_qr_code()
-        #     if not found:
-        #         time.sleep(0.1)
-        #         continue
-        #     dx, dy = self.qr_offset
-        #     if abs(dx) < 20 and abs(dy) < 20:
-        #         self.navi.stop_move()
-        #         logger.info("[VISION] QR centered")
-        #         return
-        #     direction = np.rad2deg(np.arctan2(-dy, -dx))  # offset → 移动方向
-        #     self.navi.move_by_direction(speed=5, direction_deg=direction)
-        #     time.sleep(0.1)
-        # logger.warning("[VISION] QR approach timeout")
-        # self.navi.stop_move()
+        navi = self.navi
+        logger.info(
+            f"[VISION] QR approach: h-speed={speed}cm/s, "
+            f"h-thresh={px_thresh}px, v-thresh={z_px_thresh}px, "
+            f"v-step={height_step}cm, timeout={timeout}s"
+        )
 
-    def qr_code_action(self):
-        """
-        [TODO-2][TODO-3] 检测到二维码后执行的动作
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < timeout:
+            # ---- 1. 检测 QR 偏移 ----
+            result = vision_of_tf.detect_qrcode_offset(self.qr_camera_index)
 
-        待实现:
-          1. [TODO-2] 先调用 vision_qr_approach() 视觉精调对准 QR 码
-          2. [TODO-3] 打开激光笔指示
-          3. 执行任务动作 (拍照记录 / 投放物品 / 悬停记录坐标等)
-          4. [TODO-3] 关闭激光笔
-        """
-        logger.info("[MISSION] >>> QR code action executed (placeholder) <<<")
-        # self.vision_qr_approach(timeout=30)
-        # self.laser_on()
-        time.sleep(1.0)
-        # self.laser_off()
+            if result is None:
+                logger.debug("[VISION] QR lost, hovering")
+                navi.stop_move()
+                time.sleep(0.3)
+                continue
 
-    def detect_landing_spot(self) -> bool:
+            z_px, y_px = result
+            logger.debug(f"[VISION] QR: z={z_px:.0f}px  y={y_px:.0f}px")
+
+            # ---- 2. 判断是否已居中 ----
+            y_ok = abs(y_px) < px_thresh
+            z_ok = abs(z_px) < z_px_thresh
+
+            if y_ok and z_ok:
+                navi.stop_move()
+                logger.info(
+                    f"[VISION] QR centered: y={y_px:.0f}px, z={z_px:.0f}px"
+                )
+                return
+
+            # ---- 3. 水平方向校正 (y_px → y正) ----
+            # y_px > 0: QR 在画面左侧 → 飞机向左 (yaw + 90°)
+            # y_px < 0: QR 在画面右侧 → 飞机向右 (yaw - 90°)
+            if not y_ok:
+                if y_px > 0:
+                    direction = (navi.current_yaw + 90) % 360
+                else:
+                    direction = (navi.current_yaw - 90) % 360
+                navi.move_by_direction(speed=speed, direction_deg=direction)
+            else:
+                navi.stop_move()
+
+            # ---- 4. 垂直方向校正 (z_px → z正) ----
+            # z_px > 0: QR 在画面上方 → 飞机上升
+            # z_px < 0: QR 在画面下方 → 飞机下降
+            if not z_ok:
+                delta_h = height_step * (-1 if z_px > 0 else 1)
+                new_h = navi.current_height + delta_h
+                # 钳制在合理范围 (不低于 30cm)
+                new_h = max(30.0, new_h)
+                logger.debug(f"[VISION] QR height adjust: {navi.current_height:.0f} → {new_h:.0f}cm")
+                navi.set_height(new_h)
+
+            # ---- 5. 循环间隔 ----
+            time.sleep(0.2)
+
+        # 超时
+        navi.stop_move()
+        logger.warning(f"[VISION] QR approach timeout after {timeout}s")
+
+    # ================================================================
+    #  QR 多轮扫描: 每轮 6 个 QR, 共 4 轮
+    #
+    #  扫描顺序固定 (2列 × 3行网格):
+    #    右上→右下→中下→中上→左上→左下
+    #
+    #  QR 编号不由扫描顺序决定, 每轮占一个连续的编号段:
+    #    第1轮: 1~6 → A1~A6     第2轮: 7~12 → B1~B6
+    #    第3轮: 13~18 → C1~C6   第4轮: 19~24 → D1~D6
+    #
+    #  每个位置的名字由摄像头解码出的实际编号决定:
+    #    例: 第1轮在"右上"位读到 3 → 记录为 A3 的位置
+    #        第2轮在"中下"位读到 11 → 记录为 B5 的位置
+    # ================================================================
+
+    def _qr_position_name(self, qr_number: int) -> str:
+        """将 QR 编号映射为位置名称。
+
+        例: 1→A1, 2→A2, ..., 6→A6,
+            7→B1, ..., 12→B6,
+            13→C1, ..., 24→D6
         """
-        [TODO-2] 落点识别  (占位阶段 → 待视觉模块编写后替换)
+        round_idx = (qr_number - 1) // QR_SCAN_PER_ROUND
+        round_letter = chr(ord("A") + round_idx)
+        index_in_round = ((qr_number - 1) % QR_SCAN_PER_ROUND) + 1
+        return f"{round_letter}{index_in_round}"
+
+    def _single_qr_action(self, label: str) -> int:
+        """单个 QR 码格位的完整动作序列:
+          1. barrier_distance_align()   — 障碍物板距离闭环 75±5cm
+          2. vision_qr_approach()      — 双轴视觉精调 (z高低 + y左右)
+          3. 解码 QR 编号 → 决定位置名称
+          4. 记录坐标到 self._qr_positions
+          5. 激光笔指示 + 动作
 
         Returns:
-            True 表示识别到可降落区域
-
-        待实现:
-          - 下视摄像头拍摄地面
-          - 通过颜色/纹理/标记检测安全降落区域 (如"H"标记)
-          - 若未检测到安全区域 → 使用预设的默认降落点
+            解码出的 QR 编号 (number), 解码失败则返回 0
         """
+        navi = self.navi
+        logger.info(f"[QR-{label}] barrier + vision + laser")
+
+        # Step 1: 障碍物板距离闭环
+        self.barrier_distance_align()
+
+        # Step 2: 双轴视觉精调 (z + y)
+        self.vision_qr_approach()
+
+        # Step 3: 解码 QR 编号 (打开摄像头读一帧)
+        verified = self._detect_qr_number_and_offset()
+        qr_number = verified[0] if verified is not None else 0
+
+        if qr_number == 0:
+            logger.warning(f"[QR-{label}] QR decode failed, cannot record")
+            return 0
+
+        # Step 4: 用实际编号生成位置名, 记录坐标
+        pos_name = self._qr_position_name(qr_number)
+        current_pt = (float(navi.current_x), float(navi.current_y))
+        self._qr_positions[pos_name] = current_pt
+        logger.info(
+            f"[QR-{label}] decoded #{qr_number} → {pos_name}, "
+            f"pos=({current_pt[0]:.1f}, {current_pt[1]:.1f})"
+        )
+
+        # Step 5: 激光笔 + 动作
+        # self.laser_on()
+        time.sleep(0.5)
+        # self.laser_off()
+
+        return qr_number
+
+    def qr_code_action(self):
+        """单轮 QR 码扫描 (6 个格位)。
+
+        扫描顺序: 右上(1) → 右下(2) → 中下(3) → 中上(4) → 左上(5) → 左下(6)
+
+        坐标系 (前视摄像头画面 → 飞机):
+           画面左 → 飞机 y正    (move_by_direction yaw+90°)
+           画面上 → 飞机 z正    (set_height +)
+
+        移动规则:
+           ①→②: z负 60cm (下降)     ③→④: z正 60cm (上升)
+           ②→③: y正 40cm (左移)     ④→⑤: y正 40cm (左移)
+           ⑤→⑥: z负 60cm (下降)
+
+        QR 编号不由扫描顺序决定; 每个格位上实际放的是哪个 QR 卡片,
+        由摄像头解码出的文本决定。位置名 (A1~D6) 始终跟编号走。
+        """
+        navi = self.navi
+        round_index = self._qr_round
+        round_letter = chr(ord("A") + round_index)
+
+        logger.info(
+            f"[MISSION] ╔══ QR Round {round_letter} START ══╗"
+        )
+
+        # ---- 格位 1: 右上 (起始点) ----
+        self._single_qr_action(f"{round_letter}-G1(右上)")
+
+        # ---- 格位 2: 右下 (z负 60cm = 下降) ----
+        logger.info(f"[MISSION]   ── z- {QR_GRID_Z_STEP}cm → G2(右下)")
+        new_h = max(30.0, navi.current_height - QR_GRID_Z_STEP)
+        navi.set_height(new_h)
+        navi.wait_for_height()
+        self._single_qr_action(f"{round_letter}-G2(右下)")
+
+        # ---- 格位 3: 中下 (y正 40cm = 左移) ----
+        logger.info(f"[MISSION]   ── y+ {QR_GRID_Y_STEP}cm → G3(中下)")
+        yaw_rad = np.deg2rad(navi.current_yaw)
+        abs_dx = -QR_GRID_Y_STEP * np.sin(yaw_rad)
+        abs_dy = QR_GRID_Y_STEP * np.cos(yaw_rad)
+        target = navi.current_point + np.array([abs_dx, abs_dy])
+        navi.navigation_to_waypoint(target, wait=True)
+        self._single_qr_action(f"{round_letter}-G3(中下)")
+
+        # ---- 格位 4: 中上 (z正 60cm = 上升) ----
+        logger.info(f"[MISSION]   ── z+ {QR_GRID_Z_STEP}cm → G4(中上)")
+        new_h = navi.current_height + QR_GRID_Z_STEP
+        navi.set_height(new_h)
+        navi.wait_for_height()
+        self._single_qr_action(f"{round_letter}-G4(中上)")
+
+        # ---- 格位 5: 左上 (y正 40cm = 左移) ----
+        logger.info(f"[MISSION]   ── y+ {QR_GRID_Y_STEP}cm → G5(左上)")
+        yaw_rad = np.deg2rad(navi.current_yaw)
+        abs_dx = -QR_GRID_Y_STEP * np.sin(yaw_rad)
+        abs_dy = QR_GRID_Y_STEP * np.cos(yaw_rad)
+        target = navi.current_point + np.array([abs_dx, abs_dy])
+        navi.navigation_to_waypoint(target, wait=True)
+        self._single_qr_action(f"{round_letter}-G5(左上)")
+
+        # ---- 格位 6: 左下 (z负 60cm = 下降) ----
+        logger.info(f"[MISSION]   ── z- {QR_GRID_Z_STEP}cm → G6(左下)")
+        new_h = max(30.0, navi.current_height - QR_GRID_Z_STEP)
+        navi.set_height(new_h)
+        navi.wait_for_height()
+        self._single_qr_action(f"{round_letter}-G6(左下)")
+
+        # 轮次结束, 递增计数器
+        self._qr_round += 1
+
+        # 打印本轮收集到的位置
+        round_positions = {
+            k: (round(v[0], 1), round(v[1], 1))
+            for k, v in self._qr_positions.items()
+            if k.startswith(round_letter)
+        }
+        logger.info(
+            f"[MISSION] ╚══ QR Round {round_letter} COMPLETE, "
+            f"positions: {round_positions} ══╝"
+        )
+
+        # 完整性检查: 每轮必须有 6 个不同编号
+        if len(round_positions) < QR_SCAN_PER_ROUND:
+            logger.warning(
+                f"[MISSION] Round {round_letter}: only "
+                f"{len(round_positions)}/{QR_SCAN_PER_ROUND} positions recorded!"
+            )
+
+    def detect_landing_spot(self) -> bool:
+        """调用 vision_of_tf 检测下视画面中的黑色形状 (圆/矩形)。
+
+        若检测到，同时将偏移量缓存到 self._last_landing_offset，
+        供 landing_vision_approach 初始参考。
+
+        Returns:
+            True 表示检测到可降落标记
+        """
+        # 先尝试黑色圆
+        result = vision_of_tf.detect_black_circle_offset(self.landing_camera_index)
+        if result is not None:
+            logger.info(f"[LANDING] Black circle: offset={result}")
+            self._landing_offset_type = "circle"
+            self._last_landing_offset = result
+            return True
+
+        # 再尝试黑色矩形
+        result = vision_of_tf.detect_black_rectangle_offset(self.landing_camera_index)
+        if result is not None:
+            logger.info(f"[LANDING] Black rectangle: offset={result}")
+            self._landing_offset_type = "rectangle"
+            self._last_landing_offset = result
+            return True
+
         return False
+
+    # ---- landing 视觉字段初始化 ----
+    def _ensure_landing_fields(self):
+        if not hasattr(self, "_landing_offset_type"):
+            self._landing_offset_type: Optional[str] = None
+        if not hasattr(self, "_last_landing_offset"):
+            self._last_landing_offset: Optional[tuple] = None
+
+    def _detect_landing_offset(self) -> "Optional[tuple]":
+        """单次调用检测落地标记偏移, 返回 (x_px, y_px) 或 None。
+        内部更新 _last_landing_offset 缓存。"""
+        self._ensure_landing_fields()
+        result = vision_of_tf.detect_black_circle_offset(self.landing_camera_index)
+        if result is not None:
+            self._last_landing_offset = result
+            return result
+        result = vision_of_tf.detect_black_rectangle_offset(self.landing_camera_index)
+        if result is not None:
+            self._last_landing_offset = result
+            return result
+        return None
+
+    def landing_vision_approach(
+        self,
+        timeout: float = 30.0,
+        speed: float = LANDING_APPROACH_SPEED,
+        px_thresh: float = VISION_PX_THRESH,
+    ):
+        """落点视觉位置闭环。
+
+        下视摄像头坐标系约定:
+            画面水平向左  → 飞机 y正方向
+            画面竖直向上  → 飞机 x正方向
+
+        vision_of_tf 返回 (x_px, y_px):
+            x_px = center_y - target_y → 画面上为正 → 对应飞机前 (x+)
+            y_px = center_x - target_x → 画面左为正 → 对应飞机左 (y+)
+
+        合成移动方向:
+            direction = yaw + arctan2(y_px, x_px)
+
+        参考: 2022_24_noscreen_nomotor.py vision_approach 的闭环模式。
+        """
+        navi = self.navi
+        logger.info(
+            f"[LANDING] Vision approach: speed={speed}cm/s, "
+            f"px_thresh={px_thresh}px, timeout={timeout}s"
+        )
+
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < timeout:
+            # ---- 1. 检测落点标记 ----
+            result = self._detect_landing_offset()
+
+            if result is None:
+                logger.debug("[LANDING] Target lost, hovering")
+                navi.stop_move()
+                time.sleep(0.3)
+                continue
+
+            x_px, y_px = result
+            logger.debug(f"[LANDING] offset: x={x_px:.0f}px  y={y_px:.0f}px")
+
+            # ---- 2. 已居中 → 退出 ----
+            if abs(x_px) < px_thresh and abs(y_px) < px_thresh:
+                navi.stop_move()
+                logger.info(
+                    f"[LANDING] Centered over mark: x={x_px:.0f}px, y={y_px:.0f}px"
+                )
+                return
+
+            # ---- 3. 合成移动方向 ----
+            # x_px > 0 → 画面上方(机头正前) → 向前分量
+            # y_px > 0 → 画面左侧(机头左)   → 向左分量
+            # direction = yaw + arctan2(y_px, x_px)
+            angle_from_forward = np.rad2deg(np.arctan2(y_px, x_px))
+            direction = (navi.current_yaw + angle_from_forward) % 360
+
+            logger.debug(
+                f"[LANDING] moving: direction={direction:.0f}° "
+                f"(yaw={navi.current_yaw:.0f} + {angle_from_forward:.0f})"
+            )
+
+            navi.move_by_direction(speed=speed, direction_deg=direction)
+            time.sleep(0.2)
+
+        # 超时
+        navi.stop_move()
+        logger.warning(f"[LANDING] Vision approach timeout after {timeout}s")
 
     # ================================================================
     #  f1: QR 码扫描 → 搜索 → 动作 → 升回巡航高度
@@ -316,21 +770,40 @@ class Mission(object):
         fc.set_action_log(True)
         logger.info("[MISSION] Mission Started")
 
-        # ---------- Cartographer 初始化等待 ----------
-        # 在线 SLAM 模式下等待 TF 变换建立
-        while True:
-            time.sleep(1)
-            logger.info(f"[MISSION] current_point: {navi.current_point}")
-            if navi.current_point[0] + navi.current_point[1] != 0:
-                break
-        logger.info("[MISSION] Cartographer TF established")
-
         # ---------- 定点起飞 ----------
+        # 起飞使用飞控内置程控 (PROGRAM_MODE → take_off → HOLD_POS_MODE)，
+        # 不依赖 Cartographer / T265 闭环，因此必须放在 Cartographer 初始
+        # 化等待之前。起飞过程本身（上升 + 悬停漂移）为在线 SLAM 提供了足
+        # 够的运动来完成首个 Submap 构建。
+        # 起飞结束后 navigation_flag=True，但 Cartographer 未就绪时 PID
+        # 会自动暂停 (available=False)，飞控 HOLD_POS_MODE 维持悬停。
         logger.info(f"[MISSION] Taking off to {self.cruise_height}cm")
         navi.pointing_takeoff((0, 0), self.cruise_height)
         navi.set_yaw(0)
         navi.wait_for_yaw()
         time.sleep(0.5)
+
+        # ---------- Cartographer 初始化等待 ----------
+        # 在线 SLAM 模式下，Cartographer 需要一定运动量（上升 + 漂移）才能
+        # 完成首个 Submap 并开始发布 TF 变换。轮询 navi.current_point 直到
+        # 位姿非零，表示 transform_established=True 且定位已收敛。
+        CART_TIMEOUT = 30.0  # 初始化超时 / s
+        logger.info(f"[MISSION] Waiting for Cartographer TF (timeout={CART_TIMEOUT}s)...")
+        t0 = time.perf_counter()
+        while True:
+            time.sleep(1)
+            logger.info(f"[MISSION] current_point: {navi.current_point}")
+            if navi.current_point[0] + navi.current_point[1] != 0:
+                break
+            if time.perf_counter() - t0 > CART_TIMEOUT:
+                raise RuntimeError(
+                    "Cartographer TF not established within "
+                    f"{CART_TIMEOUT}s. Consider adding small initial "
+                    "movement (e.g., rotate or translate 1m) to help "
+                    "scan matching converge."
+                )
+        logger.info(f"[MISSION] Cartographer TF established "
+                    f"({time.perf_counter() - t0:.1f}s)")
 
         # ================================================================
         #  Step A:  f1 (yaw=0°)
@@ -396,21 +869,23 @@ class Mission(object):
         navi.navigation_to_waypoint(target, wait=True)
 
         # ================================================================
-        #  Step H:  落点识别
+        #  Step H:  落点识别 + 视觉精调
         # ================================================================
-        logger.info("[MISSION] Step H: Landing spot detection")
+        logger.info("[MISSION] Step H: Landing spot detection + vision approach")
         landing_spot_found = self.detect_landing_spot()
         if landing_spot_found:
-            logger.info("[MISSION]   Landing spot confirmed")
+            logger.info("[MISSION]   Landing spot detected, visual centering...")
+            self.landing_vision_approach()
+            logger.info("[MISSION]   Landing spot centered, descending")
         else:
-            logger.info("[MISSION]   Landing spot not detected (placeholder), "
-                        "landing at basepoint")
+            logger.warning("[MISSION]   Landing spot not found, "
+                           "landing at current position")
 
         # ================================================================
-        #  Step I:  定点降落
+        #  Step I:  定点降落 (在精调后的位置)
         # ================================================================
-        logger.info("[MISSION] Step I: Landing at basepoint (0, 0)")
-        navi.pointing_landing((0, 0))
+        logger.info("[MISSION] Step I: Landing")
+        navi.pointing_landing(navi.current_point)
         logger.info("[MISSION] ========== Mission Complete ==========")
 
 
@@ -423,7 +898,9 @@ if __name__ == "__main__":
     rm = RosManager()
     rm.chmod("/dev/ttyUSB0")   # 雷达
     rm.chmod("/dev/ttyACM0")   # 飞控
+    rm.chmod("/dev/video0")    # 前视 USB 摄像头 (QR 识别)
     rm.chmod("/dev/video1")    # T265
+    rm.chmod("/dev/video2")    # 下视 USB 摄像头 (落点识别)
 
     # ---- 步骤 2: 启动 ROS 包 (tmux 后台) ----
     rm.launch_package("ldlidar_stl_ros2", "ld19.launch.py")
