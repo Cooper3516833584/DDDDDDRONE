@@ -252,7 +252,10 @@ class TestMission:
         navi.set_vertical_speed(VERTICAL_SPEED)
 
         # ---- 启动导航 ----
-        navi.start()
+        try:
+            navi.start(mode="radar")
+        except TypeError:
+            navi.start("radar")
         logger.info("[MISSION] 导航已启动")
 
         # 给传感器预热时间
