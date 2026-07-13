@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Tuple
 
 
 WAREHOUSE_WIDTH_CM = 500.0
@@ -28,7 +29,7 @@ FACE_YAW_DEG = {
 }
 
 
-Point = tuple[float, float]
+Point = Tuple[float, float]
 
 
 @dataclass(frozen=True)
