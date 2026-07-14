@@ -19,17 +19,17 @@
 - 用户：`fc`
 - SSH 别名：`fc`
 - 主机名：`fc-ubuntu`
-- HC-14 USB 调试口：`/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 -> /dev/ttyUSB0`
-- HC-14 USB 标识：CH340，USB ID `1a86:7523`
 - 飞控串口：`/dev/ttyACM0`
+- `/dev/ttyUSB0` 当前为 CP2102 接入的其他设备，不是 HC-14，不得用于 GroundStationLink
+- HC-14 已移动到飞控 `UT2/USART2`，机载 Linux 不再直接打开 HC-14 串口
 
-生产 GroundStationLink 不打开机载 `/dev/ttyUSB0`，而是复用机载上位机与飞控的现有连接，经飞控命令 `0x0D`、USART2 和无线模块收发。机载 `/dev/ttyUSB0` 只保留为独立硬件调试口。不要打开地面站的 `/dev/ttyACM0`。
+生产 GroundStationLink 复用机载上位机与飞控的现有连接，经飞控命令 `0x0D`、UT2/USART2 和 HC-14 收发。不要为 HC-14 打开机载 `/dev/ttyUSB0`，也不要打开地面站的 `/dev/ttyACM0`。
 
 本文不保存 SSH 密码、HMAC 密钥或其他凭据。凭据以 `AGENTS.md`、环境变量或用户当前明确提供的信息为准。
 
 ## 2. HC-14 当前参数
 
-地面站 CH340/HC-14 本地串口配置为：
+2026-07-14 通过只读 AT 查询确认地面站 CH340/HC-14 本地串口配置为：
 
 ```text
 UART：9600 8N1
@@ -55,7 +55,7 @@ ser.setDTR(False)
 
 连续收到 `ORDER ERROR\r\n` 时，优先检查 DTR、RTS、KEY 引脚、串口占用和两端 UART 参数。未经明确授权，不发送修改信道、波特率、空中速率、功率或恢复出厂设置的 AT 指令。
 
-飞控固件的 USART2 无线口初始化为 `115200 8N1`。连接飞控 USART2 的机载无线模块，其本地 UART 必须匹配 `115200`；这与地面站 CH340 使用 `9600` 是两个独立的本地串口速率，不应在应用层混用。
+飞控固件当前将 UT2/USART2 无线口初始化为 `115200 8N1`。移动到 UT2 的机载 HC-14 本地 UART 必须匹配 `115200`；若模块仍保留迁移前的 `9600` 配置，飞控与模块之间不会正常通信。地面站 CH340 继续使用 `9600`，它与机载模块的本地 UART 是两个独立速率。
 
 ## 3. 当前 GroundStationLink 协议
 
@@ -120,14 +120,15 @@ C:\Users\TZDEZACR\Desktop\ground_station\Ground_Station\components
 - 双方对固定消息生成的完整帧逐字节一致；
 - 已确认机载飞控服务、`/dev/ttyACM0` 和远程 `FC_Client` 连接正常；
 - 已确认飞控无线桥使用 `BB 33 | 长度 | 数据`，地面站传输层已按此格式适配；
-- 当前真实 HC-14 端到端测试仍未收到有效帧，不能标记为硬件联调通过。
+- 已确认 HC-14 位于飞控 UT2/USART2，机载 `/dev/ttyUSB0` 不是 HC-14；
+- 真实 PING/ACK 测试仍未收到有效帧，需先确认 UT2 上 HC-14 的本地 UART 是否匹配 `115200`，不能标记为硬件联调通过。
 
 本次协议迁移后尚未完成真实 HC-14 双端联调。旧协议或旧程序的历史联调结果不能作为新协议已通过硬件验证的证据。
 
 ## 6. 推荐排障顺序
 
-1. 确认两台主机可达，并确认 HC-14 仍映射到各自的稳定 `by-id` 路径。
-2. 检查是否有其他进程占用 `/dev/ttyUSB0`，不要强制终止未知任务。
+1. 确认两台主机可达，并确认地面站 HC-14 映射到稳定 `by-id` 路径。
+2. 机载侧只使用飞控 UT2/USART2 上的 HC-14，不把 `/dev/ttyUSB0` 当作 HC-14。
 3. 确认地面站 HC-14 为 `9600 8N1`、`DTR=False`、`RTS=False`。
 4. 确认机载端通过飞控 `0x0D/0x07` 无线桥收发，地面站端正确处理 `BB 33` 桥接封装。
 5. 确认机载无线模块本地 UART 匹配飞控 USART2 的 `115200`。
