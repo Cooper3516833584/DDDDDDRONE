@@ -1,6 +1,91 @@
 import threading
-import time
 from typing import Callable, Optional
+
+
+class FCWirelessTransport:
+    """Transport GroundStationLink payloads through the existing FC bridge.
+
+    The FC firmware adds/removes its own ``BB 33 | length`` envelope.  This
+    adapter therefore passes only GroundStationLink protocol bytes to callers.
+    """
+
+    def __init__(
+        self,
+        fc,
+        on_bytes: Callable[[bytes], None],
+        on_connected: Optional[Callable[[], None]] = None,
+        on_disconnected: Optional[Callable[[Optional[Exception]], None]] = None,
+        monitor_seconds: float = 0.1,
+    ):
+        if fc is None:
+            raise ValueError("flight-controller connection is required")
+        self._fc = fc
+        self._on_bytes = on_bytes
+        self._on_connected = on_connected
+        self._on_disconnected = on_disconnected
+        self._monitor_seconds = monitor_seconds
+        self._stop = threading.Event()
+        self._thread = None  # type: Optional[threading.Thread]
+        self._started = False
+        self._connected = False
+        self._lock = threading.Lock()
+
+    @property
+    def connected(self) -> bool:
+        with self._lock:
+            return self._started and self._connected
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        with self._lock:
+            self._started = True
+            self._connected = False
+        self._fc.register_wireless_callback(self._receive)
+        self._thread = threading.Thread(
+            target=self._monitor_connection,
+            name="ground-station-fc-wireless",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        with self._lock:
+            was_connected = self._connected
+            self._connected = False
+            self._started = False
+        if was_connected and self._on_disconnected is not None:
+            self._on_disconnected(None)
+
+    def write(self, data: bytes) -> None:
+        payload = bytes(data)
+        if len(payload) > 255:
+            raise ValueError("FC wireless payload exceeds 255-byte bridge limit")
+        if not self.connected:
+            raise RuntimeError("FC wireless bridge is not connected")
+        self._fc.send_to_wireless(payload)
+
+    def _receive(self, data: bytes) -> None:
+        if self.connected and data:
+            self._on_bytes(bytes(data))
+
+    def _monitor_connection(self) -> None:
+        while not self._stop.is_set():
+            current = bool(getattr(self._fc, "connected", False))
+            callback = None
+            with self._lock:
+                if current != self._connected:
+                    self._connected = current
+                    callback = (
+                        self._on_connected if current else self._on_disconnected
+                    )
+            if callback is not None:
+                callback() if current else callback(None)
+            self._stop.wait(self._monitor_seconds)
 
 
 class HC14SerialTransport:

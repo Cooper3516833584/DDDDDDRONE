@@ -4,6 +4,7 @@ from .service import (
     DEFAULT_KEY_ENV,
     GroundStationConfigurationError,
 )
+from .transport import FCWirelessTransport, HC14SerialTransport
 from .models import (
     AckStatus,
     Alarm,
@@ -28,6 +29,8 @@ __all__ = [
     "AircraftGroundStation",
     "DEFAULT_KEY_ENV",
     "GroundStationConfigurationError",
+    "FCWirelessTransport",
+    "HC14SerialTransport",
     "AckStatus",
     "Alarm",
     "Command",

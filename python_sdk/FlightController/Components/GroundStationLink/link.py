@@ -26,10 +26,9 @@ from .protocol import (
     FrameParser,
     RecentResponseCache,
     new_session,
-    pack_fast_telemetry,
     pack_frame,
 )
-from .transport import HC14SerialTransport
+from .transport import FCWirelessTransport
 
 
 DEFAULT_HC14_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
@@ -62,7 +61,7 @@ class GroundStationLink:
         stop_event: Optional[threading.Event] = None,
         state_provider: Optional[Callable[[], Optional[bytes]]] = None,
         queue_size: int = 32,
-        transport_factory=HC14SerialTransport,
+        transport_factory=None,
     ):
         if not key:
             raise ValueError("HMAC key is required")
@@ -97,13 +96,21 @@ class GroundStationLink:
         self._stop_latched = False
         self._stop_status = None  # type: Optional[AckStatus]
         self._stop_aliases = {}  # type: dict
-        self._transport = transport_factory(
-            port=port,
-            baudrate=baudrate,
-            on_bytes=self._on_bytes,
-            on_connected=self._on_connected,
-            on_disconnected=self._on_disconnected,
-        )
+        if transport_factory is None:
+            self._transport = FCWirelessTransport(
+                fc=fc,
+                on_bytes=self._on_bytes,
+                on_connected=self._on_connected,
+                on_disconnected=self._on_disconnected,
+            )
+        else:
+            self._transport = transport_factory(
+                port=port,
+                baudrate=baudrate,
+                on_bytes=self._on_bytes,
+                on_connected=self._on_connected,
+                on_disconnected=self._on_disconnected,
+            )
 
     @property
     def session(self) -> int:
@@ -236,8 +243,12 @@ class GroundStationLink:
         if payload is None:
             return False
         FCStatePayload.from_payload(payload)
-        frame_bytes = pack_fast_telemetry(
-            payload=payload[:13], session=self._session, seq=self._next_frame_seq()
+        frame_bytes = pack_frame(
+            MessageType.FC_STATE,
+            payload,
+            self._session,
+            self._next_frame_seq(),
+            self._key,
         )
         batch = None
         with self._batch_lock:

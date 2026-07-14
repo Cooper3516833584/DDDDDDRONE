@@ -13,10 +13,10 @@ from FlightController.Components.GroundStationLink import (
 )
 from FlightController.Components.GroundStationLink.models import Command
 from FlightController.Components.GroundStationLink.protocol import (
-    FastTelemetryParser,
     FrameParser,
     pack_frame,
 )
+from FlightController.Components.GroundStationLink.transport import FCWirelessTransport
 
 
 KEY = bytes.fromhex("00112233445566778899aabbccddeeff")
@@ -37,6 +37,19 @@ class FakeTransport:
         self.connected = False
 
     def write(self, data):
+        self.writes.append(data)
+
+
+class FakeFC:
+    def __init__(self):
+        self.connected = True
+        self.callback = None
+        self.writes = []
+
+    def register_wireless_callback(self, callback, threaded=False):
+        self.callback = callback
+
+    def send_to_wireless(self, data):
         self.writes.append(data)
 
 
@@ -62,6 +75,39 @@ class GroundStationLinkTests(unittest.TestCase):
         payload = state.to_payload()
         self.assertEqual(len(payload), 13)
         self.assertEqual(FCStatePayload.from_payload(payload), state)
+
+    def test_fc_wireless_transport_uses_existing_fc_bridge(self):
+        fc = FakeFC()
+        received = []
+        connected = threading.Event()
+        transport = FCWirelessTransport(
+            fc=fc,
+            on_bytes=received.append,
+            on_connected=connected.set,
+            monitor_seconds=0.001,
+        )
+        transport.start()
+        try:
+            self.assertTrue(connected.wait(0.1))
+            transport.write(b"ground-link-frame")
+            self.assertEqual(fc.writes, [b"ground-link-frame"])
+            fc.callback(b"ground-link-reply")
+            self.assertEqual(received, [b"ground-link-reply"])
+        finally:
+            transport.stop()
+
+    def test_fc_wireless_transport_rejects_oversized_payload(self):
+        fc = FakeFC()
+        transport = FCWirelessTransport(fc=fc, on_bytes=lambda data: None)
+        transport.start()
+        try:
+            deadline = time.monotonic() + 0.1
+            while not transport.connected and time.monotonic() < deadline:
+                time.sleep(0.001)
+            with self.assertRaises(ValueError):
+                transport.write(b"x" * 256)
+        finally:
+            transport.stop()
 
     def test_duplicate_command_is_queued_once(self):
         link = self.make_link()
@@ -102,7 +148,14 @@ class GroundStationLinkTests(unittest.TestCase):
         frame = bytearray(pack_frame(MessageType.HEARTBEAT, b"ok", 1, 2, KEY))
         frame[15] ^= 0x40
         self.assertEqual(parser.feed(bytes(frame)), [])
-        self.assertEqual(parser.stats.crc_failures, 1)
+        self.assertEqual(parser.stats.checksum_failures, 1)
+
+    def test_frame_uses_base_outer_format(self):
+        frame = pack_frame(MessageType.HEARTBEAT, b"ok", 1, 2, KEY)
+        self.assertEqual(frame[:2], b"\xAA\x22")
+        self.assertEqual(frame[2], MessageType.HEARTBEAT)
+        self.assertEqual(frame[3], len(frame) - 5)
+        self.assertEqual(frame[-1], sum(frame[:-1]) & 0xFF)
 
     def test_default_telemetry_rate_is_twenty_hz(self):
         link = GroundStationLink(
@@ -135,10 +188,11 @@ class GroundStationLinkTests(unittest.TestCase):
         self.assertEqual(link.mode, GroundLinkMode.TELEMETRY_TX)
         for _ in range(3):
             self.assertTrue(link.send_fc_state_now())
-        parser = FastTelemetryParser()
+        parser = FrameParser(KEY)
         states = parser.feed(link._transport.writes[-1])
         self.assertEqual(len(states), 3)
         state = states[-1]
+        self.assertEqual(state.msg_type, MessageType.FC_STATE)
         self.assertEqual(state.session, link.session)
         self.assertEqual(FCStatePayload.from_payload(state.payload).pos_x_cm, 1000)
 
@@ -169,7 +223,7 @@ class GroundStationLinkTests(unittest.TestCase):
         link.enable_telemetry_transmission()
         for _ in range(3):
             link.send_fc_state_now()
-        frames = FastTelemetryParser().feed(link._transport.writes[-1])
+        frames = FrameParser(KEY).feed(link._transport.writes[-1])
         self.assertEqual(len(frames), 3)
 
     def test_led_control_requires_telemetry_mode(self):

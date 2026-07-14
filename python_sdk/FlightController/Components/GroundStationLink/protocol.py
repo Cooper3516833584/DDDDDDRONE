@@ -6,21 +6,19 @@ import secrets
 import struct
 from typing import List, Optional, Tuple
 
-from .models import FC_STATE_LAYOUT_V1, MAX_PAYLOAD_LEN, PROTOCOL_VERSION, MessageType
+from .models import MAX_PAYLOAD_LEN, PROTOCOL_VERSION, MessageType
 
 
-MAGIC = b"\xA5\x5A"
-HEADER_STRUCT = struct.Struct(">2sBBB I H H")
-CRC_STRUCT = struct.Struct(">H")
+MAGIC = b"\xAA\x22"
+HEADER_STRUCT = struct.Struct("<2sBB")
+METADATA_STRUCT = struct.Struct(">BBIH")
 HMAC_LEN = 8
 HEADER_LEN = HEADER_STRUCT.size
-CRC_LEN = CRC_STRUCT.size
-MIN_FRAME_LEN = HEADER_LEN + CRC_LEN + HMAC_LEN
-FAST_TELEMETRY_MAGIC = b"\xC3\x3C"
-FAST_TELEMETRY_VERSION = 1
-FAST_TELEMETRY_HEADER = struct.Struct(">2sBBIH")
-FAST_TELEMETRY_CORE = struct.Struct("<iiHBB")
-FAST_TELEMETRY_LEN = FAST_TELEMETRY_HEADER.size + FAST_TELEMETRY_CORE.size + CRC_LEN
+METADATA_LEN = METADATA_STRUCT.size
+MIN_DATA_LEN = METADATA_LEN + HMAC_LEN
+MAX_DATA_LEN = METADATA_LEN + MAX_PAYLOAD_LEN + HMAC_LEN
+CHECKSUM_LEN = 1
+MIN_FRAME_LEN = HEADER_LEN + MIN_DATA_LEN + CHECKSUM_LEN
 
 
 class ProtocolError(ValueError):
@@ -37,36 +35,22 @@ class Frame:
     payload: bytes
 
 
-@dataclass(frozen=True)
-class FastTelemetry:
-    session: int
-    seq: int
-    payload: bytes
-
-
 @dataclass
 class ParserStats:
-    crc_failures: int = 0
+    checksum_failures: int = 0
     hmac_failures: int = 0
     oversize_frames: int = 0
     version_failures: int = 0
     discarded_bytes: int = 0
 
+    @property
+    def crc_failures(self) -> int:
+        """Compatibility alias for callers that used the previous counter name."""
+        return self.checksum_failures
+
 
 def new_session() -> int:
     return secrets.randbits(32)
-
-
-def crc16_ccitt(data: bytes, init: int = 0xFFFF) -> int:
-    crc = init
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return crc
 
 
 def _tag(data: bytes, key: bytes) -> bytes:
@@ -86,80 +70,52 @@ def pack_frame(
 ) -> bytes:
     if len(payload) > MAX_PAYLOAD_LEN:
         raise ProtocolError("payload too large: {} > {}".format(len(payload), MAX_PAYLOAD_LEN))
-    header = HEADER_STRUCT.pack(
-        MAGIC,
+    metadata = METADATA_STRUCT.pack(
         version,
-        int(msg_type),
         flags & 0xFF,
         session & 0xFFFFFFFF,
         seq & 0xFFFF,
-        len(payload),
     )
-    protected = header + payload
-    crc = CRC_STRUCT.pack(crc16_ccitt(protected))
-    return protected + crc + _tag(protected + crc, key)
+    data_len = len(metadata) + len(payload) + HMAC_LEN
+    header = HEADER_STRUCT.pack(MAGIC, int(msg_type), data_len)
+    protected = header + metadata + payload
+    frame_without_checksum = protected + _tag(protected, key)
+    checksum = (sum(frame_without_checksum) & 0xFF).to_bytes(1, "little")
+    return frame_without_checksum + checksum
 
 
 def unpack_frame(frame_bytes: bytes, key: bytes) -> Frame:
     if len(frame_bytes) < MIN_FRAME_LEN:
         raise ProtocolError("frame too short")
-    magic, version, msg_type, flags, session, seq, length = HEADER_STRUCT.unpack(
-        frame_bytes[:HEADER_LEN]
-    )
+    magic, msg_type, data_len = HEADER_STRUCT.unpack(frame_bytes[:HEADER_LEN])
     if magic != MAGIC:
         raise ProtocolError("bad magic")
-    if version != PROTOCOL_VERSION:
-        raise ProtocolError("unsupported version")
-    if length > MAX_PAYLOAD_LEN:
+    if data_len < MIN_DATA_LEN:
+        raise ProtocolError("frame data too short")
+    if data_len > MAX_DATA_LEN:
         raise ProtocolError("payload too large")
-    expected_len = HEADER_LEN + length + CRC_LEN + HMAC_LEN
+    expected_len = HEADER_LEN + data_len + CHECKSUM_LEN
     if len(frame_bytes) != expected_len:
         raise ProtocolError("wrong frame length")
-    crc_offset = HEADER_LEN + length
-    expected_crc = CRC_STRUCT.unpack(frame_bytes[crc_offset : crc_offset + CRC_LEN])[0]
-    if expected_crc != crc16_ccitt(frame_bytes[:crc_offset]):
-        raise ProtocolError("crc mismatch")
-    expected_tag = frame_bytes[crc_offset + CRC_LEN :]
-    actual_tag = _tag(frame_bytes[: crc_offset + CRC_LEN], key)
+    if frame_bytes[-1] != (sum(frame_bytes[:-1]) & 0xFF):
+        raise ProtocolError("checksum mismatch")
+    tag_offset = len(frame_bytes) - CHECKSUM_LEN - HMAC_LEN
+    expected_tag = frame_bytes[tag_offset:-CHECKSUM_LEN]
+    actual_tag = _tag(frame_bytes[:tag_offset], key)
     if not hmac.compare_digest(expected_tag, actual_tag):
         raise ProtocolError("hmac mismatch")
+    metadata_end = HEADER_LEN + METADATA_LEN
+    version, flags, session, seq = METADATA_STRUCT.unpack(
+        frame_bytes[HEADER_LEN:metadata_end]
+    )
+    if version != PROTOCOL_VERSION:
+        raise ProtocolError("unsupported version")
     try:
         typed_msg = MessageType(msg_type)
     except ValueError as exc:
         raise ProtocolError("unknown message type") from exc
-    payload = frame_bytes[HEADER_LEN : HEADER_LEN + length]
+    payload = frame_bytes[metadata_end:tag_offset]
     return Frame(version, typed_msg, flags, session, seq, payload)
-
-
-def pack_fast_telemetry(payload: bytes, session: int, seq: int) -> bytes:
-    if len(payload) != 13 or payload[0] != FC_STATE_LAYOUT_V1:
-        raise ProtocolError("fast telemetry requires the compact FC_STATE core")
-    header = FAST_TELEMETRY_HEADER.pack(
-        FAST_TELEMETRY_MAGIC,
-        FAST_TELEMETRY_VERSION,
-        FC_STATE_LAYOUT_V1,
-        session & 0xFFFFFFFF,
-        seq & 0xFFFF,
-    )
-    protected = header + payload[1:]
-    return protected + CRC_STRUCT.pack(crc16_ccitt(protected))
-
-
-def unpack_fast_telemetry(frame_bytes: bytes) -> FastTelemetry:
-    if len(frame_bytes) != FAST_TELEMETRY_LEN:
-        raise ProtocolError("wrong fast telemetry length")
-    magic, version, layout, session, seq = FAST_TELEMETRY_HEADER.unpack(
-        frame_bytes[: FAST_TELEMETRY_HEADER.size]
-    )
-    if magic != FAST_TELEMETRY_MAGIC:
-        raise ProtocolError("bad fast telemetry magic")
-    if version != FAST_TELEMETRY_VERSION or layout != FC_STATE_LAYOUT_V1:
-        raise ProtocolError("unsupported fast telemetry version")
-    crc_offset = FAST_TELEMETRY_LEN - CRC_LEN
-    expected_crc = CRC_STRUCT.unpack(frame_bytes[crc_offset:])[0]
-    if expected_crc != crc16_ccitt(frame_bytes[:crc_offset]):
-        raise ProtocolError("fast telemetry crc mismatch")
-    return FastTelemetry(session, seq, bytes([layout]) + frame_bytes[FAST_TELEMETRY_HEADER.size:crc_offset])
 
 
 class FrameParser:
@@ -188,18 +144,12 @@ class FrameParser:
                 del self._buffer[:start]
             if len(self._buffer) < HEADER_LEN:
                 return frames
-            _, version, _, _, _, _, length = HEADER_STRUCT.unpack(
-                self._buffer[:HEADER_LEN]
-            )
-            if version != PROTOCOL_VERSION:
-                self.stats.version_failures += 1
-                del self._buffer[0]
-                continue
-            if length > MAX_PAYLOAD_LEN:
+            _, _, data_len = HEADER_STRUCT.unpack(self._buffer[:HEADER_LEN])
+            if data_len < MIN_DATA_LEN or data_len > MAX_DATA_LEN:
                 self.stats.oversize_frames += 1
                 del self._buffer[0]
                 continue
-            total_len = HEADER_LEN + length + CRC_LEN + HMAC_LEN
+            total_len = HEADER_LEN + data_len + CHECKSUM_LEN
             if len(self._buffer) < total_len:
                 return frames
             candidate = bytes(self._buffer[:total_len])
@@ -207,44 +157,12 @@ class FrameParser:
             try:
                 frames.append(unpack_frame(candidate, self._key))
             except ProtocolError as exc:
-                if "crc" in str(exc):
-                    self.stats.crc_failures += 1
+                if "checksum" in str(exc):
+                    self.stats.checksum_failures += 1
                 elif "hmac" in str(exc):
                     self.stats.hmac_failures += 1
-                else:
-                    self.stats.discarded_bytes += 1
-
-
-class FastTelemetryParser:
-    def __init__(self):
-        self._buffer = bytearray()
-        self.stats = ParserStats()
-
-    def feed(self, data: bytes) -> List[FastTelemetry]:
-        self._buffer.extend(data)
-        frames = []
-        while True:
-            start = self._buffer.find(FAST_TELEMETRY_MAGIC)
-            if start < 0:
-                keep = 1 if self._buffer.endswith(FAST_TELEMETRY_MAGIC[:1]) else 0
-                self.stats.discarded_bytes += len(self._buffer) - keep
-                if keep:
-                    del self._buffer[:-keep]
-                else:
-                    self._buffer.clear()
-                return frames
-            if start:
-                self.stats.discarded_bytes += start
-                del self._buffer[:start]
-            if len(self._buffer) < FAST_TELEMETRY_LEN:
-                return frames
-            candidate = bytes(self._buffer[:FAST_TELEMETRY_LEN])
-            del self._buffer[:FAST_TELEMETRY_LEN]
-            try:
-                frames.append(unpack_fast_telemetry(candidate))
-            except ProtocolError as exc:
-                if "crc" in str(exc):
-                    self.stats.crc_failures += 1
+                elif "version" in str(exc):
+                    self.stats.version_failures += 1
                 else:
                     self.stats.discarded_bytes += 1
 

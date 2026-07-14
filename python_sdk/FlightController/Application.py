@@ -314,7 +314,7 @@ class FC_Application(FC_Protocol):
         stop_event: Optional[threading.Event] = None,
         **link_options
     ):
-        """启动机载 HC-14 地面站链路。
+        """通过飞控无线串口桥启动机载 HC-14 地面站链路。
 
         key 为空时从 GROUND_STATION_HMAC_KEY_HEX 环境变量读取。
         返回的门面只收发状态、任务命令和 ACK，不直接执行飞行动作。
