@@ -4,7 +4,7 @@ import struct
 from typing import Optional, Tuple
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_PAYLOAD_LEN = 128
 FLAG_UPLINK_WINDOW = 0x01
 

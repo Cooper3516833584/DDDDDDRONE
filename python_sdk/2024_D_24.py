@@ -1046,8 +1046,11 @@ if __name__ == "__main__":
         mapper=mapper,
     )
 
-    # ---- 步骤 9: 等待地面站通过 HC-14 发送 START_MISSION ----
+    # ---- 步骤 9: 经飞控 0x0D/0x07 -> UT2/HC-14 等待 START_MISSION ----
+    # start_ground_station() 默认使用 FCWirelessTransport，复用上面的
+    # FC_Client；此入口不会直接打开机载 /dev/ttyUSB0。
     fc.start_ground_station()
+    logger.info("[MANAGER] GroundStationLink using FC wireless bridge (UT2)")
     fc.enable_ground_command_reception()
     logger.info("[MANAGER] Waiting for ground-station start command")
     ground_command = None

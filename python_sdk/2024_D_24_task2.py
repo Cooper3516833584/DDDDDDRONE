@@ -1,7 +1,7 @@
 """2024 D problem, requirement 2: targeted inventory mission.
 
 Flow:
-  ground SSH ``start`` -> START_VISION_ACQUIRE over HC-14
+  ground SSH ``start`` -> START_VISION_ACQUIRE over the FC UT2/HC-14 bridge
   -> scan front camera index 0 without a timeout
   -> look up the detected cargo in 2024_D_24_inventory.json
   -> report the cargo/location and count down for 10 seconds
@@ -12,8 +12,9 @@ Flow:
 
 During the unlimited preflight scan the aircraft link remains in command RX
 mode, so a ground ``quit``/STOP_MISSION can cancel it immediately. Once the
-aircraft begins telemetry transmission and flight, the existing one-way HC-14
-protocol deliberately does not accept in-flight commands.
+aircraft begins telemetry transmission and flight, GroundStationLink continues
+through the flight controller bridge in telemetry mode and deliberately ignores
+in-flight commands.
 """
 
 from __future__ import annotations
@@ -294,7 +295,7 @@ def _complete_stop_command(fc: FC_Client) -> None:
 
 def main() -> int:
     rm = RosManager()
-    rm.chmod("/dev/ttyUSB0")
+    rm.chmod("/dev/ttyUSB0")  # CP2102 radar; GroundStationLink does not open it
     rm.chmod("/dev/ttyACM0")
     rm.chmod("/dev/video0")  # front QR camera required by task 2
     rm.chmod("/dev/video2")  # downward landing camera
@@ -328,7 +329,10 @@ def main() -> int:
     start_command = None
     mission_error: Optional[Exception] = None
     try:
+        # Reuse FC_Client through FCWirelessTransport -> FC 0x0D/0x07 -> UT2.
+        # Do not open an airborne HC-14 USB serial device here.
         fc.start_ground_station()
+        logger.info("[TASK2] GroundStationLink using FC wireless bridge (UT2)")
         fc.enable_ground_command_reception()
         logger.info("[TASK2] Waiting for SSH start / START_VISION_ACQUIRE")
         while start_command is None:
