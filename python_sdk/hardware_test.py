@@ -29,12 +29,12 @@ from loguru import logger
 # ============================================================
 
 # 定位模式: "radar" 或 "ros"
-POSITIONING_MODE = "radar"
+POSITIONING_MODE = "ros"
 
 # 各硬件期望连接数量
 EXPECTED_RADAR_COUNT = 1        # 雷达数量
 EXPECTED_FC_COUNT = 1           # 飞控数量
-EXPECTED_CAMERA_COUNT = 1       # 摄像头数量
+EXPECTED_CAMERA_COUNT = 2       # 摄像头数量
 EXPECTED_T265_COUNT = 1          # T265 数量（仅 ROS 模式）
 
 # 飞控串口设备（单雷达模式）
