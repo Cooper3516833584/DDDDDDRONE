@@ -151,8 +151,8 @@ def callback(cmd: str):
 
 scr.register_report_callback(lambda x: threading.Thread(target=callback, args=(x,)).start())
 
-for item in packages:
-    run_item(item, False)
+# for item in packages:
+#     run_item(item, False)
 
 fc.start_listen_serial(print_state=True, block_until_connected=True)
 fc.serve_forever(indicator=True)

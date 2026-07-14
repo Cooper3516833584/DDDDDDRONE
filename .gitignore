@@ -11,3 +11,6 @@ __pycache__/
 # Runtime inventory records
 /python_sdk/2024_D_24_inventory.json
 /python_sdk/2024_D_24_inventory.json.tmp
+
+/fc_log/
+/python_sdk/fc_log/
