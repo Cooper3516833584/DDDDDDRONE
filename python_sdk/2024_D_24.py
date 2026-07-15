@@ -264,14 +264,14 @@ class Mission(object):
                 # 确定飞行方向
                 if distance < target_distance:
                     # 太近 → 远离障碍物 → 机头反方向
-                    direction = (navi.current_yaw + 180) % 360
+                    direction = 180.0
                     logger.debug(
                         f"[BARRIER] Too close ({distance:.1f} < {target_distance}), "
                         f"backward dir={direction:.0f}°"
                     )
                 else:
                     # 太远 → 靠近障碍物 → 机头正方向
-                    direction = navi.current_yaw
+                    direction = 0.0
                     logger.debug(
                         f"[BARRIER] Too far ({distance:.1f} > {target_distance}), "
                         f"forward dir={direction:.0f}°"
@@ -419,13 +419,14 @@ class Mission(object):
                 return True
 
             # ---- 3. 水平方向校正 (y_px → y正) ----
-            # y_px > 0: QR 在画面左侧 → 飞机向左 (yaw + 90°)
-            # y_px < 0: QR 在画面右侧 → 飞机向右 (yaw - 90°)
+            # move_by_direction 使用机体系角度：前方 0°，左侧 +90°
+            # y_px > 0: QR 在画面左侧 → 飞机向左 (+90°)
+            # y_px < 0: QR 在画面右侧 → 飞机向右 (-90°)
             if not y_ok:
                 if y_px > 0:
-                    direction = (navi.current_yaw + 90) % 360
+                    direction = 90.0
                 else:
-                    direction = (navi.current_yaw - 90) % 360
+                    direction = -90.0
                 navi.move_by_direction(speed=speed, direction_deg=direction)
             else:
                 navi.stop_move()
@@ -563,7 +564,7 @@ class Mission(object):
            右上(3) → 右下(6) → 中下(5) → 中上(2) → 左上(1) → 左下(4)
 
         坐标系 (前视摄像头画面 → 飞机):
-           画面左 → 飞机 y正    (move_by_direction yaw+90°)
+           画面左 → 飞机 y正    (move_by_direction +90°)
            画面上 → 飞机 z正    (set_height +)
 
         移动规则:
@@ -700,8 +701,8 @@ class Mission(object):
             x_px = center_y - target_y → 画面上为正 → 对应飞机前 (x+)
             y_px = center_x - target_x → 画面左为正 → 对应飞机左 (y+)
 
-        合成移动方向:
-            direction = yaw + arctan2(y_px, x_px)
+        合成移动方向（机体系）:
+            direction = arctan2(y_px, x_px)
 
         参考: 2022_24_noscreen_nomotor.py vision_approach 的闭环模式。
         """
@@ -736,13 +737,13 @@ class Mission(object):
             # ---- 3. 合成移动方向 ----
             # x_px > 0 → 画面上方(机头正前) → 向前分量
             # y_px > 0 → 画面左侧(机头左)   → 向左分量
-            # direction = yaw + arctan2(y_px, x_px)
+            # move_by_direction 直接接收相对机头的机体系方向
             angle_from_forward = np.rad2deg(np.arctan2(y_px, x_px))
-            direction = (navi.current_yaw + angle_from_forward) % 360
+            direction = angle_from_forward
 
             logger.debug(
                 f"[LANDING] moving: direction={direction:.0f}° "
-                f"(yaw={navi.current_yaw:.0f} + {angle_from_forward:.0f})"
+                f"(relative to forward={angle_from_forward:.0f}°)"
             )
 
             navi.move_by_direction(speed=speed, direction_deg=direction)
