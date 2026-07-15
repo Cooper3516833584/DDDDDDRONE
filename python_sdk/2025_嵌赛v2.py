@@ -22,7 +22,56 @@ import struct
     
 CURISE_SPEED = 22
 CUREISE_HEIGHT = 120
-YAW_DIAGNOSTIC_INTERVAL = 0.5
+YAW_DIAGNOSTIC_INTERVAL = 0.1
+
+PRECISE_YAW_LOOP_INTERVAL = 0.05
+
+PRECISE_YAW_FAR_SPEED = 18
+PRECISE_YAW_MEDIUM_SPEED = 12
+PRECISE_YAW_NEAR_SPEED = 8
+PRECISE_YAW_FINE_SPEED = 5
+PRECISE_YAW_BRAKE_SPEED = 3
+PRECISE_YAW_HOLD_SPEED = 8
+
+PRECISE_YAW_FINAL_ERROR = 2.0
+PRECISE_YAW_FINAL_RATE = 2.5
+PRECISE_YAW_SETTLE_TIME = 1.0
+PRECISE_YAW_TIMEOUT = 18.0
+
+PRECISE_YAW_RATE_FILTER_ALPHA = 0.30
+PRECISE_YAW_MAX_VALID_RATE = 90.0
+
+
+def _precise_yaw_speed_limit(
+    abs_error: float,
+    abs_yaw_rate: float,
+    target_crossed: bool,
+) -> int:
+    """根据剩余误差、角速度和过目标状态返回 yaw PID 输出上限。"""
+    if abs_error > 70.0:
+        speed_limit = PRECISE_YAW_FAR_SPEED
+    elif abs_error > 35.0:
+        speed_limit = PRECISE_YAW_MEDIUM_SPEED
+    elif abs_error > 15.0:
+        speed_limit = PRECISE_YAW_NEAR_SPEED
+    elif abs_error > 6.0:
+        speed_limit = PRECISE_YAW_FINE_SPEED
+    else:
+        speed_limit = PRECISE_YAW_BRAKE_SPEED
+
+    if abs_yaw_rate > 1.0:
+        estimated_time_to_target = abs_error / abs_yaw_rate
+        if estimated_time_to_target < 1.2:
+            if abs_error > 6.0:
+                speed_limit = min(speed_limit, PRECISE_YAW_FINE_SPEED)
+            else:
+                speed_limit = min(speed_limit, PRECISE_YAW_BRAKE_SPEED)
+
+    if target_crossed and abs_yaw_rate > PRECISE_YAW_FINAL_RATE:
+        speed_limit = min(speed_limit, PRECISE_YAW_BRAKE_SPEED)
+
+    return int(speed_limit)
+
 
 class Mission(object):
     def __init__(self, *args, **kwargs):
@@ -30,6 +79,11 @@ class Mission(object):
         self.radar: LD_Radar = kwargs["radar"]
         self.navi: Navigation = kwargs["navi"]
         self.rs: T265 = kwargs["rs"]
+        self._yaw_diagnostic_phase = "idle"
+        self._precise_yaw_speed_limit = None
+        self._precise_yaw_filtered_rate = None
+        self._precise_yaw_target_crossed = False
+        self._precise_yaw_stable_time = 0.0
         # self.screen: UARTScreen = kwargs.get("screen", None)
        
     def stop(self):
@@ -37,9 +91,18 @@ class Mission(object):
         logger.info("[MISSION] Mission stopped")
 
     @staticmethod
-    def _shortest_yaw_difference(target_yaw: float, current_yaw: float) -> float:
-        """计算 [-180, 180) 范围内的有符号航向差。"""
-        return (float(target_yaw) - float(current_yaw) + 180.0) % 360.0 - 180.0
+    def _navigation_yaw_error(target_yaw: float, current_yaw: float) -> float:
+        """计算与 Navigation 相同语义的最短有符号航向误差。"""
+        raw_error = float(target_yaw) - float(current_yaw)
+        error = (raw_error + 180.0) % 360.0 - 180.0
+        if error == -180.0 and raw_error > 0:
+            return 180.0
+        return error
+
+    @staticmethod
+    def _yaw_delta(current_yaw: float, previous_yaw: float) -> float:
+        """计算相邻航向采样之间处理过环绕的变化量。"""
+        return (float(current_yaw) - float(previous_yaw) + 180.0) % 360.0 - 180.0
 
     def _yaw_diagnostic_task(self, stop_event: threading.Event):
         """在转向与定点降落期间低频记录航向闭环的输入、输出和飞控回传。"""
@@ -64,10 +127,10 @@ class Mission(object):
                     fc_yaw_rate = float("nan")
                 else:
                     dt = max(now - previous_time, 1e-6)
-                    navi_yaw_rate = self._shortest_yaw_difference(
+                    navi_yaw_rate = self._yaw_delta(
                         navi_yaw, previous_navi_yaw
                     ) / dt
-                    fc_yaw_rate = self._shortest_yaw_difference(
+                    fc_yaw_rate = self._yaw_delta(
                         fc_yaw, previous_fc_yaw
                     ) / dt
 
@@ -78,9 +141,13 @@ class Mission(object):
 
                 current_point = navi.current_point
                 target_point = navi.navigation_target
-                navi_error = self._shortest_yaw_difference(yaw_target, navi_yaw)
-                fc_error = self._shortest_yaw_difference(yaw_target, fc_yaw)
-                navi_fc_difference = self._shortest_yaw_difference(navi_yaw, fc_yaw)
+                navi_error = self._navigation_yaw_error(yaw_target, navi_yaw)
+                fc_error = self._navigation_yaw_error(yaw_target, fc_yaw)
+                navi_fc_difference = self._yaw_delta(navi_yaw, fc_yaw)
+                precise_rate = self._precise_yaw_filtered_rate
+                precise_rate_text = (
+                    "None" if precise_rate is None else f"{precise_rate:+.2f}"
+                )
 
                 logger.info(
                     f"[YAW-DIAG] phase={self._yaw_diagnostic_phase} "
@@ -90,6 +157,10 @@ class Mission(object):
                     f"rate(navi/fc)=({navi_yaw_rate:+.2f}/{fc_yaw_rate:+.2f})deg/s "
                     f"control_body=({control_x},{control_y},{control_z})cm/s "
                     f"control_yaw={control_yaw:+.1f}deg/s(cw+) "
+                    f"precise_limit={self._precise_yaw_speed_limit} "
+                    f"precise_rate={precise_rate_text}deg/s "
+                    f"crossed={self._precise_yaw_target_crossed} "
+                    f"stable={self._precise_yaw_stable_time:.2f}s "
                     f"fc_attitude=({fc.state.rol.value:.2f},"
                     f"{fc.state.pit.value:.2f},{fc_yaw:.2f})deg "
                     f"fc_velocity=({fc.state.vel_x.value},{fc.state.vel_y.value},"
@@ -110,6 +181,148 @@ class Mission(object):
             stop_event.wait(YAW_DIAGNOSTIC_INTERVAL)
 
         logger.info("[YAW-DIAG] logger stopped")
+
+    def turn_to_yaw_precise(
+        self,
+        target_yaw: float,
+        timeout: float = PRECISE_YAW_TIMEOUT,
+    ) -> bool:
+        """使用 Navigation 现有 yaw 外环完成带动态减速的精确转向。"""
+        navi = self.navi
+        fc = self.fc
+        target_yaw = float(target_yaw)
+
+        start_time = time.perf_counter()
+        previous_time = start_time
+        previous_yaw = float(navi.current_yaw)
+        initial_error = self._navigation_yaw_error(target_yaw, previous_yaw)
+
+        initial_direction = 0
+        if initial_error > 0:
+            initial_direction = 1
+        elif initial_error < 0:
+            initial_direction = -1
+
+        filtered_yaw_rate = 0.0
+        stable_since = None
+        current_speed_limit = PRECISE_YAW_FAR_SPEED
+        target_crossed = False
+
+        self._precise_yaw_speed_limit = current_speed_limit
+        self._precise_yaw_filtered_rate = filtered_yaw_rate
+        self._precise_yaw_target_crossed = target_crossed
+        self._precise_yaw_stable_time = 0.0
+
+        navi.set_yaw_speed(PRECISE_YAW_FAR_SPEED)
+        navi.set_yaw(target_yaw)
+        logger.info(
+            f"[YAW-PRECISE] start target={target_yaw:.2f}deg "
+            f"current={previous_yaw:.2f}deg "
+            f"initial_error={initial_error:+.2f}deg "
+            f"direction={initial_direction:+d}"
+        )
+
+        while True:
+            time.sleep(PRECISE_YAW_LOOP_INTERVAL)
+            now = time.perf_counter()
+            current_yaw = float(navi.current_yaw)
+            dt = max(now - previous_time, 1e-6)
+
+            yaw_delta = self._yaw_delta(current_yaw, previous_yaw)
+            raw_yaw_rate = yaw_delta / dt
+            if abs(raw_yaw_rate) <= PRECISE_YAW_MAX_VALID_RATE:
+                filtered_yaw_rate = (
+                    (1.0 - PRECISE_YAW_RATE_FILTER_ALPHA) * filtered_yaw_rate
+                    + PRECISE_YAW_RATE_FILTER_ALPHA * raw_yaw_rate
+                )
+            else:
+                logger.warning(
+                    f"[YAW-PRECISE] ignored invalid yaw-rate sample: "
+                    f"{raw_yaw_rate:+.2f}deg/s"
+                )
+
+            yaw_error = self._navigation_yaw_error(target_yaw, current_yaw)
+            abs_error = abs(yaw_error)
+            abs_yaw_rate = abs(filtered_yaw_rate)
+
+            if (
+                initial_direction != 0
+                and yaw_error != 0
+                and yaw_error * initial_direction < 0
+            ):
+                target_crossed = True
+
+            self._precise_yaw_filtered_rate = filtered_yaw_rate
+            self._precise_yaw_target_crossed = target_crossed
+
+            if not navi.running:
+                logger.error("[YAW-PRECISE] navigation stopped during turn")
+                return False
+            if not fc.state.unlock.value:
+                logger.error("[YAW-PRECISE] aircraft locked during turn")
+                return False
+            if fc.state.mode.value != fc.HOLD_POS_MODE:
+                logger.error(
+                    f"[YAW-PRECISE] unexpected flight mode: {fc.state.mode.value}"
+                )
+                return False
+            if not navi.navigation_flag:
+                logger.error("[YAW-PRECISE] navigation flag disabled during turn")
+                return False
+
+            desired_speed_limit = _precise_yaw_speed_limit(
+                abs_error=abs_error,
+                abs_yaw_rate=abs_yaw_rate,
+                target_crossed=target_crossed,
+            )
+            if desired_speed_limit != current_speed_limit:
+                navi.set_yaw_speed(desired_speed_limit)
+                current_speed_limit = desired_speed_limit
+                self._precise_yaw_speed_limit = current_speed_limit
+                logger.info(
+                    f"[YAW-PRECISE] speed-limit={current_speed_limit}deg/s "
+                    f"error={yaw_error:+.2f}deg "
+                    f"rate={filtered_yaw_rate:+.2f}deg/s "
+                    f"crossed={target_crossed}"
+                )
+
+            if (
+                abs_error <= PRECISE_YAW_FINAL_ERROR
+                and abs_yaw_rate <= PRECISE_YAW_FINAL_RATE
+            ):
+                if stable_since is None:
+                    stable_since = now
+                self._precise_yaw_stable_time = now - stable_since
+                if self._precise_yaw_stable_time >= PRECISE_YAW_SETTLE_TIME:
+                    navi.set_yaw_speed(PRECISE_YAW_HOLD_SPEED)
+                    self._precise_yaw_speed_limit = PRECISE_YAW_HOLD_SPEED
+                    logger.info(
+                        f"[YAW-PRECISE] reached target={target_yaw:.2f}deg "
+                        f"current={current_yaw:.2f}deg "
+                        f"error={yaw_error:+.2f}deg "
+                        f"rate={filtered_yaw_rate:+.2f}deg/s "
+                        f"elapsed={now-start_time:.2f}s"
+                    )
+                    return True
+            else:
+                stable_since = None
+                self._precise_yaw_stable_time = 0.0
+
+            if now - start_time >= timeout:
+                navi.set_yaw_speed(PRECISE_YAW_FINE_SPEED)
+                self._precise_yaw_speed_limit = PRECISE_YAW_FINE_SPEED
+                logger.warning(
+                    f"[YAW-PRECISE] timeout target={target_yaw:.2f}deg "
+                    f"current={current_yaw:.2f}deg "
+                    f"error={yaw_error:+.2f}deg "
+                    f"rate={filtered_yaw_rate:+.2f}deg/s "
+                    f"crossed={target_crossed} "
+                    f"elapsed={now-start_time:.2f}s"
+                )
+                return False
+
+            previous_yaw = current_yaw
+            previous_time = now
 
     def run(self):
         fc = self.fc
@@ -157,8 +370,12 @@ class Mission(object):
         )
         yaw_diagnostic_thread.start()
         try:
-            navi.set_yaw(180)
-            navi.wait_for_yaw()
+            turn_ok = self.turn_to_yaw_precise(180.0)
+            if not turn_ok:
+                logger.warning(
+                    "[MISSION] Precise yaw turn did not fully settle; "
+                    "continue returning to origin for safe landing"
+                )
 
             # navi.navigation_to_waypoint((100,-100))
             # time.sleep(1)
