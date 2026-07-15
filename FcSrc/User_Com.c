@@ -10,6 +10,7 @@
 
 #include "User_Com.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -357,10 +358,47 @@ void UserCom_Task(float dT_s) {
 }
 
 /**
+ * @brief Convert the frame-ID-04 quaternion to Euler angles in 0.01 degrees.
+ */
+static u8 UserCom_QuaternionToEulerX100(s16* rol_x100, s16* pit_x100,
+                                        s16* yaw_x100) {
+  const float rad_to_deg_x100 = 5729.577951f;
+  const float w = (float)fc_att_qua.st_data.w_x10000;
+  const float x = (float)fc_att_qua.st_data.x_x10000;
+  const float y = (float)fc_att_qua.st_data.y_x10000;
+  const float z = (float)fc_att_qua.st_data.z_x10000;
+  const float norm_sq = w * w + x * x + y * y + z * z;
+  float sin_pitch;
+
+  if (norm_sq < 1.0f) {
+    return 0;
+  }
+
+  sin_pitch = 2.0f * (w * y - z * x) / norm_sq;
+  if (sin_pitch > 1.0f) {
+    sin_pitch = 1.0f;
+  } else if (sin_pitch < -1.0f) {
+    sin_pitch = -1.0f;
+  }
+
+  *rol_x100 = (s16)(atan2f(2.0f * (w * x + y * z),
+                            w * w - x * x - y * y + z * z) *
+                      rad_to_deg_x100);
+  *pit_x100 = (s16)(asinf(sin_pitch) * rad_to_deg_x100);
+  *yaw_x100 = (s16)(atan2f(2.0f * (w * z + x * y),
+                            w * w + x * x - y * y - z * z) *
+                      rad_to_deg_x100);
+  return 1;
+}
+
+/**
  * @brief 交换飞控数据
  */
 void UserCom_DataExchange(void) {
   const u8 user_data_size = sizeof(to_user_data.byte_data);
+  s16 quaternion_rol_x100;
+  s16 quaternion_pit_x100;
+  s16 quaternion_yaw_x100;
 
   // 初始化数据
   to_user_data.st_data.head1 = 0xAA;
@@ -369,9 +407,18 @@ void UserCom_DataExchange(void) {
   to_user_data.st_data.cmd = 0x01;
 
   // 数据赋值
-  to_user_data.st_data.rol_x100 = fc_att.st_data.rol_x100;
-  to_user_data.st_data.pit_x100 = fc_att.st_data.pit_x100;
-  to_user_data.st_data.yaw_x100 = fc_att.st_data.yaw_x100;
+  // ID 03 Euler-angle source retained for rollback:
+  // to_user_data.st_data.rol_x100 = fc_att.st_data.rol_x100;
+  // to_user_data.st_data.pit_x100 = fc_att.st_data.pit_x100;
+  // to_user_data.st_data.yaw_x100 = fc_att.st_data.yaw_x100;
+  // ID 04 quaternion is converted without changing the 40-byte user protocol.
+  if (UserCom_QuaternionToEulerX100(&quaternion_rol_x100,
+                                    &quaternion_pit_x100,
+                                    &quaternion_yaw_x100)) {
+    to_user_data.st_data.rol_x100 = quaternion_rol_x100;
+    to_user_data.st_data.pit_x100 = quaternion_pit_x100;
+    to_user_data.st_data.yaw_x100 = quaternion_yaw_x100;
+  }
   to_user_data.st_data.alt_fused = fc_alt.st_data.alt_fused;
   to_user_data.st_data.alt_add = fc_alt.st_data.alt_add;
   to_user_data.st_data.vel_x = fc_vel.st_data.vel_x;

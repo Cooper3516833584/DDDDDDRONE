@@ -5,6 +5,9 @@ take_off, set_flight_mode, or any motion-control API.  The SDK listener sends
 its normal communication heartbeat so that the flight controller continues to
 publish state frames; that heartbeat is not a flight command.
 
+The displayed attitude fields are Euler angles converted by User_Com.c from
+the flight controller's frame-ID-04 quaternion.
+
 Example:
     python testcode/fc_state_monitor.py --fc-port COM5
     python testcode/fc_state_monitor.py --allow-auto-port
@@ -21,6 +24,11 @@ if SDK_DIR not in sys.path:
     sys.path.insert(0, SDK_DIR)
 
 from FlightController import FC_Controller  # noqa: E402
+
+
+def wrapped_angle_delta(angle: float, reference: float) -> float:
+    """Return the shortest signed angular difference in degrees."""
+    return (angle - reference + 180.0) % 360.0 - 180.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,21 +66,27 @@ def main() -> int:
     fc = FC_Controller()
     minimum_interval = 1.0 / args.rate if args.rate else 0.0
     last_print_time = 0.0
+    initial_yaw = None
 
     def print_state(state) -> None:
         """Called by the serial listener when a state frame arrives."""
-        nonlocal last_print_time
+        nonlocal initial_yaw, last_print_time
         now = time.monotonic()
         if now - last_print_time < minimum_interval:
             return
         last_print_time = now
 
+        yaw = state.yaw.value
+        if initial_yaw is None:
+            initial_yaw = yaw
+        yaw_from_start = wrapped_angle_delta(yaw, initial_yaw)
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(
             f"{timestamp} | battery={state.bat.value:5.2f} V"
-            f" | yaw={state.yaw.value:7.2f} deg"
-            f" | pitch={state.pit.value:7.2f} deg"
-            f" | roll={state.rol.value:7.2f} deg"
+            f" | yaw(q04)={yaw:7.2f} deg"
+            f" | yaw_from_start={yaw_from_start:+7.2f} deg"
+            f" | pitch(q04)={state.pit.value:7.2f} deg"
+            f" | roll(q04)={state.rol.value:7.2f} deg"
             f" | altitude={state.alt_add.value:5d} cm"
             f" | armed={'YES' if state.unlock.value else 'NO'}"
             f" | mode={state.mode.value}"
@@ -86,6 +100,7 @@ def main() -> int:
             callback=print_state,
         )
         print("Telemetry monitor started. No arm, takeoff, mode, or motion command is sent.")
+        print("Attitude source: frame ID 04 quaternion converted to Euler angles in User_Com.c.")
         print("Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
