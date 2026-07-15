@@ -49,6 +49,10 @@ PRECISE_YAW_STOP_DWELL = 1.0
 
 PRECISE_YAW_RATE_FILTER_ALPHA = 0.30
 PRECISE_YAW_MAX_VALID_RATE = 90.0
+PRECISE_YAW_CROSSING_WINDOW = 15.0
+PREFLIGHT_TIMEOUT = 15.0
+MIN_TAKEOFF_VOLTAGE = 11.1
+MIN_INFLIGHT_VOLTAGE = 10.5
 
 
 def _precise_yaw_speed_limit(
@@ -82,9 +86,9 @@ def _precise_yaw_speed_limit(
     return int(speed_limit)
 
 
-def wait_for_ground_start(fc: FC_Like):
+def wait_for_ground_start(fc: FC_Like, stop_event: threading.Event):
     """经飞控 UT2/HC-14 桥等待一个通过协议校验的 START_MISSION。"""
-    fc.start_ground_station()
+    fc.start_ground_station(stop_event=stop_event)
     logger.info("[MANAGER] GroundStationLink using FC wireless bridge (UT2)")
     fc.enable_ground_command_reception()
     logger.info("[MANAGER] Waiting for ground-station START_MISSION")
@@ -121,17 +125,53 @@ class Mission(object):
         self._precise_yaw_stable_time = 0.0
         self._precise_yaw_braking = False
         self._precise_yaw_accumulated_rotation = 0.0
+        self.stop_event = kwargs.get("stop_event", threading.Event())
+        self.navi.stop_event = self.stop_event
         # self.screen: UARTScreen = kwargs.get("screen", None)
        
     def stop(self):
         self.navi.stop()
         logger.info("[MISSION] Mission stopped")
 
+    def _check_abort(self):
+        if self.stop_event.is_set():
+            raise RuntimeError("mission stop/safety event requested")
+
+    def _flight_safety_task(self, shutdown_event: threading.Event):
+        """Latch the existing stop path on fresh low-voltage or FC-link loss."""
+        was_airborne = False
+        while not shutdown_event.wait(0.1):
+            if self.stop_event.is_set():
+                return
+            if self.fc.state.is_fresh(0.5) and self.fc.state.unlock.value:
+                was_airborne = True
+            if not was_airborne:
+                continue
+            if not self.fc.connected or not self.fc.state.is_fresh(1.0):
+                logger.error("[MISSION] FC telemetry lost in flight; requesting safe stop")
+                self.stop_event.set()
+                return
+            battery = float(self.fc.state.bat.value)
+            if 1.0 < battery < MIN_INFLIGHT_VOLTAGE:
+                logger.error(
+                    f"[MISSION] In-flight low battery: {battery:.2f}V; requesting safe stop"
+                )
+                self.stop_event.set()
+                return
+            if not self.fc.state.unlock.value:
+                return
+
     @staticmethod
-    def _navigation_yaw_error(target_yaw: float, current_yaw: float) -> float:
+    def _navigation_yaw_error(
+        target_yaw: float,
+        current_yaw: float,
+        preferred_direction: int = 0,
+    ) -> float:
         """计算与 Navigation 相同语义的最短有符号航向误差。"""
         raw_error = float(target_yaw) - float(current_yaw)
         error = (raw_error + 180.0) % 360.0 - 180.0
+        if preferred_direction and abs(abs(error) - 180.0) <= 2.0:
+            return abs(error) * (1 if preferred_direction > 0 else -1)
         if error == -180.0 and raw_error > 0:
             return 180.0
         return error
@@ -269,7 +309,6 @@ class Mission(object):
         current_speed_limit = PRECISE_YAW_FAR_SPEED
         target_crossed = False
         braking = False
-        fine_correction = False
         previous_error = initial_error
         accumulated_rotation = 0.0
         max_rotation = max(
@@ -301,7 +340,8 @@ class Mission(object):
 
             yaw_delta = self._yaw_delta(current_yaw, previous_yaw)
             raw_yaw_rate = yaw_delta / dt
-            if abs(raw_yaw_rate) <= PRECISE_YAW_MAX_VALID_RATE:
+            valid_rate_sample = abs(raw_yaw_rate) <= PRECISE_YAW_MAX_VALID_RATE
+            if valid_rate_sample:
                 accumulated_rotation += abs(yaw_delta)
                 filtered_yaw_rate = (
                     (1.0 - PRECISE_YAW_RATE_FILTER_ALPHA) * filtered_yaw_rate
@@ -313,13 +353,18 @@ class Mission(object):
                     f"{raw_yaw_rate:+.2f}deg/s"
                 )
 
-            yaw_error = self._navigation_yaw_error(target_yaw, current_yaw)
+            yaw_error = self._navigation_yaw_error(
+                target_yaw, current_yaw, initial_direction
+            )
             abs_error = abs(yaw_error)
             abs_yaw_rate = abs(filtered_yaw_rate)
             crossed_this_sample = (
-                previous_error != 0
+                valid_rate_sample
+                and previous_error != 0
                 and yaw_error != 0
                 and previous_error * yaw_error < 0
+                and abs(previous_error) <= PRECISE_YAW_CROSSING_WINDOW
+                and abs(yaw_error) <= PRECISE_YAW_CROSSING_WINDOW
             )
 
             if crossed_this_sample:
@@ -334,6 +379,14 @@ class Mission(object):
                 self._hold_current_yaw(
                     "navigation-stopped", braking=False, dwell=PRECISE_YAW_STOP_DWELL
                 )
+                return False
+            if self.stop_event.is_set():
+                logger.warning("[YAW-PRECISE] ground STOP requested during turn")
+                self._hold_current_yaw("ground-stop", braking=False)
+                return False
+            if not navi.pose_is_fresh():
+                logger.error("[YAW-PRECISE] navigation pose became stale during turn")
+                self._hold_current_yaw("pose-stale", braking=False)
                 return False
             if not fc.state.unlock.value:
                 logger.error("[YAW-PRECISE] aircraft locked during turn")
@@ -391,7 +444,6 @@ class Mission(object):
             )
             if should_brake and not braking:
                 braking = True
-                fine_correction = True
                 stable_since = None
                 brake_low_rate_since = None
                 current_speed_limit = 0
@@ -448,10 +500,6 @@ class Mission(object):
                 abs_yaw_rate=abs_yaw_rate,
                 target_crossed=target_crossed,
             )
-            if fine_correction:
-                desired_speed_limit = min(
-                    desired_speed_limit, PRECISE_YAW_BRAKE_SPEED
-                )
             if desired_speed_limit != current_speed_limit:
                 navi.set_yaw_speed(desired_speed_limit)
                 current_speed_limit = desired_speed_limit
@@ -509,20 +557,41 @@ class Mission(object):
         fc.set_action_log(True)
         logger.info("[MISSION] Mission Started")
         self.started = 1
-        ################ Carto检测 #############
-        while True:
-            time.sleep(1)
-            logger.info(f"current_point: {navi.current_point}")
-            if navi.current_point[0] + navi.current_point[1] != 0:
+        ################ 飞前状态检测 #############
+        preflight_deadline = time.monotonic() + PREFLIGHT_TIMEOUT
+        while time.monotonic() < preflight_deadline:
+            self._check_abort()
+            state_fresh = fc.state.is_fresh(0.5)
+            pose_fresh = navi.pose_is_fresh()
+            map_fresh = navi.mapper.is_transform_fresh(0.5)
+            if fc.connected and state_fresh and pose_fresh and map_fresh:
+                battery = float(fc.state.bat.value)
+                if battery <= 1.0:
+                    raise RuntimeError("invalid battery telemetry before takeoff")
+                if battery < MIN_TAKEOFF_VOLTAGE:
+                    raise RuntimeError(
+                        f"battery too low for takeoff: {battery:.2f}V < {MIN_TAKEOFF_VOLTAGE:.2f}V"
+                    )
                 break
+            logger.info(
+                f"[MISSION] Preflight waiting: fc={fc.connected} "
+                f"state={state_fresh} pose={pose_fresh} map={map_fresh}"
+            )
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("preflight telemetry/pose/map readiness timeout")
         fc.set_indicator_led(0, 0, 0)
         # 定点起飞
         navi.pointing_takeoff((0,0),self.cruise_height)
+        self._check_abort()
         navi.set_yaw(0)
-        navi.wait_for_yaw()
+        if not navi.wait_for_yaw():
+            raise RuntimeError("initial yaw did not settle")
         time.sleep(0.5)
         # # 进入导航模式
-        navi.navigation_to_waypoint((100,0))
+        if not navi.navigation_to_waypoint((100,0)):
+            raise RuntimeError("navigation to yaw-test point failed")
+        self._check_abort()
         time.sleep(1)
         yaw_diagnostic_stop = threading.Event()
         self._yaw_diagnostic_phase = "turn_to_180"
@@ -536,10 +605,14 @@ class Mission(object):
         try:
             turn_ok = self.turn_to_yaw_precise(180.0)
             if not turn_ok:
-                logger.warning(
-                    "[MISSION] Precise yaw turn did not fully settle; "
-                    "continue returning to origin for safe landing"
+                self._check_abort()
+                logger.error(
+                    "[MISSION] Precise yaw turn failed; land at current position"
                 )
+                self._yaw_diagnostic_phase = "landing_after_yaw_failure"
+                if not navi.pointing_landing(navi.current_point):
+                    raise RuntimeError("landing after yaw failure was not confirmed")
+                return True
 
             # navi.navigation_to_waypoint((100,-100))
             # time.sleep(1)
@@ -548,7 +621,8 @@ class Mission(object):
 
             self._yaw_diagnostic_phase = "pointing_landing_to_origin"
             logger.info("[YAW-DIAG] starting pointing_landing((0, 0))")
-            navi.pointing_landing((0,0))
+            if not navi.pointing_landing((0,0)):
+                raise RuntimeError("pointing landing was not confirmed")
             self._yaw_diagnostic_phase = "landing_complete"
             logger.info("[YAW-DIAG] pointing_landing((0, 0)) returned")
         finally:
@@ -556,6 +630,7 @@ class Mission(object):
             yaw_diagnostic_thread.join(timeout=2.0)
             if yaw_diagnostic_thread.is_alive():
                 logger.warning("[YAW-DIAG] logger did not stop within 2 seconds")
+        return True
         
 
 
@@ -588,6 +663,7 @@ if __name__ == "__main__":
         mapper=mapper,
     )
     RosNodeRunner().add_nodes().run()
+    mission_stop_event = threading.Event()
     mission = Mission(
         fc=fc,
         rs=t265,
@@ -595,9 +671,10 @@ if __name__ == "__main__":
         navi=navi,
         mapper=mapper,
         screen=screen,
+        stop_event=mission_stop_event,
     )
 
-    ground_command = wait_for_ground_start(fc)
+    ground_command = wait_for_ground_start(fc, mission_stop_event)
     fc.enable_ground_telemetry()
     fc.send_ground_status(
         MissionState.RUNNING,
@@ -606,14 +683,26 @@ if __name__ == "__main__":
     )
     mission_error = None
     mission_completed = False
+    safety_monitor_shutdown = threading.Event()
+    safety_monitor_thread = threading.Thread(
+        target=mission._flight_safety_task,
+        args=(safety_monitor_shutdown,),
+        name="mission-safety-monitor",
+        daemon=True,
+    )
+    safety_monitor_thread.start()
     try:
-        mission.run()
-        mission_completed = True
+        mission_completed = bool(mission.run())
     except Exception as e:
         mission_error = e
         logger.exception(f"[MANAGER] Mission Failed")
     finally:
-        mission.stop()
+        safety_monitor_shutdown.set()
+        safety_monitor_thread.join(timeout=1.0)
+        try:
+            mission.stop()
+        except Exception:
+            logger.exception("[MANAGER] Failed to stop navigation cleanly")
         if fc.state.unlock.value:
             logger.warning("[MANAGER] Auto Landing")
             fc.set_flight_mode(fc.PROGRAM_MODE)
@@ -622,7 +711,27 @@ if __name__ == "__main__":
             # fc.set_digital_output(1, False)  # 激光笔
             ret = fc.wait_for_lock()
             if not ret:
-                fc.lock()
+                if fc.state.is_fresh(0.5) and float(fc.state.alt_add.value) <= 8:
+                    fc.lock()
+                    ret = fc.wait_for_lock(timeout_s=4)
+                else:
+                    logger.error(
+                        "[MANAGER] Lock not confirmed; refuse force-lock without fresh touchdown altitude"
+                    )
+            mission_completed = mission_completed and bool(ret)
+
+        while True:
+            stop_command = fc.receive_ground_command(timeout=0)
+            if stop_command is None:
+                break
+            try:
+                if stop_command.command.command_id == CommandId.STOP_MISSION:
+                    if not fc.state.unlock.value:
+                        fc.complete_ground_command(stop_command)
+                    else:
+                        fc.fail_ground_command(stop_command, RejectReason.FC_OFFLINE)
+            finally:
+                fc.ground_command_done()
 
         try:
             if mission_completed:

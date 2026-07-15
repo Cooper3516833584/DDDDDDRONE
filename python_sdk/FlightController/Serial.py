@@ -114,9 +114,17 @@ class SerialReaderBuffered:
             if not self._reading_flag:
                 idx = self._buffer.find(self._read_start_bit)
                 if idx != -1:
-                    self._read_pos = idx + self._read_start_bit_length
+                    if idx:
+                        self._buffer = self._buffer[idx:]
+                    self._read_pos = self._read_start_bit_length
                     self._reading_flag = True
                     self._pack_length = -1
+                elif len(self._buffer) >= self._read_start_bit_length:
+                    # Retain only the suffix that could still be the beginning
+                    # of a split frame header.  Otherwise continuous garbage
+                    # grows this buffer without bound.
+                    keep = max(0, self._read_start_bit_length - 1)
+                    self._buffer = self._buffer[-keep:] if keep else bytes()
             if self._reading_flag:
                 if self._pack_length == -1 and len(self._buffer) > self._read_pos:
                     self._pack_length = self._buffer[self._read_pos]

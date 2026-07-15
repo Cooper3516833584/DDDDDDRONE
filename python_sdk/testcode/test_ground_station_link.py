@@ -179,8 +179,9 @@ class GroundStationLinkTests(unittest.TestCase):
             )
         )
 
-    def test_telemetry_mode_sends_state_and_ignores_commands(self):
-        link = self.make_link()
+    def test_telemetry_mode_sends_state_ignores_ping_but_accepts_stop(self):
+        stop_event = threading.Event()
+        link = self.make_link(stop_event)
         link._state_provider = lambda: FCStatePayload(
             1000, -2000, 11.85, 3, True
         ).to_payload()
@@ -208,6 +209,21 @@ class GroundStationLinkTests(unittest.TestCase):
         )
         self.assertEqual(len(link._transport.writes), before)
         self.assertIsNone(link.get_command(timeout=0.01))
+
+        link._on_bytes(
+            pack_frame(
+                MessageType.COMMAND,
+                Command(CommandId.STOP_MISSION).to_payload(),
+                55,
+                11,
+                KEY,
+            )
+        )
+        self.assertTrue(stop_event.is_set())
+        self.assertEqual(
+            link.get_command(timeout=0.01).command.command_id,
+            CommandId.STOP_MISSION,
+        )
 
     def test_switching_back_to_command_mode_discards_partial_telemetry_batch(self):
         link = self.make_link()

@@ -1,3 +1,4 @@
+import copy
 import re
 import struct
 import threading
@@ -149,11 +150,24 @@ class FC_State_Struct:
         vel_x,vel_y,vel_z,pos_x,pos_y,
         bat,mode,unlock,cid,cmd_0,cmd_1,
     ]  # fmt: skip
+    FIELD_NAMES = (
+        "rol", "pit", "yaw", "alt_fused", "alt_add", "vel_x", "vel_y",
+        "vel_z", "pos_x", "pos_y", "bat", "mode", "unlock", "cid",
+        "cmd_0", "cmd_1",
+    )
 
     def __init__(self):
+        # Byte_Var objects are mutable.  Give every state instance its own set;
+        # otherwise a server and client constructed in the same process silently
+        # overwrite each other's telemetry through the class attributes above.
+        for name in self.FIELD_NAMES:
+            setattr(self, name, copy.copy(getattr(type(self), name)))
+        self.alt = self.alt_add
+        self.RECV_ORDER = [getattr(self, name) for name in self.FIELD_NAMES]
         self._fmt_string = "<" + "".join([i.struct_fmt_type for i in self.RECV_ORDER])
         self._fmt_length = struct.calcsize(self._fmt_string)
         self.update_event = Event()
+        self.last_update_monotonic = 0.0
         self._low_bat_warn_threshold = 3.5 * 3  # V
         self._low_bat_warn_last_time = 0
 
@@ -163,11 +177,18 @@ class FC_State_Struct:
         vals = struct.unpack(self._fmt_string, bytes)
         for i, val in enumerate(vals):
             self.RECV_ORDER[i].update_value_with_mul(val)
+        self.last_update_monotonic = time.monotonic()
         self.update_event.set()
         if 1 < self.bat.value < self._low_bat_warn_threshold:
             if time.perf_counter() - self._low_bat_warn_last_time > 1:
                 self._low_bat_warn_last_time = time.perf_counter()
                 logger.warning(f"[FC] Low battery: {self.bat.value}V")
+
+    def is_fresh(self, max_age: float = 0.5) -> bool:
+        return bool(
+            self.last_update_monotonic > 0
+            and time.monotonic() - self.last_update_monotonic <= float(max_age)
+        )
 
     @property
     def command_now(self):
@@ -394,7 +415,7 @@ class FC_Base_Uart_Comunication(object):
         self.running = False
         self.connected = False
         if joined:
-            for thread in self._thread_list:
+            for thread in list(self._thread_list):
                 thread.join()
                 self._thread_list.remove(thread)
         if self._reader:

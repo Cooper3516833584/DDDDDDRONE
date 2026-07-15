@@ -14,12 +14,26 @@ from .PathPlanner import PFBPP, TrajectoryGenerator
 
 logger_dbg = logger.bind(debug=True)
 
+YAW_AMBIGUITY_BAND_DEG = 2.0
+POSE_STALE_TIMEOUT = 0.30
+FUSION_ROS_CALIBRATION_INTERVAL = 1.0
+FUSION_ROS_MAX_POSITION_CORRECTION_CM = 2.0
+FUSION_ROS_MAX_YAW_CORRECTION_DEG = 1.0
+NAVIGATION_CONTROL_STALE_TIMEOUT = 0.30
 
-def _shortest_yaw_error(target_yaw: float, current_yaw: float) -> float:
+def _shortest_yaw_error(
+    target_yaw: float,
+    current_yaw: float,
+    preferred_direction: int = 0,
+) -> float:
     """Return the signed shortest yaw error in degrees."""
     raw_error = float(target_yaw) - float(current_yaw)
     error = (raw_error + 180.0) % 360.0 - 180.0
-    # Preserve the requested positive direction for the ambiguous +180 degree case.
+    # Around exactly 180 degrees both directions are equally short.  Keep the
+    # direction selected when set_yaw() was called so sensor noise cannot flip
+    # +180/-180 on successive frames.
+    if preferred_direction and abs(abs(error) - 180.0) <= YAW_AMBIGUITY_BAND_DEG:
+        return abs(error) * (1 if preferred_direction > 0 else -1)
     if error == -180.0 and raw_error > 0:
         return 180.0
     return error
@@ -98,6 +112,7 @@ class Navigation(object):
         )
         self.yaw_pid = PID(0.7, 0.0, 0.05, setpoint=0, output_limits=(-30, 30), auto_mode=False)
         self.yaw_target = 0.0
+        self._yaw_direction_hint = 0
         #####################################
         self.current_x = 0  # 当前位置X(相对于基地点) / cm
         self.current_y = 0  # 当前位置Y(相对于基地点) / cm
@@ -109,9 +124,13 @@ class Navigation(object):
         self.keep_height_flag = False  # 定高状态
         self.navigation_flag = False  # 导航状态
         self.keep_height_by_rs = False  # 使用realsense定高
+        self.stop_event = kwargs.get("stop_event")
         self.running = False
         self._control_lock = threading.Lock()
         self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
+        self._navigation_control_updated_at = 0.0
+        self._last_pose_update = 0.0
+        self._last_ros_calibration = 0.0
         self._thread_list: List[threading.Thread] = []
         self.traj_running_event = threading.Event()
         self.traj_progress = 0.0
@@ -207,6 +226,7 @@ class Navigation(object):
         更新实时控制帧
         """
         with self._control_lock:
+            now = time.monotonic()
             if not self.running:
                 self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
             else:
@@ -218,7 +238,18 @@ class Navigation(object):
                     self._realtime_control_data_in_xyzYaw[2] = vel_z
                 if yaw is not None:
                     self._realtime_control_data_in_xyzYaw[3] = yaw
-            self.fc.send_realtime_control_data(*self._realtime_control_data_in_xyzYaw)
+                if vel_x is not None or vel_y is not None or yaw is not None:
+                    self._navigation_control_updated_at = now
+            control = list(self._realtime_control_data_in_xyzYaw)
+            if (
+                self.running
+                and self.navigation_flag
+                and now - self._navigation_control_updated_at > NAVIGATION_CONTROL_STALE_TIMEOUT
+            ):
+                control[0] = 0
+                control[1] = 0
+                control[3] = 0
+            self.fc.send_realtime_control_data(*control)
 
     def switch_navigation_mode(self, mode: Literal["radar", "rs", "fusion", "fusion-ros"]):
         """
@@ -324,22 +355,27 @@ class Navigation(object):
                 self.update_realtime_control(vel_z=0)
 
     def _get_t265_pose(self, wait=True) -> Optional[Tuple[float, float, float, bool]]:
-        if wait and not self.rs.update_event.wait(1):
+        if wait and not self.rs.update_event.wait(POSE_STALE_TIMEOUT):
             logger.warning("[NAVI] RealSense pose timeout")
             return None
         self.rs.update_event.clear()
+        pose = self.rs.get_pose_snapshot() if hasattr(self.rs, "get_pose_snapshot") else self.rs.pose
+        last_update = float(getattr(self.rs, "last_update_monotonic", 0.0))
+        fresh = last_update > 0 and time.monotonic() - last_update <= POSE_STALE_TIMEOUT
         if self._t265_trans_args is None:
-            current_x = -self.rs.pose.translation.z * 100
-            current_y = -self.rs.pose.translation.x * 100
-            self.current_height_rs = self.rs.pose.translation.y * 100
-            current_yaw = -self.rs.eular_rotation[2]
+            current_x = -pose.translation.z * 100
+            current_y = -pose.translation.x * 100
+            self.current_height_rs = pose.translation.y * 100
+            current_yaw = -self.rs.get_eular_rotation(pose)[2] if hasattr(self.rs, "get_eular_rotation") else -self.rs.eular_rotation[2]
         else:
             position, eular = self.rs.get_pose_in_secondary_frame(self._t265_trans_args, as_eular=True)
             current_x = -position[2] * 100  # type: ignore
             current_y = -position[0] * 100  # type: ignore
             self.current_height_rs = position[1] * 100  # type: ignore
             current_yaw = -eular[2]  # type: ignore
-        available = self.rs.pose.tracker_confidence >= 2
+        available = fresh and pose.tracker_confidence >= 2
+        if available:
+            self._last_pose_update = time.monotonic()
         logger_dbg.debug(f"[NAVI] RealSense pose: {current_x}, {current_y}, {current_yaw}, {available}")
         return current_x, current_y, current_yaw, available  # type: ignore
 
@@ -369,19 +405,34 @@ class Navigation(object):
         return self._get_t265_pose()
 
     def _get_fusion_ros_pose(self) -> Optional[Tuple[float, float, float, bool]]:
-        if self.mapper.trans_update_event.is_set():  # type: ignore
-            self.mapper.trans_update_event.clear()  # type: ignore
-            self.calibrate_realsense_ros(wait=False)
         ret = self._get_t265_pose()
         if not ret:
             return None
+        now = time.monotonic()
+        if (
+            self.mapper.trans_update_event.is_set()  # type: ignore
+            and now - self._last_ros_calibration >= FUSION_ROS_CALIBRATION_INTERVAL
+            and self.mapper.is_transform_fresh(POSE_STALE_TIMEOUT)  # type: ignore
+        ):
+            self.mapper.trans_update_event.clear()  # type: ignore
+            self.calibrate_realsense_ros(
+                wait=False,
+                max_position_correction_cm=FUSION_ROS_MAX_POSITION_CORRECTION_CM,
+                max_yaw_correction_deg=FUSION_ROS_MAX_YAW_CORRECTION_DEG,
+            )
+            self._last_ros_calibration = now
+            ret = self._get_t265_pose(wait=False) or ret
         x, y, yaw, avai = ret
-        return x, y, yaw, avai and self.mapper._trans_node.transform_established  # type: ignore
+        return x, y, yaw, avai and self.mapper.is_transform_fresh(POSE_STALE_TIMEOUT)  # type: ignore
 
     def _navigation_task(self):
         paused = False
         while self.running:
             try:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    self.update_realtime_control(vel_x=0, vel_y=0, yaw=0)
+                    time.sleep(0.05)
+                    continue
                 if self._navigation_mode == "radar":
                     pose = self._get_radar_pose()
                 elif self._navigation_mode == "rs":
@@ -430,7 +481,9 @@ class Navigation(object):
                 # self.fc.send_general_position(x=self.current_x, y=self.current_y)
                 out_x_world = self.navi_x_pid(self.current_x)
                 out_y_world = self.navi_y_pid(self.current_y)
-                yaw_error = _shortest_yaw_error(self.yaw_target, self.current_yaw)
+                yaw_error = _shortest_yaw_error(
+                    self.yaw_target, self.current_yaw, self._yaw_direction_hint
+                )
                 out_yaw = self.yaw_pid(-yaw_error)
                 if out_x_world is None or out_y_world is None or out_yaw is None:
                     continue
@@ -470,7 +523,12 @@ class Navigation(object):
             force_level=True, z_offset=dx, x_offset=dy, yaw_offset=dyaw, y_offset=dz
         )
 
-    def calibrate_realsense_ros(self, wait=True):
+    def calibrate_realsense_ros(
+        self,
+        wait=True,
+        max_position_correction_cm: Optional[float] = None,
+        max_yaw_correction_deg: Optional[float] = None,
+    ):
         """
         根据ROS建图数据校准T265的坐标系
         """
@@ -478,14 +536,42 @@ class Navigation(object):
             raise RuntimeError("Mapper transform update timeout")
         x, y, _ = self.mapper.position  # type: ignore
         _, _, yaw = self.mapper.eular_rotation  # type: ignore
-        dx = -x
-        dy = -y
-        dyaw = yaw
+        desired_x_cm = float(x) * 100.0
+        desired_y_cm = float(y) * 100.0
+        desired_nav_yaw = -float(yaw)
+        if self._t265_trans_args is not None and max_position_correction_cm is not None:
+            correction = np.array(
+                [desired_x_cm - self.current_x, desired_y_cm - self.current_y],
+                dtype=float,
+            )
+            correction_norm = float(np.linalg.norm(correction))
+            max_correction = max(0.0, float(max_position_correction_cm))
+            if correction_norm > max_correction > 0:
+                correction *= max_correction / correction_norm
+            desired_x_cm = float(self.current_x + correction[0])
+            desired_y_cm = float(self.current_y + correction[1])
+        if self._t265_trans_args is not None and max_yaw_correction_deg is not None:
+            yaw_correction = _shortest_yaw_error(desired_nav_yaw, self.current_yaw)
+            yaw_correction = float(
+                np.clip(
+                    yaw_correction,
+                    -abs(float(max_yaw_correction_deg)),
+                    abs(float(max_yaw_correction_deg)),
+                )
+            )
+            desired_nav_yaw = float(self.current_yaw + yaw_correction)
+        dx = -desired_x_cm / 100.0
+        dy = -desired_y_cm / 100.0
+        dyaw = -desired_nav_yaw
         if not self.keep_height_by_rs:
             dz = self.fc.state.alt_add.value / 100.0
         else:
             dz = self.current_height_rs / 100.0
-        logger_dbg.info(f"[NAVI] Calibrate T265: map={self.mapper.position} dz={dx}, dx={dy}, dy={dz}, dyaw={dyaw}")  # type: ignore
+        logger_dbg.info(
+            f"[NAVI] Calibrate T265: map={self.mapper.position} "  # type: ignore
+            f"desired=({desired_x_cm:.1f},{desired_y_cm:.1f},{desired_nav_yaw:.1f}) "
+            f"dz={dx}, dx={dy}, dy={dz}, dyaw={dyaw}"
+        )
         self._t265_trans_args = self.rs.establish_secondary_origin(
             force_level=True, z_offset=dx, x_offset=dy, yaw_offset=dyaw, y_offset=dz
         )
@@ -514,6 +600,11 @@ class Navigation(object):
             waypoint = [waypoint[0], waypoint[1], waypoint[2]]
         waypoint_cur = [self.current_x, self.current_y, self.current_height]
         length = np.linalg.norm(np.array(waypoint) - np.array(waypoint_cur))  # type: ignore
+        if length <= 1e-6:
+            self.direct_set_waypoint(waypoint)
+            if wait:
+                return self.wait_for_waypoint(time_thres=0.1, timeout=1.0)
+            return True
         tT = float(length / self.navi_speed)
         traj = TrajectoryGenerator(start_pos=waypoint_cur, des_pos=waypoint, T=tT)
         traj.solve()
@@ -521,7 +612,7 @@ class Navigation(object):
         for t in np.arange(0, tT, dt):
             traj_list.append(traj.calc_position_xyz(t))
         traj_list.append(waypoint)
-        self.navigation_follow_trajectory(traj_list, wait=wait)  # type: ignore
+        return self.navigation_follow_trajectory(traj_list, wait=wait)  # type: ignore
 
     def navigation_around_waypoint(
             self,
@@ -590,6 +681,8 @@ class Navigation(object):
         - 支持pos_thres（绕杆建议8~12cm）
         """
         logger.debug("[NAVI] Trajectory task started")
+        if len(traj_list) == 0:
+            raise ValueError("trajectory must contain at least one point")
         self.traj_running_event.set()
 
         pos_thres = float(max(pos_thres, 1.0))
@@ -598,13 +691,20 @@ class Navigation(object):
         len_t = len(traj_list)
 
         for n, point in enumerate(traj_list):
+            if self.stop_event is not None and self.stop_event.is_set():
+                logger.warning("[NAVI] Trajectory stopped by external stop event")
+                self.traj_running_event.clear()
+                return False
+            if not self.pose_is_fresh():
+                logger.error("[NAVI] Trajectory aborted because navigation pose is stale")
+                self.traj_running_event.clear()
+                return False
             if not (self.running and self.navigation_flag):
                 logger.debug("[NAVI] Trajectory task forced to stop (nav not running)")
                 return
 
             # 外部请求停止：clear event
             if not self.traj_running_event.is_set():
-                self.traj_running_event.set()
                 logger.debug("[NAVI] Trajectory task forced to stop")
                 self.traj_list_before_stop = traj_list[n:]
                 return
@@ -623,7 +723,6 @@ class Navigation(object):
                 time.sleep(0.02)
 
                 if not self.traj_running_event.is_set():
-                    self.traj_running_event.set()
                     logger.debug("[NAVI] Trajectory task forced to stop")
                     self.traj_list_before_stop = traj_list[n:]
                     return
@@ -631,6 +730,16 @@ class Navigation(object):
                 if not (self.running and self.navigation_flag):
                     logger.debug("[NAVI] Trajectory task forced to stop (nav not running)")
                     return
+                if self.stop_event is not None and self.stop_event.is_set():
+                    logger.warning("[NAVI] Trajectory stopped by external stop event")
+                    self.traj_running_event.clear()
+                    return False
+                if not self.pose_is_fresh():
+                    logger.error("[NAVI] Trajectory aborted because navigation pose is stale")
+                    self.navi_x_pid.setpoint = self.current_x
+                    self.navi_y_pid.setpoint = self.current_y
+                    self.traj_running_event.clear()
+                    return False
 
                 dx = float(self.current_x) - x
                 dy = float(self.current_y) - y
@@ -638,11 +747,15 @@ class Navigation(object):
                     break
 
                 if timeout_per_point > 0 and (time.perf_counter() - t0) > timeout_per_point:
-                    logger.warning("[NAVI] Trajectory point timeout, skipping to next point")
-                    break
+                    logger.error("[NAVI] Trajectory point timeout; abort remaining trajectory")
+                    self.navi_x_pid.setpoint = self.current_x
+                    self.navi_y_pid.setpoint = self.current_y
+                    self.traj_running_event.clear()
+                    return False
 
         self.traj_running_event.clear()
         logger.debug("[NAVI] Trajectory task finished")
+        return True
 
     def navigation_follow_trajectory(
         self,
@@ -661,9 +774,15 @@ class Navigation(object):
         self.navi_y_pid.output_limits = (-self.navi_speed, self.navi_speed)
 
         if wait:
-            self._trajectory_task(traj_list, pos_thres=pos_thres)
+            trajectory_ok = self._trajectory_task(traj_list, pos_thres=pos_thres)
+            if not trajectory_ok:
+                return False
             # 最后一段再确认一次到点（用更小阈值更贴轨）
-            self.wait_for_waypoint(time_thres=0.5, pos_thres=max(8, int(pos_thres)), timeout=10)
+            return self.wait_for_waypoint(
+                time_thres=0.5,
+                pos_thres=max(8, int(pos_thres)),
+                timeout=10,
+            )
         else:
             t = threading.Thread(
                 target=self._trajectory_task,
@@ -674,6 +793,7 @@ class Navigation(object):
             t.start()
             self._thread_list.append(t)
             self.traj_running_event.wait()
+            return True
 
     @property
     def navigation_target(self) -> np.ndarray:
@@ -728,8 +848,17 @@ class Navigation(object):
         """
         if not np.isfinite(yaw):
             raise ValueError("yaw must be finite")
+        initial_error = _shortest_yaw_error(float(yaw), self.current_yaw)
+        self._yaw_direction_hint = 1 if initial_error > 0 else (-1 if initial_error < 0 else 0)
         self.yaw_target = float(yaw)
         logger.debug(f"[NAVI] Keep yaw set to {self.yaw_target}")
+
+    def pose_is_fresh(self, max_age: float = POSE_STALE_TIMEOUT) -> bool:
+        """Return whether a usable navigation pose was received recently."""
+        return bool(
+            self._last_pose_update > 0
+            and time.monotonic() - self._last_pose_update <= float(max_age)
+        )
 
     def navigation_to_waypoint_relative(self, waypoint_rel, *args, **kwargs):
         """
@@ -777,93 +906,6 @@ class Navigation(object):
             abs(self.current_x - self.navi_x_pid.setpoint) < pos_thres
             and abs(self.current_y - self.navi_y_pid.setpoint) < pos_thres
         )
-
-    def pointing_takeoff(
-            self,
-            point,
-            target_height=140,
-            first_lift=60,
-            lock_pos_thres=15,
-            lock_pos_time=1.0,
-            lock_timeout=12,
-            hover_timeout=12,
-            height_timeout=15,
-    ):
-        """
-        定点起飞（修复版）
-        - 修复问题：在地面时 self.fc.hovering 可能本来就为 True，导致 wait_for_hovering() 立即返回，
-          随后切模式/开导航会把 take_off 指令“打断”，表现为电机不转、飞机不抬。
-        - 做法：take_off 后先等待“起飞确实开始/完成”（vel_z/alt_add 变化），再等待进入悬停稳定。
-        """
-        logger.info(f"[NAVI] Takeoff at {point}")
-
-        # 1) 起飞阶段先关掉闭环，避免线程在不合适的模式下干预
-        self.navigation_flag = False
-        self.keep_height_flag = False
-
-        # 2) 程控模式 + 解锁
-        self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
-        if not self.fc.state.unlock.value:
-            self.fc.unlock()
-
-        # 等解锁状态回传（有些设备回传慢）
-        t0 = time.perf_counter()
-        while not self.fc.state.unlock.value and (time.perf_counter() - t0) < 3.0:
-            time.sleep(0.05)
-
-        time.sleep(0.8)  # 给电机/状态一个缓冲时间
-
-        # 3) 一键起飞抬离地面
-        lift = int(max(40, first_lift))
-        self.fc.take_off(lift)
-
-        # 关键：等待起飞“确实开始/完成”，避免 hover 状态误判导致立即切模式打断起飞
-        time.sleep(0.8)  # 让 command_now / vel_z 有时间更新
-        ok = False
-        try:
-            ok = self.fc.wait_for_takeoff_done(timeout_s=8)
-        except TypeError:
-            # 兼容旧版接口
-            ok = self.fc.wait_for_takeoff_done(4, 8)
-
-        # 兜底：如果 vel_z 阈值没触发，但高度已经抬起来，也算起飞成功
-        try:
-            alt_now = float(self.fc.state.alt_add.value)
-        except Exception:
-            alt_now = 0.0
-        if (not ok) and alt_now < 10:
-            raise RuntimeError("[NAVI] Takeoff did not start (alt_add < 10cm). Check unlock/mode/propellers/FC safety.")
-
-        # 起飞完成后等待进入悬停稳定（此时 hovering 的判断才有意义）
-        self.fc.wait_for_hovering(hover_timeout)
-
-        # 4) 切到定点模式，准备开启“水平锁点 + 定高”
-        self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
-        time.sleep(0.1)
-
-        # 先把当前高度作为定高起点，避免切模式瞬间高度漂
-        try:
-            h_now = float(self.fc.state.alt_add.value)
-        except Exception:
-            h_now = float(lift)
-        self.set_height(max(h_now, float(lift)))
-        self.keep_height_flag = True
-
-        # 5) 立刻锁点到目标 point（只取 x,y；高度由 set_height 控制）
-        self.switch_pid("hover")
-        self.direct_set_waypoint([float(point[0]), float(point[1])])
-        self.navigation_flag = True
-
-        # 低高度先把位置锁回 point，再爬高（解决“先飘很久后才回原点”）
-        self.wait_for_waypoint(
-            time_thres=lock_pos_time,
-            pos_thres=lock_pos_thres,
-            timeout=lock_timeout,
-        )
-
-        # 6) 在锁点状态下爬升到目标高度（原地竖直爬升）
-        self.set_height(float(target_height))
-        self.wait_for_height(timeout=height_timeout)
 
     def adjust_height_and_hover(
         self,
@@ -998,20 +1040,29 @@ class Navigation(object):
         self.keep_height_flag = True
         self.switch_pid("land")
         self.navigation_to_waypoint([x, y], wait=True)
-        self.wait_for_waypoint(
+        approach_ok = self.wait_for_waypoint(
             time_thres=max(0.3, float(settle_time_thres)),
             pos_thres=max(8, int(approach_pos_thres)),
             timeout=max(1.0, float(settle_timeout)),
         )
 
         self.set_height(float(max(10, approach_height)))
-        self.wait_for_height(time_thres=0.3, height_thres=10, timeout=max(1.0, float(height_timeout)))
-        self.direct_set_waypoint([x, y])
-        self.wait_for_waypoint(
+        height_ok = self.wait_for_height(
             time_thres=0.3,
-            pos_thres=max(8, int(approach_pos_thres)),
-            timeout=max(1.0, float(settle_timeout)),
+            height_thres=10,
+            timeout=max(1.0, float(height_timeout)),
         )
+        if approach_ok and height_ok and self.pose_is_fresh():
+            self.direct_set_waypoint([x, y])
+            self.wait_for_waypoint(
+                time_thres=0.3,
+                pos_thres=max(8, int(approach_pos_thres)),
+                timeout=max(1.0, float(settle_timeout)),
+            )
+        else:
+            logger.warning(
+                "[NAVI] Landing approach not confirmed; land at current position"
+            )
 
         # 阶段2: 关闭导航闭环，切给飞控一键降落，避免PID慢速“磨地”
         self.navigation_flag = False
@@ -1021,7 +1072,7 @@ class Navigation(object):
         self.fc.stablize()
         self.fc.land()
 
-        # 等待落地(高度足够低或飞控已自动上锁)
+        # 等待落地。只有新鲜高度足够低或飞控已自动上锁才允许补发 lock。
         t0 = time.perf_counter()
         landed = False
         alt_thres = float(max(3, touchdown_alt_thres))
@@ -1031,21 +1082,33 @@ class Navigation(object):
                 alt_now = float(self.fc.state.alt_add.value)
             except Exception:
                 alt_now = 999.0
-            if alt_now <= alt_thres or (not self.fc.state.unlock.value):
+            state_fresh = bool(
+                getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
+            )
+            if (state_fresh and alt_now <= alt_thres) or (not self.fc.state.unlock.value):
                 landed = True
                 break
 
         if not landed:
-            logger.warning("[NAVI] Landing timeout, force lock")
-            self.fc.lock()
-            return
+            logger.error("[NAVI] Landing timeout; keep landing command active, refuse airborne force-lock")
+            self.fc.land()
+            return False
 
         try:
             ok = self.fc.wait_for_lock(timeout_s=lock_timeout)
         except TypeError:
             ok = self.fc.wait_for_lock(lock_timeout)
         if not ok:
-            self.fc.lock()
+            state_fresh = bool(
+                getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
+            )
+            alt_now = float(self.fc.state.alt_add.value) if state_fresh else 999.0
+            if state_fresh and alt_now <= alt_thres:
+                self.fc.lock()
+            else:
+                logger.error("[NAVI] Lock not confirmed; refuse lock without fresh touchdown altitude")
+                return False
+        return True
 
     def _waypoint_param_switch(self):
         tuning = self.pid_tunings["hover"]
@@ -1068,17 +1131,24 @@ class Navigation(object):
         param_switched = False
         while True:
             time.sleep(0.05)
+            if self.stop_event is not None and self.stop_event.is_set():
+                logger.warning("[NAVI] Waypoint wait stopped by external stop event")
+                return False
             if self._reached_waypoint(pos_thres):
                 time_count += 0.05
                 if not param_switched:
                     self._waypoint_param_switch()
                     param_switched = True
+            else:
+                time_count = 0
+            if not self.running or not self.pose_is_fresh():
+                time_count = 0
             if time_count >= time_thres:
                 logger.info("[NAVI] Reached waypoint")
-                return
+                return True
             if time.perf_counter() - time_start > timeout:
                 logger.warning("[NAVI] Waypoint overtime")
-                return
+                return False
 
     def wait_for_height(self, time_thres=0.5, height_thres=8, timeout=10):
         """
@@ -1092,14 +1162,24 @@ class Navigation(object):
         time_count = 0
         while True:
             time.sleep(0.05)
+            if self.stop_event is not None and self.stop_event.is_set():
+                logger.warning("[NAVI] Height wait stopped by external stop event")
+                return False
             if abs(self.current_height - self.height_pid.setpoint) < height_thres:
                 time_count += 0.05
+            else:
+                time_count = 0
+            state_fresh = bool(
+                getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
+            )
+            if not self.running or not state_fresh:
+                time_count = 0
             if time_count >= time_thres:
                 logger.info("[NAVI] Reached height")
-                return
+                return True
             if time.perf_counter() - time_start > timeout:
                 logger.warning("[NAVI] Height overtime")
-                return
+                return False
 
     def wait_for_yaw(self, time_thres=0.5, yaw_thres=5, timeout=10):
         """
@@ -1113,17 +1193,26 @@ class Navigation(object):
         time_count = 0
         while True:
             time.sleep(0.05)
-            yaw_error = abs(_shortest_yaw_error(self.yaw_target, self.current_yaw))
+            if self.stop_event is not None and self.stop_event.is_set():
+                logger.warning("[NAVI] Yaw wait stopped by external stop event")
+                return False
+            yaw_error = abs(
+                _shortest_yaw_error(
+                    self.yaw_target, self.current_yaw, self._yaw_direction_hint
+                )
+            )
             if yaw_error < yaw_thres:
                 time_count += 0.05
             else:
                 time_count = 0
+            if not self.running or not self.pose_is_fresh():
+                time_count = 0
             if time_count >= time_thres:
                 logger.info("[NAVI] Reached yaw")
-                return
+                return True
             if time.perf_counter() - time_start > timeout:
                 logger.warning("[NAVI] Yaw overtime")
-                return
+                return False
     def radar_find_target(self,TARGET_NUM):
         self.radar.get_target_points(TARGET_NUM)
 
@@ -1141,9 +1230,9 @@ class Navigation(object):
         """
         Take off and then enter closed-loop hold/navigation.
 
-        This override is tolerant to FC status-report lag:
-        it retries one-key takeoff once and can fallback to `safe_takeoff`
-        before treating the attempt as failed.
+        A takeoff command is sent only once and only after fresh mode/unlock
+        feedback.  Ambiguous feedback is treated as a failure, not as a reason
+        to issue another takeoff command while the aircraft may already be airborne.
         """
         logger.info(f"[NAVI] Takeoff at {point}")
 
@@ -1156,10 +1245,21 @@ class Navigation(object):
         if not self.fc.state.unlock.value:
             self.fc.unlock()
 
-        # Wait unlock feedback (some FC firmwares report slowly).
+        # Wait for fresh unlock feedback before sending the one-key takeoff.
         t0 = time.perf_counter()
-        while not self.fc.state.unlock.value and (time.perf_counter() - t0) < 3.0:
+        while time.perf_counter() - t0 < 3.0:
+            state_fresh = bool(
+                getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
+            )
+            if (
+                state_fresh
+                and self.fc.state.mode.value == self.fc.PROGRAM_MODE
+                and self.fc.state.unlock.value
+            ):
+                break
             time.sleep(0.05)
+        else:
+            raise RuntimeError("[NAVI] Fresh PROGRAM/unlock feedback not confirmed")
 
         time.sleep(0.8)  # Buffer for motor/state updates.
         lift = int(max(40, first_lift))
@@ -1182,48 +1282,24 @@ class Navigation(object):
             except Exception:
                 return 0.0
 
-        def _takeoff_started(alt_ref: float, alt_now: float, wait_ok: bool) -> bool:
-            # Some FCs under-report vel_z, but altitude still rises in reality.
-            return bool(wait_ok or alt_now >= 10 or (alt_now - alt_ref) >= 5)
-
         self.fc.take_off(lift)
         time.sleep(0.8)  # Give command_now / vel_z time to update.
         ok = _wait_takeoff_done(timeout_s=8)
         alt_now = _current_alt()
-
-        # Retry once if first confirmation failed.
-        if not _takeoff_started(alt_before, alt_now, ok):
-            logger.warning("[NAVI] First takeoff attempt not confirmed, retrying once")
-            self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
-            if not self.fc.state.unlock.value:
-                self.fc.unlock()
-                time.sleep(0.5)
-            self.fc.take_off(lift)
-            time.sleep(1.0)
-            ok = _wait_takeoff_done(timeout_s=10)
-            alt_now = _current_alt()
-
-        # Last fallback for firmwares with strict one-key timing windows.
-        if not _takeoff_started(alt_before, alt_now, ok):
-            if hasattr(self.fc, "safe_takeoff"):
-                logger.warning("[NAVI] Falling back to FC safe_takeoff")
-                try:
-                    self.fc.safe_takeoff(
-                        target_height=max(int(lift), 80),
-                        climb_speed=20,
-                        first_lift=lift,
-                    )
-                except Exception:
-                    logger.exception("[NAVI] safe_takeoff fallback failed")
-            alt_now = _current_alt()
-
-        if alt_now < 10:
+        state_fresh = bool(
+            getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
+        )
+        takeoff_started = bool(
+            state_fresh and (ok or alt_now >= 10 or (alt_now - alt_before) >= 5)
+        )
+        if not takeoff_started:
             raise RuntimeError(
-                "[NAVI] Takeoff did not start (alt_add < 10cm). Check unlock/mode/propellers/FC safety."
+                "[NAVI] Takeoff was not confirmed by fresh telemetry; command will not be retried"
             )
 
         # Ensure FC reports hovering before enabling closed-loop hold.
-        self.fc.wait_for_hovering(hover_timeout)
+        if not self.fc.wait_for_hovering(hover_timeout):
+            raise RuntimeError("[NAVI] Hovering was not confirmed after takeoff")
 
         # 3) Switch to HOLD_POS and enable closed-loop control.
         self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
@@ -1240,14 +1316,16 @@ class Navigation(object):
         self.direct_set_waypoint([float(point[0]), float(point[1])])
         self.navigation_flag = True
 
-        self.wait_for_waypoint(
+        if not self.wait_for_waypoint(
             time_thres=lock_pos_time,
             pos_thres=lock_pos_thres,
             timeout=lock_timeout,
-        )
+        ):
+            raise RuntimeError("[NAVI] Position hold was not confirmed after takeoff")
 
         self.set_height(float(target_height))
-        self.wait_for_height(timeout=height_timeout)
+        if not self.wait_for_height(timeout=height_timeout):
+            raise RuntimeError("[NAVI] Cruise height was not confirmed after takeoff")
 
     def move_by_direction(self, speed: float = 5, direction_deg: float = 0):
         """

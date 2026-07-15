@@ -376,7 +376,7 @@ class FC_Application(FC_Protocol):
         self._require_ground_station().enable_command_reception()
 
     def enable_ground_telemetry(self) -> None:
-        """Use after takeoff: transmit state only; incoming commands are ignored."""
+        """Use after takeoff: transmit state; only STOP remains accepted."""
         self._require_ground_station().enable_telemetry_transmission()
 
     def accept_ground_command(self, command) -> None:

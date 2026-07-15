@@ -1,7 +1,7 @@
 import socket
 import time
 from multiprocessing.connection import Client, Listener
-from threading import Thread
+from threading import Lock, Thread
 from typing import Callable, Dict, Optional, Tuple
 
 from FlightController.Application import FC_Application
@@ -150,6 +150,7 @@ class FC_Client(FC_Application):
 
     def __init__(self, *args, **kwargs) -> None:
         self._conn = None
+        self._send_lock = Lock()
         super().__init__(*args, **kwargs)
 
     def start_listen_serial(self, *args, **kwargs):
@@ -219,6 +220,8 @@ class FC_Client(FC_Application):
         return super().close(joined)
 
     def send_data_to_fc(self, *args, **kwargs):
-        if self._conn is None:
-            raise Exception("FC_Client not connected")
-        self._conn.send((args, kwargs))
+        with self._send_lock:
+            conn = self._conn
+            if conn is None or not self.connected:
+                raise Exception("FC_Client not connected")
+            conn.send((args, kwargs))

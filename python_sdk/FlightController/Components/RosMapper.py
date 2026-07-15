@@ -51,6 +51,7 @@ class RosMapper(object):
         self._trans_update_count = 0
         self.trans_update_event = Event()
         self.trans_event_skip = 1
+        self.last_transform_monotonic = 0.0
         self._map_update_count = 0
         self.map_update_event = Event()
         self.map_event_skip = 1
@@ -65,10 +66,20 @@ class RosMapper(object):
 
     def trans_callback(self, msg: Transform):
         self.trans = msg
+        self.last_transform_monotonic = time.monotonic()
         self._trans_update_count += 1
         if self._trans_update_count >= self.trans_event_skip:
             self.trans_update_event.set()
             self._trans_update_count = 0
+
+    def is_transform_fresh(self, max_age: float = 0.5) -> bool:
+        trans_node = getattr(self, "_trans_node", None)
+        return bool(
+            trans_node is not None
+            and trans_node.transform_established
+            and self.last_transform_monotonic > 0
+            and time.monotonic() - self.last_transform_monotonic <= float(max_age)
+        )
 
     def start_trajectory(self, options: TrajectoryOptions, topics: SensorTopics) -> int:
         """

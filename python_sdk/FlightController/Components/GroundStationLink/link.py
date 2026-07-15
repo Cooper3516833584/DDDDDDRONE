@@ -277,8 +277,6 @@ class GroundStationLink:
             logger.warning("[GroundLink] HC-14 disconnected: {}", error)
 
     def _on_bytes(self, data: bytes) -> None:
-        if self.mode != GroundLinkMode.COMMAND_RX:
-            return
         now = time.monotonic()
         self._last_rx_time = now
         for frame in self._parser.feed(data):
@@ -290,17 +288,23 @@ class GroundStationLink:
                 self._handle_command(frame)
 
     def _handle_command(self, frame: Frame) -> None:
-        if self.mode != GroundLinkMode.COMMAND_RX:
+        try:
+            command = Command.from_payload(frame.payload)
+        except ValueError:
+            logger.warning("[GroundLink] Invalid command payload")
+            return
+        # In telemetry mode START/target commands remain disabled, but STOP must
+        # stay available throughout flight.  The receive thread only latches an
+        # event and queues the command; it never performs a flight action.
+        if (
+            self.mode != GroundLinkMode.COMMAND_RX
+            and command.command_id != CommandId.STOP_MISSION
+        ):
             return
         with self._recent_lock:
             cached = self._recent.get(frame.session, frame.seq)
         if cached is not None:
             self._write(cached)
-            return
-        try:
-            command = Command.from_payload(frame.payload)
-        except ValueError:
-            logger.warning("[GroundLink] Invalid command payload")
             return
 
         mission_command = MissionCommand(

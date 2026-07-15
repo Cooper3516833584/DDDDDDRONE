@@ -171,6 +171,7 @@ class Tf2ListenNode(Node):  # listen to the pose data
         self.target_frame = target_frame
         self.timer = self.create_timer(1 / frequency, self.timer_callback)
         self._last_transform_time = 0
+        self._last_transform_stamp = None
         self.transform_established = False
         _nodes_to_run.append(self)
         logger.info(f"[ROS] {self.node_name} ready to start")
@@ -184,7 +185,14 @@ class Tf2ListenNode(Node):  # listen to the pose data
                     self.transform_established = False
                 return
             trans = self.tf_buffer.lookup_transform(self.target_frame, self.source_frame, rclpy.time.Time())
+            stamp = (int(trans.header.stamp.sec), int(trans.header.stamp.nanosec))
+            if stamp == self._last_transform_stamp:
+                if time.perf_counter() - self._last_transform_time > 1:
+                    logger.warning(f"[ROS] {self.node_name}: Transform is stale over 1 second")
+                    self.transform_established = False
+                return
             self.callback(trans.transform)
+            self._last_transform_stamp = stamp
             self._last_transform_time = time.perf_counter()
             self.transform_established = True
         except Exception as e:

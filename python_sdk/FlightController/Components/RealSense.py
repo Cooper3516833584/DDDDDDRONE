@@ -85,8 +85,10 @@ class T265(object):
         self.pose: T265_Pose_Frame = T265_Pose_Frame.get_zero()  # type: ignore
         self.frame_num: int = 0  # frame number
         self.frame_timestamp: float = 0.0  # timestamp
+        self.last_update_monotonic: float = 0.0
         self.running = False
         self.update_event = threading.Event()
+        self._pose_lock = threading.Lock()
         self._callbacks: List[List] = []
         self._update_count = 0
         self._last_trans_args: Any = None
@@ -132,47 +134,116 @@ class T265(object):
         # for opt in pose_sensor.get_supported_options():
         #     logger.debug(f"[T265]   {opt}: {pose_sensor.get_option(opt)}")
 
+    @staticmethod
+    def _copy_pose(pose) -> T265_Pose_Frame:
+        return T265_Pose_Frame(
+            translation=T265_Pose_Frame._XYZ(
+                float(pose.translation.x), float(pose.translation.y), float(pose.translation.z)
+            ),
+            rotation=T265_Pose_Frame._WXYZ(
+                float(pose.rotation.w), float(pose.rotation.x), float(pose.rotation.y), float(pose.rotation.z)
+            ),
+            velocity=T265_Pose_Frame._XYZ(
+                float(pose.velocity.x), float(pose.velocity.y), float(pose.velocity.z)
+            ),
+            acceleration=T265_Pose_Frame._XYZ(
+                float(pose.acceleration.x), float(pose.acceleration.y), float(pose.acceleration.z)
+            ),
+            angular_velocity=T265_Pose_Frame._XYZ(
+                float(pose.angular_velocity.x), float(pose.angular_velocity.y), float(pose.angular_velocity.z)
+            ),
+            angular_acceleration=T265_Pose_Frame._XYZ(
+                float(pose.angular_acceleration.x),
+                float(pose.angular_acceleration.y),
+                float(pose.angular_acceleration.z),
+            ),
+            tracker_confidence=int(pose.tracker_confidence),
+            mapper_confidence=int(pose.mapper_confidence),
+        )
+
+    def get_pose_snapshot(self) -> T265_Pose_Frame:
+        with self._pose_lock:
+            return self._copy_pose(self.pose)
+
+    @staticmethod
+    def get_eular_rotation(pose: T265_Pose_Frame) -> np.ndarray:
+        return Rotation.from_quat(
+            [pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w]
+        ).as_euler("zxy", degrees=True)
+
     def _updated(self):
         if self._print_update:
             self._print_pose()
         self._update_count += 1
-        if self._callbacks:
-            for item in self._callbacks:
-                item[1] += 1
-                if item[1] >= item[2]:
-                    item[0](self.pose, self.frame_num, self.frame_timestamp)
-                    item[1] = 0
         if self._update_count >= self.event_skip:
             self.update_event.set()
             self._update_count = 0
+        if self._callbacks:
+            pose = self.get_pose_snapshot()
+            frame_num = self.frame_num
+            frame_timestamp = self.frame_timestamp
+            for item in list(self._callbacks):
+                item[1] += 1
+                if item[1] >= item[2]:
+                    item[1] = 0
+                    try:
+                        item[0](pose, frame_num, frame_timestamp)
+                    except Exception:
+                        logger.exception("[T265] Pose callback failed")
 
     def _callback_rs(self, frame) -> None:
         pose = frame.as_pose_frame()
         if not pose:
             return
-        self.frame_num = pose.frame_number
-        self.frame_timestamp = pose.timestamp
-        self.pose = pose.get_pose_data()
+        with self._pose_lock:
+            self.frame_num = pose.frame_number
+            self.frame_timestamp = pose.timestamp
+            self.pose = self._copy_pose(pose.get_pose_data())
+            self.last_update_monotonic = time.monotonic()
         self._updated()
 
     def _callback_ros(self, data) -> None:
-        self.frame_num += 1
+        stamp = getattr(getattr(data, "header", None), "stamp", None)
+        if stamp is not None:
+            frame_timestamp = (float(stamp.sec) + float(stamp.nanosec) / 1e9) * 1000.0
+        else:
+            frame_timestamp = time.time() * 1000.0
+        # Build a complete immutable snapshot before publishing it to readers.
         # y -> z, x -> -y, z -> -x
-        self.pose.translation.x = -data.pose.pose.position.y
-        self.pose.translation.y = data.pose.pose.position.z
-        self.pose.translation.z = -data.pose.pose.position.x
-        self.pose.rotation.w = data.pose.pose.orientation.w
-        self.pose.rotation.x = -data.pose.pose.orientation.y
-        self.pose.rotation.y = data.pose.pose.orientation.z
-        self.pose.rotation.z = -data.pose.pose.orientation.x
-        self.pose.velocity.x = -data.twist.twist.linear.y
-        self.pose.velocity.y = data.twist.twist.linear.z
-        self.pose.velocity.z = -data.twist.twist.linear.x
-        self.pose.angular_velocity.x = -data.twist.twist.angular.y
-        self.pose.angular_velocity.y = data.twist.twist.angular.z
-        self.pose.angular_velocity.z = -data.twist.twist.angular.x
-        self.pose.tracker_confidence = 3
-        self.pose.mapper_confidence = 3
+        pose = T265_Pose_Frame(
+            translation=T265_Pose_Frame._XYZ(
+                -data.pose.pose.position.y,
+                data.pose.pose.position.z,
+                -data.pose.pose.position.x,
+            ),
+            rotation=T265_Pose_Frame._WXYZ(
+                data.pose.pose.orientation.w,
+                -data.pose.pose.orientation.y,
+                data.pose.pose.orientation.z,
+                -data.pose.pose.orientation.x,
+            ),
+            velocity=T265_Pose_Frame._XYZ(
+                -data.twist.twist.linear.y,
+                data.twist.twist.linear.z,
+                -data.twist.twist.linear.x,
+            ),
+            acceleration=T265_Pose_Frame._XYZ(0, 0, 0),
+            angular_velocity=T265_Pose_Frame._XYZ(
+                -data.twist.twist.angular.y,
+                data.twist.twist.angular.z,
+                -data.twist.twist.angular.x,
+            ),
+            angular_acceleration=T265_Pose_Frame._XYZ(0, 0, 0),
+            # ROS odometry does not expose T265 confidence.  Treat fresh data as
+            # medium confidence; freshness is checked separately by Navigation.
+            tracker_confidence=2,
+            mapper_confidence=2,
+        )
+        with self._pose_lock:
+            self.frame_num += 1
+            self.frame_timestamp = frame_timestamp
+            self.pose = pose
+            self.last_update_monotonic = time.monotonic()
         self._updated()
 
     def _print_pose(self, refresh=True) -> None:
@@ -235,21 +306,12 @@ class T265(object):
         pose = frames.get_pose_frame()
         if not pose:
             return
-        self.frame_num = pose.frame_number
-        self.frame_timestamp = pose.timestamp
-        self.pose = pose.get_pose_data()
-        if self._print_update:
-            self._print_pose()
-        self._update_count += 1
-        if self._callbacks:
-            for item in self._callbacks:
-                item[1] += 1
-                if item[1] >= item[2]:
-                    item[0](self.pose, self.frame_num, self.frame_timestamp)
-                    item[1] = 0
-        if self._update_count >= self.event_skip:
-            self.update_event.set()
-            self._update_count = 0
+        with self._pose_lock:
+            self.frame_num = pose.frame_number
+            self.frame_timestamp = pose.timestamp
+            self.pose = self._copy_pose(pose.get_pose_data())
+            self.last_update_monotonic = time.monotonic()
+        self._updated()
 
     def register_callback(
         self, callback: Callable[[T265_Pose_Frame, int, float], None], callback_skip: int = 0
@@ -322,9 +384,7 @@ class T265(object):
         #     self.pose.rotation.z, self.pose.rotation.x, self.pose.rotation.y, self.pose.rotation.w
         # )
 
-        return Rotation.from_quat(
-            [self.pose.rotation.x, self.pose.rotation.y, self.pose.rotation.z, self.pose.rotation.w]
-        ).as_euler("zxy", degrees=True)
+        return self.get_eular_rotation(self.get_pose_snapshot())
 
     def establish_secondary_origin(
         self,
@@ -342,8 +402,9 @@ class T265(object):
         return: 变换参数
         """
         # 获取当前位置和朝向
-        position = np.array([self.pose.translation.x, self.pose.translation.y, self.pose.translation.z])  # type: ignore
-        orientation = np.array([self.pose.rotation.x, self.pose.rotation.y, self.pose.rotation.z, self.pose.rotation.w])  # type: ignore
+        pose = self.get_pose_snapshot()
+        position = np.array([pose.translation.x, pose.translation.y, pose.translation.z])  # type: ignore
+        orientation = np.array([pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w])  # type: ignore
         if force_level:
             orientation[0] = 0
             orientation[2] = 0
@@ -380,8 +441,9 @@ class T265(object):
             _offset_yaw,
         ) = trans_args
         # 获取当前位置和朝向
-        position = np.array([self.pose.translation.x, self.pose.translation.y, self.pose.translation.z])  # type: ignore
-        orientation = np.array([self.pose.rotation.x, self.pose.rotation.y, self.pose.rotation.z, self.pose.rotation.w])  # type: ignore
+        pose = self.get_pose_snapshot()
+        position = np.array([pose.translation.x, pose.translation.y, pose.translation.z])  # type: ignore
+        orientation = np.array([pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w])  # type: ignore
         # 将当前位置和朝向转换到副坐标系中
         position -= _secondary_position
         # 反向应用副坐标系的旋转矩阵
