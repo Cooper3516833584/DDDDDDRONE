@@ -11,7 +11,8 @@
 - 主机名：`pi`
 - HC-14：`/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 -> /dev/ttyUSB0`
 - HC-14 USB 标识：CH340，USB ID `1a86:7523`
-- RC927/STM32 屏幕候选串口：`/dev/ttyACM0`，USB ID `0483:5740`
+- RC927/STM32 屏幕：`/dev/serial/by-id/usb-jixin.pro_CMSIS-DAP_LU_LU_2022_8888-if00 -> /dev/ttyACM0`
+- 屏幕当前 USB 标识：CMSIS-DAP_LU，USB ID `c251:f001`
 
 ### 机载上位机
 
