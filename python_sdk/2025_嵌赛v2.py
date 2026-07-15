@@ -37,6 +37,10 @@ PRECISE_YAW_FINAL_ERROR = 2.0
 PRECISE_YAW_FINAL_RATE = 2.5
 PRECISE_YAW_SETTLE_TIME = 1.0
 PRECISE_YAW_TIMEOUT = 18.0
+PRECISE_YAW_BRAKE_TRIGGER_ERROR = 6.0
+PRECISE_YAW_BRAKE_SETTLE_TIME = 0.4
+PRECISE_YAW_MAX_EXTRA_ROTATION = 25.0
+PRECISE_YAW_STOP_DWELL = 1.0
 
 PRECISE_YAW_RATE_FILTER_ALPHA = 0.30
 PRECISE_YAW_MAX_VALID_RATE = 90.0
@@ -84,6 +88,8 @@ class Mission(object):
         self._precise_yaw_filtered_rate = None
         self._precise_yaw_target_crossed = False
         self._precise_yaw_stable_time = 0.0
+        self._precise_yaw_braking = False
+        self._precise_yaw_accumulated_rotation = 0.0
         # self.screen: UARTScreen = kwargs.get("screen", None)
        
     def stop(self):
@@ -161,6 +167,8 @@ class Mission(object):
                     f"precise_rate={precise_rate_text}deg/s "
                     f"crossed={self._precise_yaw_target_crossed} "
                     f"stable={self._precise_yaw_stable_time:.2f}s "
+                    f"braking={self._precise_yaw_braking} "
+                    f"rotation={self._precise_yaw_accumulated_rotation:.1f}deg "
                     f"fc_attitude=({fc.state.rol.value:.2f},"
                     f"{fc.state.pit.value:.2f},{fc_yaw:.2f})deg "
                     f"fc_velocity=({fc.state.vel_x.value},{fc.state.vel_y.value},"
@@ -181,6 +189,27 @@ class Mission(object):
             stop_event.wait(YAW_DIAGNOSTIC_INTERVAL)
 
         logger.info("[YAW-DIAG] logger stopped")
+
+    def _hold_current_yaw(self, reason: str, braking: bool, dwell: float = 0.0) -> float:
+        """将 Navigation 的 yaw 输出限制为零，并把目标锁在当前航向。"""
+        self.navi.set_yaw_speed(0)
+        current_yaw = float(self.navi.current_yaw)
+        if np.isfinite(current_yaw):
+            self.navi.set_yaw(current_yaw)
+        else:
+            logger.error(
+                "[YAW-PRECISE] current yaw is invalid; "
+                "yaw output remains clamped to zero"
+            )
+        self._precise_yaw_speed_limit = 0
+        self._precise_yaw_braking = braking
+        logger.warning(
+            f"[YAW-PRECISE] yaw command stopped: reason={reason} "
+            f"hold={current_yaw:.2f}deg dwell={dwell:.2f}s"
+        )
+        if dwell > 0:
+            time.sleep(dwell)
+        return current_yaw
 
     def turn_to_yaw_precise(
         self,
@@ -205,13 +234,24 @@ class Mission(object):
 
         filtered_yaw_rate = 0.0
         stable_since = None
+        brake_low_rate_since = None
         current_speed_limit = PRECISE_YAW_FAR_SPEED
         target_crossed = False
+        braking = False
+        fine_correction = False
+        previous_error = initial_error
+        accumulated_rotation = 0.0
+        max_rotation = max(
+            PRECISE_YAW_MAX_EXTRA_ROTATION,
+            abs(initial_error) + PRECISE_YAW_MAX_EXTRA_ROTATION,
+        )
 
         self._precise_yaw_speed_limit = current_speed_limit
         self._precise_yaw_filtered_rate = filtered_yaw_rate
         self._precise_yaw_target_crossed = target_crossed
         self._precise_yaw_stable_time = 0.0
+        self._precise_yaw_braking = braking
+        self._precise_yaw_accumulated_rotation = accumulated_rotation
 
         navi.set_yaw_speed(PRECISE_YAW_FAR_SPEED)
         navi.set_yaw(target_yaw)
@@ -231,6 +271,7 @@ class Mission(object):
             yaw_delta = self._yaw_delta(current_yaw, previous_yaw)
             raw_yaw_rate = yaw_delta / dt
             if abs(raw_yaw_rate) <= PRECISE_YAW_MAX_VALID_RATE:
+                accumulated_rotation += abs(yaw_delta)
                 filtered_yaw_rate = (
                     (1.0 - PRECISE_YAW_RATE_FILTER_ALPHA) * filtered_yaw_rate
                     + PRECISE_YAW_RATE_FILTER_ALPHA * raw_yaw_rate
@@ -244,37 +285,142 @@ class Mission(object):
             yaw_error = self._navigation_yaw_error(target_yaw, current_yaw)
             abs_error = abs(yaw_error)
             abs_yaw_rate = abs(filtered_yaw_rate)
-
-            if (
-                initial_direction != 0
+            crossed_this_sample = (
+                previous_error != 0
                 and yaw_error != 0
-                and yaw_error * initial_direction < 0
-            ):
+                and previous_error * yaw_error < 0
+            )
+
+            if crossed_this_sample:
                 target_crossed = True
 
             self._precise_yaw_filtered_rate = filtered_yaw_rate
             self._precise_yaw_target_crossed = target_crossed
+            self._precise_yaw_accumulated_rotation = accumulated_rotation
 
             if not navi.running:
                 logger.error("[YAW-PRECISE] navigation stopped during turn")
+                self._hold_current_yaw(
+                    "navigation-stopped", braking=False, dwell=PRECISE_YAW_STOP_DWELL
+                )
                 return False
             if not fc.state.unlock.value:
                 logger.error("[YAW-PRECISE] aircraft locked during turn")
+                self._hold_current_yaw(
+                    "aircraft-locked", braking=False, dwell=PRECISE_YAW_STOP_DWELL
+                )
                 return False
             if fc.state.mode.value != fc.HOLD_POS_MODE:
                 logger.error(
                     f"[YAW-PRECISE] unexpected flight mode: {fc.state.mode.value}"
                 )
+                self._hold_current_yaw(
+                    "unexpected-flight-mode",
+                    braking=False,
+                    dwell=PRECISE_YAW_STOP_DWELL,
+                )
                 return False
             if not navi.navigation_flag:
                 logger.error("[YAW-PRECISE] navigation flag disabled during turn")
+                self._hold_current_yaw(
+                    "navigation-disabled", braking=False, dwell=PRECISE_YAW_STOP_DWELL
+                )
                 return False
+
+            if accumulated_rotation > max_rotation:
+                logger.error(
+                    f"[YAW-PRECISE] rotation guard triggered: "
+                    f"rotation={accumulated_rotation:.1f}deg limit={max_rotation:.1f}deg"
+                )
+                self._hold_current_yaw(
+                    "rotation-guard", braking=False, dwell=PRECISE_YAW_STOP_DWELL
+                )
+                return False
+
+            if now - start_time >= timeout:
+                self._hold_current_yaw(
+                    "timeout", braking=False, dwell=PRECISE_YAW_STOP_DWELL
+                )
+                logger.warning(
+                    f"[YAW-PRECISE] timeout target={target_yaw:.2f}deg "
+                    f"current={current_yaw:.2f}deg "
+                    f"error={yaw_error:+.2f}deg "
+                    f"rate={filtered_yaw_rate:+.2f}deg/s "
+                    f"crossed={target_crossed} "
+                    f"elapsed={now-start_time:.2f}s"
+                )
+                return False
+
+            should_brake = (
+                crossed_this_sample
+                or (
+                    abs_error <= PRECISE_YAW_BRAKE_TRIGGER_ERROR
+                    and abs_yaw_rate > PRECISE_YAW_FINAL_RATE
+                )
+            )
+            if should_brake and not braking:
+                braking = True
+                fine_correction = True
+                stable_since = None
+                brake_low_rate_since = None
+                current_speed_limit = 0
+                self._hold_current_yaw("target-brake", braking=True)
+
+            if braking:
+                if abs_yaw_rate <= PRECISE_YAW_FINAL_RATE:
+                    if brake_low_rate_since is None:
+                        brake_low_rate_since = now
+
+                    if abs_error <= PRECISE_YAW_FINAL_ERROR:
+                        if stable_since is None:
+                            stable_since = now
+                        self._precise_yaw_stable_time = now - stable_since
+                        if self._precise_yaw_stable_time >= PRECISE_YAW_SETTLE_TIME:
+                            self._hold_current_yaw("target-reached", braking=False)
+                            logger.info(
+                                f"[YAW-PRECISE] reached target={target_yaw:.2f}deg "
+                                f"current={current_yaw:.2f}deg "
+                                f"error={yaw_error:+.2f}deg "
+                                f"rate={filtered_yaw_rate:+.2f}deg/s "
+                                f"elapsed={now-start_time:.2f}s"
+                            )
+                            return True
+                    else:
+                        stable_since = None
+                        self._precise_yaw_stable_time = 0.0
+                        if (
+                            now - brake_low_rate_since
+                            >= PRECISE_YAW_BRAKE_SETTLE_TIME
+                        ):
+                            braking = False
+                            self._precise_yaw_braking = False
+                            current_speed_limit = PRECISE_YAW_BRAKE_SPEED
+                            navi.set_yaw_speed(current_speed_limit)
+                            self._precise_yaw_speed_limit = current_speed_limit
+                            navi.set_yaw(target_yaw)
+                            logger.info(
+                                f"[YAW-PRECISE] resume fine correction: "
+                                f"error={yaw_error:+.2f}deg limit={current_speed_limit}deg/s"
+                            )
+                else:
+                    brake_low_rate_since = None
+                    stable_since = None
+                    self._precise_yaw_stable_time = 0.0
+
+                previous_yaw = current_yaw
+                previous_time = now
+                previous_error = yaw_error
+                continue
 
             desired_speed_limit = _precise_yaw_speed_limit(
                 abs_error=abs_error,
                 abs_yaw_rate=abs_yaw_rate,
                 target_crossed=target_crossed,
             )
+            if fine_correction:
+                desired_speed_limit = min(
+                    desired_speed_limit, PRECISE_YAW_BRAKE_SPEED
+                )
             if desired_speed_limit != current_speed_limit:
                 navi.set_yaw_speed(desired_speed_limit)
                 current_speed_limit = desired_speed_limit
@@ -294,8 +440,7 @@ class Mission(object):
                     stable_since = now
                 self._precise_yaw_stable_time = now - stable_since
                 if self._precise_yaw_stable_time >= PRECISE_YAW_SETTLE_TIME:
-                    navi.set_yaw_speed(PRECISE_YAW_HOLD_SPEED)
-                    self._precise_yaw_speed_limit = PRECISE_YAW_HOLD_SPEED
+                    self._hold_current_yaw("target-reached", braking=False)
                     logger.info(
                         f"[YAW-PRECISE] reached target={target_yaw:.2f}deg "
                         f"current={current_yaw:.2f}deg "
@@ -308,21 +453,9 @@ class Mission(object):
                 stable_since = None
                 self._precise_yaw_stable_time = 0.0
 
-            if now - start_time >= timeout:
-                navi.set_yaw_speed(PRECISE_YAW_FINE_SPEED)
-                self._precise_yaw_speed_limit = PRECISE_YAW_FINE_SPEED
-                logger.warning(
-                    f"[YAW-PRECISE] timeout target={target_yaw:.2f}deg "
-                    f"current={current_yaw:.2f}deg "
-                    f"error={yaw_error:+.2f}deg "
-                    f"rate={filtered_yaw_rate:+.2f}deg/s "
-                    f"crossed={target_crossed} "
-                    f"elapsed={now-start_time:.2f}s"
-                )
-                return False
-
             previous_yaw = current_yaw
             previous_time = now
+            previous_error = yaw_error
 
     def run(self):
         fc = self.fc
