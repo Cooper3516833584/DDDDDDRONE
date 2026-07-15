@@ -17,6 +17,11 @@ from FlightController.Solutions.Vision import *
 from loguru import logger
 from FlightController.Components.RosManager import RosManager
 from FlightController.Components.UartScreen import UARTScreen
+from FlightController.Components.GroundStationLink import (
+    CommandId,
+    MissionState,
+    RejectReason,
+)
 import numpy as np
 import struct
     
@@ -75,6 +80,32 @@ def _precise_yaw_speed_limit(
         speed_limit = min(speed_limit, PRECISE_YAW_BRAKE_SPEED)
 
     return int(speed_limit)
+
+
+def wait_for_ground_start(fc: FC_Like):
+    """经飞控 UT2/HC-14 桥等待一个通过协议校验的 START_MISSION。"""
+    fc.start_ground_station()
+    logger.info("[MANAGER] GroundStationLink using FC wireless bridge (UT2)")
+    fc.enable_ground_command_reception()
+    logger.info("[MANAGER] Waiting for ground-station START_MISSION")
+
+    while True:
+        command = fc.receive_ground_command(timeout=0.5)
+        if command is None:
+            continue
+        try:
+            if command.command.command_id == CommandId.START_MISSION:
+                fc.prepare_ground_mission()
+                fc.accept_ground_command(command)
+                logger.info("[MANAGER] Ground-station START_MISSION accepted")
+                return command
+            if command.command.command_id == CommandId.STOP_MISSION:
+                fc.complete_ground_command(command)
+                logger.info("[MANAGER] Ignored STOP_MISSION while idle")
+            else:
+                fc.reject_ground_command(command, RejectReason.UNKNOWN_COMMAND)
+        finally:
+            fc.ground_command_done()
 
 
 class Mission(object):
@@ -565,9 +596,21 @@ if __name__ == "__main__":
         mapper=mapper,
         screen=screen,
     )
+
+    ground_command = wait_for_ground_start(fc)
+    fc.enable_ground_telemetry()
+    fc.send_ground_status(
+        MissionState.RUNNING,
+        progress=0,
+        message="2025V2:START",
+    )
+    mission_error = None
+    mission_completed = False
     try:
         mission.run()
+        mission_completed = True
     except Exception as e:
+        mission_error = e
         logger.exception(f"[MANAGER] Mission Failed")
     finally:
         mission.stop()
@@ -580,5 +623,30 @@ if __name__ == "__main__":
             ret = fc.wait_for_lock()
             if not ret:
                 fc.lock()
+
+        try:
+            if mission_completed:
+                fc.send_ground_status(
+                    MissionState.COMPLETED,
+                    progress=100,
+                    message="2025V2:LANDED",
+                )
+                fc.complete_ground_command(ground_command)
+            else:
+                fc.send_ground_status(
+                    MissionState.FAILED,
+                    progress=0,
+                    error_code=1,
+                    message=(
+                        f"2025V2:FAILED:{type(mission_error).__name__}"
+                        if mission_error is not None
+                        else "2025V2:FAILED:INTERRUPTED"
+                    ),
+                )
+                fc.fail_ground_command(ground_command, RejectReason.FC_OFFLINE)
+        except Exception as report_error:
+            logger.exception(
+                f"[MANAGER] Ground-station final report failed: {report_error}"
+            )
     logger.info("[MANAGER] Mission finished")
     fc.close()
