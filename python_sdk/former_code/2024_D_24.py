@@ -21,8 +21,8 @@ from FlightController.Components.GroundStationLink import (
     MissionState,
     RejectReason,
 )
-import vision_of_tf
-from vision_of_tf import (
+import python_sdk.vision_of_tf as vision_of_tf
+from python_sdk.vision_of_tf import (
     _detect_qrcodes,
     _open_usb_camera,
     _select_nearest_to_image_center,

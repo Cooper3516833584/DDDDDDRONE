@@ -11,6 +11,7 @@ from loguru import logger
 from simple_pid import PID
 
 from .PathPlanner import PFBPP, TrajectoryGenerator
+from .SmoothTrajectory import SplineTrajectoryConfig, SplineTrajectoryGenerator
 
 logger_dbg = logger.bind(debug=True)
 
@@ -613,6 +614,80 @@ class Navigation(object):
             traj_list.append(traj.calc_position_xyz(t))
         traj_list.append(waypoint)
         return self.navigation_follow_trajectory(traj_list, wait=wait)  # type: ignore
+
+    def create_smooth_traj_list(
+        self,
+        waypoints,
+        altitude: Optional[float] = None,
+        config: Optional[SplineTrajectoryConfig] = None,
+        extended: bool = False,
+    ) -> List[Tuple[float, ...]]:
+        """根据有序二维航点生成平滑轨迹点列表。
+
+        waypoints: ``[(x, y), ...]``，单位 cm，与当前导航坐标系一致
+        altitude: 固定轨迹高度 / cm，默认使用当前定高目标
+        config: 平滑与速度规划参数；其中巡航速度始终使用当前 navi_speed
+        extended: 是否输出带 ``t/vx/vy/speed_limit`` 的扩展点格式
+        """
+        if altitude is None:
+            altitude = float(self.height_pid.setpoint)
+        trajectory_config = (
+            config or SplineTrajectoryConfig(navi_speed=self.navi_speed)
+        ).with_navi_speed(self.navi_speed)
+        generator = SplineTrajectoryGenerator(
+            waypoints=waypoints,
+            altitude=float(altitude),
+            config=trajectory_config,
+        )
+        return generator.generate_traj_list(extended=extended)
+
+    def navigation_follow_waypoints(
+        self,
+        waypoints,
+        wait=True,
+        altitude: Optional[float] = None,
+        pos_thres: float = 10.0,
+        config: Optional[SplineTrajectoryConfig] = None,
+    ):
+        """以当前位置为起点生成平滑多航点轨迹，并交给现有执行器。
+
+        输入的第一个航点会作为路径中的第二个点。轨迹起点在调用时读取
+        ``current_x/current_y/current_height``；未指定 altitude 时使用当前
+        定高 PID 目标。当前执行器仍按位置点逐点推进，因此配置中的时间
+        和速度规划决定采样位置，但不等价于按时间戳闭环跟踪。
+        """
+        planned_waypoints = np.asarray(waypoints, dtype=float)
+        if (
+            planned_waypoints.ndim != 2
+            or planned_waypoints.shape[0] == 0
+            or planned_waypoints.shape[1] < 2
+        ):
+            raise ValueError("waypoints must contain at least one (x, y) point")
+        if not np.all(np.isfinite(planned_waypoints[:, :2])):
+            raise ValueError("waypoints must contain only finite coordinates")
+
+        start_x = float(self.current_x)
+        start_y = float(self.current_y)
+        start_height = float(self.current_height)
+        if not np.all(np.isfinite([start_x, start_y, start_height])):
+            raise ValueError("current navigation position must be finite")
+
+        trajectory_waypoints = np.vstack(
+            ([start_x, start_y], planned_waypoints[:, :2])
+        )
+        traj_list = self.create_smooth_traj_list(
+            waypoints=trajectory_waypoints,
+            altitude=altitude,
+            config=config,
+            extended=False,
+        )
+        first_point = traj_list[0]
+        traj_list[0] = (first_point[0], first_point[1], start_height)
+        return self.navigation_follow_trajectory(
+            traj_list,
+            wait=wait,
+            pos_thres=pos_thres,
+        )
 
     def navigation_around_waypoint(
             self,
