@@ -9,6 +9,7 @@ HW-159 为 WS2812 灯环；PWM3 只能使整个模块统一闪烁，不能逐颗
 
 import argparse
 import os
+import struct
 import sys
 import time
 
@@ -43,6 +44,18 @@ def parse_args():
     return args
 
 
+def set_pwm_without_ack(fc, channel, pwm_percent):
+    """发送用户 PWM 帧，但不等待现场固件未返回的 ACK。"""
+    if not 0.0 <= pwm_percent <= 100.0:
+        raise ValueError("PWM 占空比必须在 0 到 100 之间")
+    pwm_value = int(pwm_percent * 100.0)
+    fc.send_data_to_fc(
+        struct.pack("<Bh", channel, pwm_value),
+        0x05,
+        need_ack=False,
+    )
+
+
 def main():
     args = parse_args()
     # 延迟导入：--help 和参数校验不应触发飞控日志初始化或访问串口。
@@ -64,7 +77,7 @@ def main():
         deadline = time.monotonic() + args.duration
         while time.monotonic() < deadline:
             is_on = not is_on
-            fc.set_PWM_output(PWM_CHANNEL, PWM_PERCENT if is_on else 0.0)
+            set_pwm_without_ack(fc, PWM_CHANNEL, PWM_PERCENT if is_on else 0.0)
             remaining = deadline - time.monotonic()
             time.sleep(min(args.interval, max(0.0, remaining)))
     except KeyboardInterrupt:
@@ -72,7 +85,7 @@ def main():
     finally:
         # 无论正常结束、连接失败或 Ctrl+C，均尝试关闭 PWM3。
         try:
-            fc.set_PWM_output(PWM_CHANNEL, 0.0)
+            set_pwm_without_ack(fc, PWM_CHANNEL, 0.0)
         except Exception as exc:
             print("关闭 PWM3 失败：{}".format(exc), file=sys.stderr)
 
