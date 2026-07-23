@@ -403,6 +403,17 @@ stablize
 
 不要在未确认屏幕固件同步更新的情况下修改命令字符串。
 
+### 6.4 FC_Server / FC_Client 架构
+
+上位机上通常运行着 `server_ros.py`，它实例化 `FC_Server` 并持有飞控串口，同时在 TCP 5654 端口（authkey `b"fc"`）接受客户端连接。`FC_Client` 通过网络连接到 `FC_Server`，将 `send_data_to_fc` 调用转发到服务器执行，自身不打开任何串口。
+
+编写需要连接飞控的代码（测试脚本、调试工具等）时，**必须先询问用户：上位机上是否正在运行 `server_ros.py`（或其他启动了 `FC_Server` 的程序）。**
+
+- **如果正在运行**：使用 `FC_Client`，通过 `connect()` 方法连接到服务器，避免抢占飞控串口。参考 `testcode/test_indicator_led.py`。
+- **如果未运行**：使用 `FC_Controller`，通过 `start_listen_serial()` 直连飞控串口。参考 `read_fc_mode.py`。
+
+不得在未确认上位机状态的情况下默认选择直连串口，以免与已运行的 `FC_Server` 抢占飞控连接。
+
 ---
 
 ## 7. 线程、事件与资源管理
