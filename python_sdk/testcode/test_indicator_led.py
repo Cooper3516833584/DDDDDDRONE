@@ -1,28 +1,37 @@
 """
 测试飞控 32 板载 LED（set_indicator_led）的程序。
 
-仅连接飞控串口并发送 LED 颜色命令，不做任何控制动作：
+通过 FC_Client 连接已运行的 FC_Server（例如 server_ros.py），转发 LED 颜色命令，
+不会抢占飞控串口。不做任何控制动作：
   - 不解锁
   - 不发送实时控制帧
   - 不驱动电机 / PWM / 蜂鸣器
   - 不设置飞行模式
 
+前置条件：上位机上需要已运行 server_ros.py（启动 FC_Server 并持有飞控串口）。
+
 用法:
     # 设置指定颜色（R G B 各 0-255）
-    python testcode/test_indicator_led.py --fc-port COM3 --color 255 0 0    # 红色
-    python testcode/test_indicator_led.py --fc-port COM3 --color 0 255 0    # 绿色
-    python testcode/test_indicator_led.py --fc-port COM3 --color 0 0 255    # 蓝色
-    python testcode/test_indicator_led.py --fc-port COM3 --color 255 255 0  # 黄色
+    python testcode/test_indicator_led.py --color 255 0 0    # 红色
+    python testcode/test_indicator_led.py --color 0 255 0    # 绿色
+    python testcode/test_indicator_led.py --color 0 0 255    # 蓝色
 
     # 循环展示预设颜色（默认行为，需手动 Ctrl+C 退出）
-    python testcode/test_indicator_led.py --fc-port COM3 --cycle
+    python testcode/test_indicator_led.py --cycle
 
     # 循环展示，自定义切换间隔（秒）
-    python testcode/test_indicator_led.py --fc-port COM3 --cycle --interval 2.0
+    python testcode/test_indicator_led.py --cycle --interval 2.0
+
+    # 连接远程机载上位机的 FC_Server
+    python testcode/test_indicator_led.py --host 192.168.31.176 --color 255 0 0
+
+    # 指定自定义端口 / 密钥
+    python testcode/test_indicator_led.py --port 5654 --authkey fc --color 0 255 0
 
 协议说明:
+    FC_Client 通过网络连接到 FC_Server（默认 127.0.0.1:5654, authkey=b"fc"），
     set_indicator_led 将 0-255 的 RGB 值按比例映射到 0-20，通过命令 0x0A
-    以 s8 格式发送到飞控。
+    以 s8 格式经服务器转发到飞控。
 """
 
 import argparse
@@ -34,9 +43,9 @@ SDK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if SDK_DIR not in sys.path:
     sys.path.insert(0, SDK_DIR)
 
-from FlightController import FC_Controller  # noqa: E402
+from FlightController import FC_Client  # noqa: E402
 
-# 预设颜色列表（R, G, B）
+# 预设颜色列表（R, G, B, 名称）
 PRESET_COLORS = [
     (255, 0, 0, "红色 (Red)"),
     (0, 255, 0, "绿色 (Green)"),
@@ -58,24 +67,29 @@ def rgb_to_fc_value(val: int) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="测试飞控 32 板载 LED（仅连接，不控制飞行）"
+        description="测试飞控 32 板载 LED（通过 FC_Client 网络连接，不直接抢占串口）"
     )
     parser.add_argument(
-        "--fc-port",
-        default=None,
-        help="飞控串口设备名（默认自动搜索 VID:PID=66CC:2233）",
+        "--host",
+        default="127.0.0.1",
+        help="FC_Server 地址（默认 127.0.0.1，即本机运行的 server_ros.py）",
     )
     parser.add_argument(
-        "--fc-baud",
+        "--port",
         type=int,
-        default=500000,
-        help="串口波特率（默认 500000）",
+        default=5654,
+        help="FC_Server 端口（默认 5654，与 server_ros.py 一致）",
+    )
+    parser.add_argument(
+        "--authkey",
+        default="fc",
+        help="FC_Server 认证密钥（默认 fc，与 server_ros.py 一致）",
     )
     parser.add_argument(
         "--connect-timeout",
         type=float,
         default=5.0,
-        help="等待飞控遥测的超时秒数（默认 5）",
+        help="连接 FC_Server 的超时秒数（默认 5）",
     )
     parser.add_argument(
         "--color",
@@ -98,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def send_led_color(fc: FC_Controller, r: int, g: int, b: int) -> None:
+def send_led_color(fc: FC_Client, r: int, g: int, b: int) -> None:
     """发送 LED 颜色命令并打印映射详情。"""
     r_fc = rgb_to_fc_value(r)
     g_fc = rgb_to_fc_value(g)
@@ -124,30 +138,32 @@ def main() -> int:
         print("[!] --interval 必须大于 0")
         return 2
 
+    if args.connect_timeout <= 0:
+        print("[!] --connect-timeout 必须大于 0")
+        return 2
+
     # 默认行为：如果没有指定 --color 也没有 --cycle，则循环展示
     cycle_mode = args.cycle or (args.color is None)
 
-    # ---- 创建飞控对象并连接串口 ----
-    fc = FC_Controller()
-    print(f"[*] 正在连接飞控串口 ...")
+    # ---- 创建 FC_Client 并连接到 FC_Server ----
+    fc = FC_Client()
+    print(f"[*] 正在连接 FC_Server ({args.host}:{args.port}) ...")
+
     try:
-        fc.start_listen_serial(
-            serial_dev=args.fc_port,
-            baudrate=args.fc_baud,
+        fc.connect(
+            host=args.host,
+            port=args.port,
+            authkey=args.authkey.encode() if isinstance(args.authkey, str) else args.authkey,
             print_state=False,
+            block=True,
+            timeout=args.connect_timeout,
         )
-    except AssertionError:
-        print("[!] 未找到飞控串口 (VID:PID=66CC:2233)，请检查连接或通过 --fc-port 指定。")
+    except Exception as e:
+        print(f"[!] 无法连接到 FC_Server ({args.host}:{args.port}): {e}")
+        print("[!] 请确认 server_ros.py 已在上位机运行，且网络可达。")
         return 1
 
-    # ---- 等待首帧遥测 ----
-    print(f"[*] 等待飞控遥测数据（超时 {args.connect_timeout}s）...")
-    if not fc.wait_for_connection(timeout_s=args.connect_timeout):
-        print(f"[!] {args.connect_timeout}s 内未收到遥测数据，请检查飞控是否上电并正常发送。")
-        fc.close()
-        return 1
-
-    print("[✓] 飞控已连接。\n")
+    print("[✓] 已连接到 FC_Server，遥测数据同步中。\n")
 
     # ---- 确认飞控未解锁 ----
     if fc.state.unlock.value:
@@ -190,7 +206,7 @@ def main() -> int:
         except Exception:
             pass
         fc.close()
-        print("[✓] 飞控连接已关闭。")
+        print("[✓] 客户端连接已关闭。")
 
     return 0
 
