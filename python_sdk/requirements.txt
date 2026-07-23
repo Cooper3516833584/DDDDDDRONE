@@ -14,3 +14,4 @@ pyserial==3.5
 pyzbar==0.1.9
 scipy==1.10.1
 simple-pid==2.0.0
+ultralytics==8.4.100
