@@ -15,3 +15,7 @@ __pycache__/
 /fc_log/
 /python_sdk/fc_log/
 /.vscode/
+/python_sdk/.vscode/
+
+# Hardware-debug artifacts
+/python_sdk/radar_resolve_debug.png
