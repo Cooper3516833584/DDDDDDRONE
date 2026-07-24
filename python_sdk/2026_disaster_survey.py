@@ -36,13 +36,13 @@ from FlightController.Components.RosNode import RosNodeRunner
 from FlightController.Components.RosManager import RosManager
 from FlightController.Components.UartScreen import UARTScreen
 
-from python_sdk.vision_for_simulation.takeoff_rectangle import (
+from vision_for_simulation.takeoff_rectangle import (
     detect_takeoff_rectangle,
 )
-from python_sdk.vision_for_simulation.terrain_ring import (
+from vision_for_simulation.terrain_ring import (
     detect_nearest_terrain_ring,
 )
-from python_sdk.vision_for_simulation.camera_offsets import _center_to_offset
+from vision_for_simulation.camera_offsets import _center_to_offset
 
 # ============ 可调参数 ============
 CRUISE_SPEED = 22            # 水平导航速度 cm/s
