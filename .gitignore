@@ -19,3 +19,5 @@ __pycache__/
 
 # Hardware-debug artifacts
 /python_sdk/radar_resolve_debug.png
+
+.vscode/
