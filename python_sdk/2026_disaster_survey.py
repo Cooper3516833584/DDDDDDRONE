@@ -440,14 +440,8 @@ class Mission(object):
         fc.set_action_log(True)
         logger.info("[MISSION] Mission Started")
 
-        # ---- 起飞 ----
-        logger.info(f"[MISSION] Takeoff to {self.cruise_height}cm")
-        navi.pointing_takeoff((0, 0), self.cruise_height)
-        navi.set_yaw(0)
-        navi.wait_for_yaw()
-        time.sleep(0.5)
-
-        # ---- Cartographer ----
+        # ---- Cartographer 就绪等待（起飞前）----
+        # 仿照 base_test.py: 先确保 Cartographer / TF 坐标可靠，再解锁起飞。
         CART_TIMEOUT = 30.0
         logger.info(f"[MISSION] Waiting Cartographer TF ({CART_TIMEOUT}s)...")
         t0 = time.perf_counter()
@@ -460,6 +454,13 @@ class Mission(object):
                 raise RuntimeError(f"Cartographer TF timeout ({CART_TIMEOUT}s)")
         logger.info(f"[MISSION] Cartographer TF ok ({time.perf_counter() - t0:.1f}s)")
         fc.set_indicator_led(0, 0, 0)
+
+        # ---- 定点起飞 ----
+        logger.info(f"[MISSION] Takeoff to {self.cruise_height}cm")
+        navi.pointing_takeoff((0, 0), self.cruise_height)
+        navi.set_yaw(0)
+        navi.wait_for_yaw()
+        time.sleep(0.5)
 
         # ---- 起飞矩形校准 ----
         if self.sim_vision is not None:
