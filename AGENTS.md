@@ -414,6 +414,17 @@ stablize
 
 不得在未确认上位机状态的情况下默认选择直连串口，以免与已运行的 `FC_Server` 抢占飞控连接。
 
+### 6.5 飞行代码的 ROS 建图组件启动
+
+如果已经确认上位机开机自启动 `python_sdk/server_ros.py`，后续编写或修改会在上位机运行并使用 `navi` 导航的飞行代码时，不得把 `server_ros.py` 正在运行等同于 ROS 建图链路已经启动。此类飞行代码默认必须确保以下组件已经启动并可用：
+
+- RealSense ROS 驱动；
+- 雷达 ROS 驱动；
+- Cartographer；
+- `camera_pose_frame` 与 `base_link` 所需的静态 TF。
+
+飞行代码默认直接沿用 `python_sdk/base_test.py` 中通过 `RosManager` 启动上述组件的现有方式，不得为此另行设计或修改新的启动、复用、进程探测或健康检查框架。进入 `navi` 导航、解锁或起飞前，必须等待 RealSense 位姿、雷达数据、地图和导航所需 TF 均已建立且保持新鲜；等待超时或任一链路无效时必须拒绝起飞，不得仅凭 `FC_Client` 已连接或 `server_ros.py` 正在运行继续任务。
+
 ---
 
 ## 7. 线程、事件与资源管理
