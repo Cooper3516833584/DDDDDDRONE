@@ -94,12 +94,12 @@ def _draw_hud(
 
     # ---- 方向箭头 ----
     if angle_deg is not None and dist_px is not None and dist_px > CALIB_CLOSE_THRESHOLD_PX:
-        arrow_len = int(min(w, h) * 0.25)  # 箭头长度 1/4 画面
+        arrow_len = int(min(w, h) * 0.25)
         rad = math.radians(angle_deg)
-        # 方向指向矩形（即无人机需要移动的方向）→ 箭头指向 (cx + dx, cy - dy)
-        # +x = up = -y 在图像中
-        dx = int(arrow_len * math.sin(rad) * 1.0)   # y分量 → 画面水平
-        dy = -int(arrow_len * math.cos(rad) * 1.0)  # x分量 → 画面竖直
+        # 飞行方向 → 图像方向:
+        #   0°=前 → 图像上(-y), +90°=左 → 图像左(-x)
+        dx = -int(arrow_len * math.sin(rad))  # 左分量为负 x
+        dy = -int(arrow_len * math.cos(rad))  # 前分量为负 y
         end = (cx + dx, cy + dy)
         cv2.arrowedLine(frame, (cx, cy), end, (0, 255, 255), 3, cv2.LINE_AA, tipLength=0.15)
 
