@@ -1,0 +1,273 @@
+"""FleetBus V1 drone endpoint with no direct flight-control operations."""
+
+import queue
+import threading
+import time
+from typing import Callable, Optional
+
+from .command_queue import AirCommandQueue
+from .models import (
+    AckPayload,
+    AckReason,
+    AckStatus,
+    AirCommand,
+    CommandId,
+    CommandPayload,
+    Frame,
+    MessageKind,
+    NodeId,
+    NodeTiming,
+    ReportPayload,
+)
+from .protocol import (
+    FrameParser,
+    ProtocolError,
+    RecentResponseCache,
+    decode_command,
+    decode_drone_goto,
+    encode_ack,
+    encode_report,
+    new_session,
+    pack_frame,
+)
+
+
+class AirFleetNode:
+    """Parse in the transport callback and process/reply only in a worker thread."""
+
+    def __init__(
+        self,
+        transport: object,
+        state_provider: Callable[[], object],
+        command_queue: AirCommandQueue,
+        stop_event: threading.Event,
+        timing: NodeTiming = NodeTiming(),
+        readonly: bool = False,
+        wait: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._transport = transport
+        self._state_provider = state_provider
+        self._commands = command_queue
+        self._flight_stop_event = stop_event
+        self._timing = timing
+        self._readonly = readonly
+        self._wait = wait
+        self._parser = FrameParser(int(NodeId.DRONE))
+        self._inbox = queue.Queue(timing.queue_size)
+        self._cache = RecentResponseCache()
+        self._session = new_session()
+        self._stop = threading.Event()
+        self._worker = None  # type: Optional[threading.Thread]
+
+    @property
+    def parser(self) -> FrameParser:
+        return self._parser
+
+    @property
+    def command_queue(self) -> AirCommandQueue:
+        return self._commands
+
+    def start(self) -> None:
+        if self._worker is not None:
+            return
+        self._stop.clear()
+        self._worker = threading.Thread(
+            target=self._run, name="fleet-air-node", daemon=True
+        )
+        self._worker.start()
+        self._transport.start()
+
+    def close(self) -> None:
+        self._transport.stop()
+        self._stop.set()
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout=1.0)
+        self._worker = None
+
+    def feed_bytes(self, data: bytes) -> None:
+        """Transport callback: validate/address/queue, without waiting or writing."""
+        for frame in self._parser.feed(data):
+            try:
+                self._inbox.put_nowait(frame)
+            except queue.Full:
+                continue
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                frame = self._inbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            response = self._handle(frame)
+            if response is None or self._stop.is_set():
+                continue
+            self._wait(self._timing.turnaround_s)
+            if not self._stop.is_set():
+                self._transport.write(response)
+
+    def _handle(self, frame: Frame) -> Optional[bytes]:
+        if frame.src != int(NodeId.GROUND):
+            return None
+        self._cache.begin_ground_session(frame.session)
+        cached = self._cache.get(frame.session, frame.seq)
+        if cached is not None:
+            return cached
+        if frame.kind == int(MessageKind.POLL):
+            response = self._report(frame)
+        elif frame.kind == int(MessageKind.COMMAND):
+            response = self._command(frame)
+        else:
+            return None
+        self._cache.put(frame.session, frame.seq, response)
+        return response
+
+    def _report(self, request: Frame) -> bytes:
+        state = self._state_provider()
+        command_status = self._commands.status()
+        payload = encode_report(
+            ReportPayload(
+                request.session,
+                request.seq,
+                state.node_flags,
+                state.node_uptime_ms,
+                state.x_cm,
+                state.y_cm,
+                state.z_cm,
+                state.heading_cdeg,
+                state.vx_cm_s,
+                state.vy_cm_s,
+                state.vz_cm_s,
+                state.battery_cV,
+                state.operation_state,
+                state.pose_quality,
+                command_status.active_command_seq,
+                command_status.status,
+                state.error_code or command_status.error_code,
+            )
+        )
+        return self._response(request, MessageKind.REPORT, payload)
+
+    def _command(self, request: Frame) -> bytes:
+        try:
+            command = decode_command(request.payload)
+            command_body = self._decode_command_body(command)
+        except ProtocolError:
+            command_id = request.payload[0] if request.payload else 0
+            return self._ack(
+                request, command_id, AckStatus.REJECTED, AckReason.BAD_PAYLOAD
+            )
+
+        if command.command_id == int(CommandId.PING):
+            return self._ack(
+                request, command.command_id, AckStatus.COMPLETED, AckReason.NONE
+            )
+
+        if self._readonly:
+            return self._ack(
+                request, command.command_id, AckStatus.REJECTED, AckReason.UNSUPPORTED
+            )
+
+        if command.command_id != int(CommandId.TARGETED_STOP):
+            state = self._state_provider()
+            if not state.node_flags & 0x0001:
+                return self._ack(
+                    request,
+                    command.command_id,
+                    AckStatus.REJECTED,
+                    AckReason.LOCALIZATION_INVALID,
+                )
+
+        queued = AirCommand(
+            request.session, request.seq, command.command_id, command_body
+        )
+        if command.command_id == int(CommandId.TARGETED_STOP):
+            self._flight_stop_event.set()
+        if not self._commands.put(queued):
+            return self._ack(
+                request, command.command_id, AckStatus.REJECTED, AckReason.BUSY
+            )
+        self._commands.accept(queued)
+        return self._ack(
+            request, command.command_id, AckStatus.ACCEPTED, AckReason.NONE
+        )
+
+    @staticmethod
+    def _decode_command_body(command: CommandPayload) -> object:
+        if command.command_id == int(CommandId.DRONE_GOTO):
+            return decode_drone_goto(command.command_body)
+        if command.command_id in (
+            int(CommandId.PING),
+            int(CommandId.TARGETED_STOP),
+            int(CommandId.DRONE_HOLD),
+            int(CommandId.CANCEL_TASK),
+        ):
+            if command.command_body:
+                raise ProtocolError("payload", "command body must be empty")
+            return None
+        raise ProtocolError("payload", "unsupported command")
+
+    def _ack(
+        self,
+        request: Frame,
+        command_id: int,
+        status: AckStatus,
+        reason: AckReason,
+    ) -> bytes:
+        return self._response(
+            request,
+            MessageKind.ACK,
+            encode_ack(
+                AckPayload(
+                    request.session,
+                    request.seq,
+                    command_id,
+                    int(status),
+                    int(reason),
+                )
+            ),
+        )
+
+    def _response(self, request: Frame, kind: MessageKind, payload: bytes) -> bytes:
+        return pack_frame(
+            Frame(
+                version=1,
+                src=int(NodeId.DRONE),
+                dst=int(NodeId.GROUND),
+                kind=int(kind),
+                flags=0,
+                session=self._session,
+                seq=request.seq,
+                payload=payload,
+            )
+        )
+
+
+def attach_air_fleet_node(
+    fc: object,
+    navigation: object,
+    stop_event: threading.Event,
+    readonly: bool = False,
+) -> AirFleetNode:
+    """Create the one FCWirelessTransport callback owner for FleetBus mode."""
+    from FlightController.Components.GroundStationLink.transport import (
+        FCWirelessTransport,
+    )
+
+    from .pose_provider import NavigationAirStateProvider
+
+    holder = {}
+    transport = FCWirelessTransport(
+        fc, on_bytes=lambda data: holder["node"].feed_bytes(data)
+    )
+    commands = AirCommandQueue()
+    node = AirFleetNode(
+        transport,
+        NavigationAirStateProvider(fc, navigation),
+        commands,
+        stop_event,
+        readonly=readonly,
+    )
+    holder["node"] = node
+    node.start()
+    return node
