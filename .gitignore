@@ -20,5 +20,10 @@ __pycache__/
 
 # Hardware-debug artifacts
 /python_sdk/radar_resolve_debug.png
+/video*_*.jpg
+
+# Device-local QR experiments
+/python_sdk/qr_number_display_task.py
+/python_sdk/testcode/test_qr_number_display_task.py
 
 .vscode/
