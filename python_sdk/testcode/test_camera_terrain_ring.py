@@ -1,7 +1,7 @@
 """
 test_camera_terrain_ring.py
 ===========================
-从 /dev/video0 摄像头以 10 Hz 实时检测地形环，输出 detect_nearest_terrain_ring
+从 /dev/video2 摄像头以 10 Hz 实时检测地形环，输出 detect_nearest_terrain_ring
 的检测结果。仅使用视觉模块，不连接飞控。
 
 运行方式（上位机）:
@@ -12,7 +12,7 @@ test_camera_terrain_ring.py
   PYTHONPATH=. python3 python_sdk/testcode/test_camera_terrain_ring.py
 
 可选参数:
-  --camera N         摄像头索引 (默认 0, 即 /dev/video0)
+  --camera N         摄像头索引 (默认 2, 即 /dev/video2)
   --freq N           检测频率 Hz (默认 10)
   --conf N           置信度阈值 (默认 0.80)
   --dist-warn N      像素距离告警阈值 (默认 100px, 低于此值时输出 WARN)
@@ -39,158 +39,6 @@ _HERE = Path(__file__).resolve().parent
 _SDK = _HERE.parent
 if str(_SDK) not in sys.path:
     sys.path.insert(0, str(_SDK))
-
-# ---- ultralytics 新旧版本兼容层 ----
-# 上位机旧版 ultralytics 缺少 C3k2 / C3k / C2PSA / PSABlock / Attention，
-# 而 simulation.pt 是用 yolo11 (ultralytics==8.4.92) 训练的。
-# 以下从 yolo11-8.4.92 源码完整回植缺失的 block 类，确保 torch.load 能
-# 反序列化模型且 forward() 推理结果正确。仅当旧版缺少时才注入。
-try:
-    import torch
-    import torch.nn as _nn
-    import ultralytics.nn.modules.block as _block
-    from ultralytics.nn.modules.conv import Conv as _Conv
-    from ultralytics.nn.modules.block import Bottleneck as _Bottleneck
-
-    _injected = []
-
-    # ---- Attention (yolo11-8.4.92 block.py lines 1271-1329) ----
-    if not hasattr(_block, "Attention"):
-
-        class Attention(_nn.Module):
-            def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
-                super().__init__()
-                self.num_heads = num_heads
-                self.head_dim = dim // num_heads
-                self.key_dim = int(self.head_dim * attn_ratio)
-                self.scale = self.key_dim ** -0.5
-                nh_kd = self.key_dim * num_heads
-                h = dim + nh_kd * 2
-                self.qkv = _Conv(dim, h, 1, act=False)
-                self.proj = _Conv(dim, dim, 1, act=False)
-                self.pe = _Conv(dim, dim, 3, 1, g=dim, act=False)
-
-            def forward(self, x):
-                B, C, H, W = x.shape
-                N = H * W
-                qkv = self.qkv(x)
-                q, k, v = qkv.view(
-                    B, self.num_heads, self.key_dim * 2 + self.head_dim, N
-                ).split([self.key_dim, self.key_dim, self.head_dim], dim=2)
-                attn = (q * self.scale).transpose(-2, -1) @ k
-                attn = attn.softmax(dim=-1)
-                x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(
-                    v.reshape(B, C, H, W)
-                )
-                x = self.proj(x)
-                return x
-
-        _block.Attention = Attention
-        _injected.append("Attention")
-
-    # ---- PSABlock (yolo11-8.4.92 block.py lines 1331-1379) ----
-    if not hasattr(_block, "PSABlock"):
-
-        class PSABlock(_nn.Module):
-            def __init__(
-                self, c: int, attn_ratio: float = 0.5,
-                num_heads: int = 4, shortcut: bool = True,
-            ):
-                super().__init__()
-                self.attn = _block.Attention(c, attn_ratio=attn_ratio, num_heads=num_heads)
-                self.ffn = _nn.Sequential(
-                    _Conv(c, c * 2, 1), _Conv(c * 2, c, 1, act=False)
-                )
-                self.add = shortcut
-
-            def forward(self, x):
-                x = x + self.attn(x) if self.add else self.attn(x)
-                x = x + self.ffn(x) if self.add else self.ffn(x)
-                return x
-
-        _block.PSABlock = PSABlock
-        _injected.append("PSABlock")
-
-    # ---- C3k (yolo11-8.4.92 block.py lines 1109-1128) ----
-    if not hasattr(_block, "C3k"):
-
-        class C3k(_block.C3):
-            def __init__(
-                self, c1: int, c2: int, n: int = 1,
-                shortcut: bool = True, g: int = 1, e: float = 0.5, k: int = 3,
-            ):
-                super().__init__(c1, c2, n, shortcut, g, e)
-                c_ = int(c2 * e)
-                self.m = _nn.Sequential(
-                    *(_Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0)
-                      for _ in range(n))
-                )
-
-        _block.C3k = C3k
-        _injected.append("C3k")
-
-    # ---- C3k2 (yolo11-8.4.92 block.py lines 1069-1107) ----
-    if not hasattr(_block, "C3k2"):
-
-        class C3k2(_block.C2f):
-            def __init__(
-                self, c1: int, c2: int, n: int = 1,
-                c3k: bool = False, e: float = 0.5, attn: bool = False,
-                g: int = 1, shortcut: bool = True,
-            ):
-                super().__init__(c1, c2, n, shortcut, g, e)
-                self.m = _nn.ModuleList(
-                    _nn.Sequential(
-                        _Bottleneck(self.c, self.c, shortcut, g),
-                        _block.PSABlock(
-                            self.c, attn_ratio=0.5,
-                            num_heads=max(self.c // 64, 1),
-                        ),
-                    )
-                    if attn
-                    else _block.C3k(self.c, self.c, 2, shortcut, g)
-                    if c3k
-                    else _Bottleneck(self.c, self.c, shortcut, g)
-                    for _ in range(n)
-                )
-
-        _block.C3k2 = C3k2
-        _injected.append("C3k2")
-
-    # ---- C2PSA (yolo11-8.4.92 block.py lines 1436-1489) ----
-    if not hasattr(_block, "C2PSA"):
-
-        class C2PSA(_nn.Module):
-            def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5):
-                super().__init__()
-                assert c1 == c2
-                self.c = int(c1 * e)
-                self.cv1 = _Conv(c1, 2 * self.c, 1, 1)
-                self.cv2 = _Conv(2 * self.c, c1, 1)
-                self.m = _nn.Sequential(
-                    *(_block.PSABlock(
-                        self.c, attn_ratio=0.5, num_heads=self.c // 64,
-                    ) for _ in range(n))
-                )
-
-            def forward(self, x):
-                a, b = self.cv1(x).split((self.c, self.c), dim=1)
-                b = self.m(b)
-                return self.cv2(torch.cat((a, b), 1))
-
-        _block.C2PSA = C2PSA
-        _injected.append("C2PSA")
-
-    print(
-        "[COMPAT] ultralytics backport OK — injected: "
-        + (", ".join(_injected) if _injected else "(all present)")
-    )
-
-except Exception as _patch_err:
-    print(f"[COMPAT] ultralytics patch FAILED: {_patch_err}")
-    import traceback
-
-    traceback.print_exc()
 
 from vision_for_simulation.terrain_ring import (
     TerrainRing,
@@ -228,7 +76,7 @@ def _open_persistent_camera(
 
 
 def run_detection_loop(
-    camera_index: int = 0,
+    camera_index: int = 2,
     freq: float = 10.0,
     confidence_threshold: float = 0.80,
     dist_warn: float = 100.0,
@@ -397,13 +245,13 @@ def run_detection_loop(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="10Hz terrain-ring detection from /dev/video0"
+        description="10Hz terrain-ring detection from /dev/video2"
     )
     parser.add_argument(
         "--camera",
         type=int,
-        default=0,
-        help="Camera index (default: 0 → /dev/video0 on Linux)",
+        default=2,
+        help="Camera index (default: 2 → /dev/video2 on Linux)",
     )
     parser.add_argument(
         "--freq", type=float, default=10.0, help="Detection frequency in Hz (default: 10)"

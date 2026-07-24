@@ -5,9 +5,12 @@
   1. 定点起飞 → Cartographer / TF 就绪
   2. 起飞矩形视觉校准（下视 /dev/video0，检测黑色矩形标记，视觉闭环居中）
   3. 记录校准点为坐标原点
-  4. 按预设航点序列巡航（平滑轨迹），期间 10 Hz 持续检测地形环
-  5. 识别到 debris_flow（泥石流）时打断轨迹 → 悬停 → 降高 → 关泵 → 等 5s
-     → 回升 → 继续航行
+  4. 逐个航点导航（3×5 蛇形，100/170/240 × -40/-110/-180/-250/-320），
+     每到达一个测绘航点记录 YOLO 地形 label 到网格
+  5. 巡航期间 10 Hz 检测地形环。火山(debris_flow)像素距离 < 50px
+     时打断（整次飞行仅触发一次），记录当前最近航点，执行泥石流动作后
+     以 smooth 轨迹接续所有后续航点（不含记录的火山航点），
+     到达后续航点时继续记录 label
   6. 完成全部航点后降落在坐标原点
 
 上位机已自启动 server_ros.py，本程序通过 FC_Client 连接。
@@ -18,7 +21,7 @@ ROS 建图组件启动流程参考 base_test.py 与 former_code/2024_D_24.py。
 import sys
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -47,10 +50,10 @@ CRUISE_HEIGHT = 150          # 巡航高度 cm
 VERTICAL_SPEED = 22          # 垂直速度 cm/s
 
 # 起飞矩形视觉校准参数（与 2022_24.py 一致）
-CALIB_CLOSE_THRESHOLD_PX = 30   # 像素距离阈值：小于此值认为已居中
-CALIB_APPROACH_SPEED = 15       # 逼近速度 cm/s
-CALIB_FREQ = 10                 # 控制循环频率 Hz
-CALIB_TIMEOUT = 60              # 校准超时 / s
+CALIB_CLOSE_THRESHOLD_PX = 30
+CALIB_APPROACH_SPEED = 15
+CALIB_FREQ = 10
+CALIB_TIMEOUT = 60
 
 # 摄像头索引（校准和地形环共用 /dev/video0）
 CAMERA_INDEX = 0
@@ -60,17 +63,20 @@ RING_DETECT_FREQ = 10         # Hz
 
 # YOLO 仿真模型 7 类地形:
 #   0:snow_mountain  1:field  2:river  3:settlements
-#   4:lake           5:debris_flow  6:wildfire
-#
-# 相邻地形在飞机正下方的时间间隔约 3 s，10 Hz 每段可检测约 30 次。
+#   4:lake           5:debris_flow(火山)  6:wildfire
 
-# 地形环触发后冷却时间（避免同一地形重复打断）
-RING_COOLDOWN = 4.0           # s
+# 火山打断像素距离阈值（偏移 < 50px 才触发）
+DEBRIS_FLOW_PX_THRESH = 50    # px
+
+# 测绘网格坐标 → 行列映射
+# 行 (3): x=100→0, x=170→1, x=240→2
+# 列 (5): y=-40→0, y=-110→1, y=-180→2, y=-250→3, y=-320→4
+SURVEY_X_TO_ROW: Dict[int, int] = {100: 0, 170: 1, 240: 2}
+SURVEY_Y_TO_COL: Dict[int, int] = {-40: 0, -110: 1, -180: 2, -250: 3, -320: 4}
 # =================================
 
 
 def _open_persistent_camera(index: int, width: int = 1280, height: int = 720) -> cv2.VideoCapture:
-    """打开摄像头并保持常开，返回 VideoCapture 对象。"""
     if sys.platform.startswith("linux"):
         backends = (cv2.CAP_V4L2, cv2.CAP_ANY)
     elif sys.platform.startswith("win"):
@@ -99,33 +105,21 @@ class SimVisionTask:
         self._camera_index = camera_index
         self._stop_flag = False
 
-    # ------------------------------------------------------------------
-    # 生命周期
-    # ------------------------------------------------------------------
-
     def open(self):
-        """打开摄像头。"""
         if self._cap is None:
             self._cap = _open_persistent_camera(self._camera_index)
             logger.info(f"[VISION] Camera {self._camera_index} opened")
 
     def close(self):
-        """释放摄像头。"""
         if self._cap is not None:
             self._cap.release()
             logger.info(f"[VISION] Camera {self._camera_index} released")
         self._cap = None
 
     def stop(self):
-        """标记停止，后台检测线程应检查此标志。"""
         self._stop_flag = True
 
-    # ------------------------------------------------------------------
-    # 帧读取
-    # ------------------------------------------------------------------
-
     def _read_frame(self) -> Optional[np.ndarray]:
-        """从摄像头读取一帧，失败返回 None。"""
         if self._cap is None:
             return None
         ok, frame = self._cap.read()
@@ -133,15 +127,8 @@ class SimVisionTask:
             return None
         return frame
 
-    # ------------------------------------------------------------------
-    # 检测 API
-    # ------------------------------------------------------------------
-
     def detect_takeoff_offset(self) -> Optional[Tuple[float, float]]:
-        """检测起飞矩形，返回 ``(x_px, y_px)`` 或 None。
-
-        +x = 图像上方（机头前），+y = 图像左侧（机头左）。
-        """
+        """检测起飞矩形，返回 ``(x_px, y_px)`` 或 None。"""
         frame = self._read_frame()
         if frame is None:
             return None
@@ -152,11 +139,7 @@ class SimVisionTask:
         return _center_to_offset(detection.center, (h, w))
 
     def detect_ring_offset(self) -> Optional[Tuple[float, float, str]]:
-        """YOLO 检测最近地形环，返回 ``(x_px, y_px, label)`` 或 None。
-
-        +x = 图像上方（机头前），+y = 图像左侧（机头左）。
-        label 为 YOLO 类别名（如 debris_flow、lake 等）。
-        """
+        """YOLO 检测最近地形环，返回 ``(x_px, y_px, label)`` 或 None。"""
         frame = self._read_frame()
         if frame is None:
             return None
@@ -169,10 +152,11 @@ class SimVisionTask:
 
 
 class Mission(object):
-    """2026 模拟赛 — 空地协同测绘救灾系统 任务类。
+    """2026 模拟赛 — 空地协同测绘救灾系统。
 
-    轨迹巡航期间由后台线程 10 Hz 持续检测地形环。识别到特定地形后通过清除
-    Navigation.traj_running_event 打断轨迹 → 悬停 → 执行动作 → 从剩余轨迹恢复航行。
+    第一段: 逐个航点导航 + 测绘记录，火山 (debris_flow) 像素距离 < 50px 时打断。
+    第二段: 火山动作后以 smooth 轨迹遍历剩余航点，继续记录 label。
+    火山整次飞行最多触发一次。
     """
 
     def __init__(self, *args, **kwargs):
@@ -183,14 +167,25 @@ class Mission(object):
         self.sim_vision: Optional[SimVisionTask] = kwargs.get("sim_vision", None)
         self.cruise_height = CRUISE_HEIGHT
 
-        # 坐标原点（视觉校准后设置，后续所有航点相对此点）
+        # 坐标原点（视觉校准后设置）
         self._origin_x: float = 0.0
         self._origin_y: float = 0.0
 
-        # 地形环打断机制
+        # 3×5 测绘网格
+        self._survey_grid: List[List[Optional[str]]] = [
+            [None, None, None, None, None],
+            [None, None, None, None, None],
+            [None, None, None, None, None],
+        ]
+
+        # 后台检测线程持续更新的最新 label
+        self._latest_ring_label: Optional[str] = None
+
+        # 火山打断 — 单次飞行仅触发一次
+        self._debris_flow_triggered_once: bool = False
+        self._debris_flow_wp_index: int = -1   # 打断时最近航点在 raw_waypoints 中的索引
         self._ring_triggered = threading.Event()
         self._ring_label: str = ""
-        self._ring_cooldown_until: float = 0.0
 
         # 线程控制
         self._stop_ring = threading.Event()
@@ -205,9 +200,6 @@ class Mission(object):
 
     # ================================================================
     #  起飞矩形视觉校准
-    #
-    #  起飞后通过下视摄像头检测黑色矩形起飞标记，以视觉闭环
-    #  将无人机移至标记正上方，消除起飞漂移误差。
     # ================================================================
 
     def _calibrate_to_takeoff_rectangle(
@@ -217,12 +209,6 @@ class Mission(object):
         freq: float = CALIB_FREQ,
         timeout: float = CALIB_TIMEOUT,
     ) -> bool:
-        """视觉闭环校准：将无人机移动到起飞矩形正上方。
-
-        参考 former_code/2022_24.py vision_approach() 的闭环模式。
-        以 freq Hz 循环读取摄像头，检测起飞矩形像素偏移，
-        用 move_by_direction 逼近直到像素距离小于阈值。
-        """
         if self.sim_vision is None:
             logger.error("[CALIB] sim_vision is None")
             return False
@@ -251,145 +237,136 @@ class Mission(object):
 
             if dist_px <= close_threshold_px:
                 self.navi.stop_move()
-                logger.info(
-                    f"[CALIB] Centered "
-                    f"(dist={dist_px:.1f}px, x={x_px:.0f}, y={y_px:.0f})"
-                )
+                logger.info(f"[CALIB] Centered (dist={dist_px:.1f}px)")
                 return True
 
-            # 像素偏移 → 机体系移动方向
-            # +x_px = 图像上方 = 机头前, +y_px = 图像左侧 = 机头左
             angle_deg = float(np.rad2deg(np.arctan2(y_px, x_px)))
-            self.navi.move_by_direction(
-                speed=approach_speed, direction_deg=angle_deg
-            )
+            self.navi.move_by_direction(speed=approach_speed, direction_deg=angle_deg)
             time.sleep(dt)
 
     # ================================================================
     #  地形环后台检测（10 Hz）
-    #
-    #  巡航期间持续运行，识别到地形后通过 traj_running_event 打断轨迹。
     # ================================================================
 
     def _ring_detection_loop(self):
-        """后台 daemon 线程：10 Hz 检测地形环，发现后打断轨迹。
+        """后台 daemon 线程: 10 Hz 检测地形环。
 
-        打断机制:
-          1. 设置 _ring_triggered 事件通知主线程
-          2. 存储 label
-          3. 清除 navi.traj_running_event → _trajectory_task 在下一次
-             内部检查（最迟 0.02 s）时保存剩余轨迹并返回
+        - 始终更新 _latest_ring_label（测绘记录用）
+        - 火山 (debris_flow) 仅在像素距离 < DEBRIS_FLOW_PX_THRESH 且
+          整次飞行未触发过时打断轨迹
         """
         dt = 1.0 / max(RING_DETECT_FREQ, 5)
         logger.info(f"[RING] Loop started ({RING_DETECT_FREQ} Hz)")
 
         while not self._stop_ring.is_set():
-            # 冷却期内跳过
-            if time.perf_counter() < self._ring_cooldown_until:
-                self._stop_ring.wait(dt)
-                continue
-            # 上一次触发还未被主线程处理完
-            if self._ring_triggered.is_set():
-                self._stop_ring.wait(dt)
-                continue
-
             if self.sim_vision is None:
                 break
 
             offset = self.sim_vision.detect_ring_offset()
             if offset is not None:
                 x_px, y_px, label = offset
-                logger.info(
-                    f"[RING] Trigger: label={label}, "
-                    f"offset=({x_px:.1f}, {y_px:.1f})px"
-                )
-                self._ring_label = label
-                self._ring_triggered.set()
-                # 打断轨迹 — Navigation 内部检查此 event
-                self.navi.traj_running_event.clear()
+                self._latest_ring_label = label
+
+                # 火山打断: 像素距离 < 50px 且本轮飞行未触发过
+                if label == "debris_flow" and not self._debris_flow_triggered_once:
+                    dist_px = float(np.hypot(x_px, y_px))
+                    if dist_px < DEBRIS_FLOW_PX_THRESH and not self._ring_triggered.is_set():
+                        logger.info(
+                            f"[RING] debris_flow dist={dist_px:.1f}px < "
+                            f"{DEBRIS_FLOW_PX_THRESH}px → interrupting"
+                        )
+                        self._ring_label = label
+                        self._ring_triggered.set()
+                        self.navi.traj_running_event.clear()
 
             self._stop_ring.wait(dt)
 
         logger.info("[RING] Loop stopped")
 
     # ================================================================
-    #  地形环动作
-    #
-    #  目前仅 debris_flow（泥石流）触发救灾动作，其余地形仅记录。
+    #  测绘网格记录
     # ================================================================
 
-    def _perform_ring_action(self, label: str) -> None:
-        """根据检测到的地形类别执行对应动作。
+    def _record_survey_label(self, rel_x: float, rel_y: float) -> None:
+        x_key = int(round(rel_x))
+        y_key = int(round(rel_y))
+        row = SURVEY_X_TO_ROW.get(x_key)
+        col = SURVEY_Y_TO_COL.get(y_key)
 
-        调用时无人机已通过 stop_move 悬停在当前位置。
-        """
+        if row is None or col is None:
+            logger.warning(
+                f"[SURVEY] ({x_key}, {y_key}) not in grid, skip"
+            )
+            return
+
+        self._survey_grid[row][col] = self._latest_ring_label
         logger.info(
-            f"[ACTION] Ring action for '{label}' "
-            f"at ({self.navi.current_x:.0f}, {self.navi.current_y:.0f})"
+            f"[SURVEY] Grid[{row}][{col}] (x={x_key}, y={y_key})"
+            f" = {self._latest_ring_label}"
         )
+        self._log_survey_grid()
 
-        if label == "debris_flow":
-            # 泥石流: 降高 → 关泵 → 等待 → 回升 → 继续航行
-            self._action_debris_flow()
-        else:
-            logger.info(f"[ACTION] Label '{label}' has no dedicated action, skipping")
-            time.sleep(0.5)
+    def _log_survey_grid(self) -> None:
+        rows = []
+        for r, row in enumerate(self._survey_grid):
+            display = [(lbl if lbl is not None else "?") for lbl in row]
+            rows.append(f"  row[{r}] (x={[100,170,240][r]}): {display}")
+        logger.info(f"[SURVEY] Grid:\n" + "\n".join(rows))
+
+    # ================================================================
+    #  找最近航点
+    # ================================================================
+
+    def _find_nearest_survey_waypoint(
+        self, raw_waypoints: List[Tuple[float, float]]
+    ) -> int:
+        """返回当前相对坐标最近测绘航点（不含降落点）在 raw_waypoints 中的索引。"""
+        rel_x = self.navi.current_x - self._origin_x
+        rel_y = self.navi.current_y - self._origin_y
+        best_idx = -1
+        best_dist2 = float("inf")
+        for i, (wx, wy) in enumerate(raw_waypoints):
+            if wx == 0.0 and wy == 0.0:
+                continue  # 跳过降落点
+            d2 = (rel_x - wx) ** 2 + (rel_y - wy) ** 2
+            if d2 < best_dist2:
+                best_dist2 = d2
+                best_idx = i
+        return best_idx
+
+    # ================================================================
+    #  火山动作
+    # ================================================================
 
     def _action_debris_flow(self) -> None:
-        """泥石流救灾动作序列。
+        """火山救灾动作序列。
 
-        流程: 黄灯 → 降至 90cm → 关水泵(digital output 0) → 等待 5s
-              → 回升至巡航高度 150cm → 绿灯 → 继续航行。
+        黄灯 → 降至 90cm → 关泵 → 等 5s → 回升 150cm → 绿灯。
         """
         fc = self.fc
         navi = self.navi
 
-        logger.info("[ACTION:debris_flow] Starting debris-flow action sequence")
+        logger.info("[ACTION:debris_flow] Start")
 
-        # 1. 指示灯 → 黄色（警告状态）
+        # 1. 黄灯
         fc.set_indicator_led(255, 255, 0)
-        logger.info("[ACTION:debris_flow] Indicator LED → yellow")
-
-        # 2. 降低高度至 90cm（接近地面以便水泵作业）
-        target_low = 90.0
-        logger.info(f"[ACTION:debris_flow] Descending to {target_low}cm")
-        navi.set_height(target_low)
-        height_ok = navi.wait_for_height(
-            time_thres=0.5,
-            height_thres=10,
-            timeout=10,
-        )
-        if not height_ok:
-            logger.warning(
-                f"[ACTION:debris_flow] Height not reached: "
-                f"current={navi.current_height:.1f}cm, target={target_low}cm"
-            )
-
-        # 3. 关闭水泵（数字输出通道 0 → False）
+        # 2. 降至 90cm
+        navi.set_height(90.0)
+        ok = navi.wait_for_height(time_thres=0.5, height_thres=10, timeout=10)
+        if not ok:
+            logger.warning(f"[ACTION:debris_flow] Low height not reached")
+        # 3. 关泵
         fc.set_digital_output(0, False)
-        logger.info("[ACTION:debris_flow] Digital output 0 → OFF (pump stopped)")
-
-        # 4. 在低空等待 5 秒
-        logger.info("[ACTION:debris_flow] Waiting 5s at low altitude")
+        # 4. 等 5s
         time.sleep(5.0)
-
-        # 5. 回升至巡航高度
-        logger.info(f"[ACTION:debris_flow] Ascending to {self.cruise_height}cm")
+        # 5. 回升
         navi.set_height(self.cruise_height)
-        height_ok = navi.wait_for_height(
-            time_thres=0.5,
-            height_thres=10,
-            timeout=10,
-        )
-        if not height_ok:
-            logger.warning(
-                f"[ACTION:debris_flow] Height not reached: "
-                f"current={navi.current_height:.1f}cm, target={self.cruise_height}cm"
-            )
-
-        # 6. 指示灯 → 绿色（恢复正常航行状态）
+        ok = navi.wait_for_height(time_thres=0.5, height_thres=10, timeout=10)
+        if not ok:
+            logger.warning(f"[ACTION:debris_flow] Cruise height not reached")
+        # 6. 绿灯
         fc.set_indicator_led(0, 255, 0)
-        logger.info("[ACTION:debris_flow] Indicator LED → green, action complete")
+        logger.info("[ACTION:debris_flow] Complete")
 
     # ================================================================
     #  平滑轨迹生成
@@ -398,19 +375,16 @@ class Mission(object):
     def _build_smooth_traj(
         self, waypoints: List[Tuple[float, float]]
     ) -> List[Tuple[float, ...]]:
-        """以当前位置为起点，生成经过所有 waypoints 的平滑轨迹。"""
         start_x = float(self.navi.current_x)
         start_y = float(self.navi.current_y)
         start_height = float(self.navi.current_height)
-        trajectory_waypoints = np.vstack(
-            ([[start_x, start_y]], np.asarray(waypoints, dtype=float))
-        )
+        traj_wps = np.vstack(([[start_x, start_y]], np.asarray(waypoints, dtype=float)))
         traj_list = self.navi.create_smooth_traj_list(
-            waypoints=trajectory_waypoints,
+            waypoints=traj_wps,
             altitude=self.cruise_height,
         )
-        first_point = traj_list[0]
-        traj_list[0] = (first_point[0], first_point[1], start_height)
+        fp = traj_list[0]
+        traj_list[0] = (fp[0], fp[1], start_height)
         logger.info(
             f"[TRAJ] {len(traj_list)} points from "
             f"({start_x:.0f}, {start_y:.0f}) through {len(waypoints)} waypoints"
@@ -419,34 +393,42 @@ class Mission(object):
 
     # ================================================================
     #  主任务
-    #
-    #  完整流程:
-    #    起飞 → Cartographer 就绪 → 起飞矩形校准 → 记录原点
-    #    → 生成平滑轨迹 → 启动地形环检测
-    #    → 轨迹巡航（可被地形环打断）→ 降落
     # ================================================================
 
     def run(self):
         fc = self.fc
         navi = self.navi
 
-        # ---- 航点（相对原点，cm，匿名 ROS 坐标系）----
-        raw_waypoints = [
-            (100, -40),
-            (240, -40),
-            (240, -320),
-            (100, -320),
-            (100, -110),
-            (170, -110),
-            (170, -250),
-            (0, 0),
+        # ---- 航点（相对原点，cm）----
+        # 3×5 蛇形扫描:
+        #   x=100: -40 → -110 → -180 → -250 → -320
+        #   x=170: -320 → -250 → -180 → -110 → -40
+        #   x=240: -40 → -110 → -180 → -250 → -320
+        #   终点: (0,0) 降落
+        raw_waypoints: List[Tuple[float, float]] = [
+            (100, -40),    # 0
+            (100, -110),   # 1
+            (100, -180),   # 2
+            (100, -250),   # 3
+            (100, -320),   # 4
+            (170, -320),   # 5
+            (170, -250),   # 6
+            (170, -180),   # 7
+            (170, -110),   # 8
+            (170, -40),    # 9
+            (240, -40),    # 10
+            (240, -110),   # 11
+            (240, -180),   # 12
+            (240, -250),   # 13
+            (240, -320),   # 14
+            (0, 0),        # 15 降落点
         ]
 
         # ---- 导航参数 ----
         navi.set_navigation_speed(CRUISE_SPEED)
         navi.set_vertical_speed(VERTICAL_SPEED)
 
-        # ---- 启动导航（ROS fusion 模式，Cartographer + T265）----
+        # ---- 导航 ----
         navi.start()
         navi.switch_navigation_mode("fusion-ros")
         logger.info("[MISSION] Navigation started (fusion-ros)")
@@ -458,17 +440,16 @@ class Mission(object):
         fc.set_action_log(True)
         logger.info("[MISSION] Mission Started")
 
-        # ---- 定点起飞 ----
+        # ---- 起飞 ----
         logger.info(f"[MISSION] Takeoff to {self.cruise_height}cm")
         navi.pointing_takeoff((0, 0), self.cruise_height)
         navi.set_yaw(0)
         navi.wait_for_yaw()
         time.sleep(0.5)
 
-        # ---- Cartographer 初始化等待 ----
-        # 在线 SLAM 需要一定运动量（起飞 + 漂移）完成首个 Submap。
+        # ---- Cartographer ----
         CART_TIMEOUT = 30.0
-        logger.info(f"[MISSION] Waiting for Cartographer TF ({CART_TIMEOUT}s)...")
+        logger.info(f"[MISSION] Waiting Cartographer TF ({CART_TIMEOUT}s)...")
         t0 = time.perf_counter()
         while True:
             time.sleep(1)
@@ -476,38 +457,30 @@ class Mission(object):
             if navi.current_point[0] + navi.current_point[1] != 0:
                 break
             if time.perf_counter() - t0 > CART_TIMEOUT:
-                raise RuntimeError(
-                    f"Cartographer TF timeout ({CART_TIMEOUT}s)"
-                )
-        logger.info(
-            f"[MISSION] Cartographer TF ok ({time.perf_counter() - t0:.1f}s)"
-        )
+                raise RuntimeError(f"Cartographer TF timeout ({CART_TIMEOUT}s)")
+        logger.info(f"[MISSION] Cartographer TF ok ({time.perf_counter() - t0:.1f}s)")
         fc.set_indicator_led(0, 0, 0)
 
-        # ---- 起飞矩形视觉校准（消除起飞漂移）----
+        # ---- 起飞矩形校准 ----
         if self.sim_vision is not None:
             if not self._calibrate_to_takeoff_rectangle():
                 raise RuntimeError("Takeoff calibration failed")
         else:
             logger.warning("[MISSION] sim_vision unavailable")
 
-        # ---- 记录坐标原点（校准后当前位置即为原点）----
+        # ---- 坐标原点 ----
         self._origin_x = float(navi.current_x)
         self._origin_y = float(navi.current_y)
-        logger.info(
-            f"[MISSION] Origin = ({self._origin_x:.1f}, {self._origin_y:.1f})"
-        )
+        logger.info(f"[MISSION] Origin = ({self._origin_x:.1f}, {self._origin_y:.1f})")
 
-        # ---- 航点坐标变换（相对原点 → 绝对坐标）----
+        # 绝对坐标
         waypoints: List[Tuple[float, float]] = [
-            (x + self._origin_x, y + self._origin_y)
-            for (x, y) in raw_waypoints
+            (x + self._origin_x, y + self._origin_y) for (x, y) in raw_waypoints
         ]
+        survey_waypoints = waypoints[:-1]   # 15 个测绘航点
+        landing_wp = waypoints[-1]           # 降落点
 
-        # ---- 生成平滑轨迹 ----
-        traj_list = self._build_smooth_traj(waypoints)
-
-        # ---- 启动地形环后台检测（10 Hz，巡航期间持续运行）----
+        # ---- 启动地形环后台检测 ----
         if self.sim_vision is not None:
             self._stop_ring.clear()
             self._ring_thread = threading.Thread(
@@ -516,71 +489,122 @@ class Mission(object):
             self._ring_thread.start()
 
         # ============================================================
-        #  轨迹巡航 + 地形环打断循环
+        #  第一段: 逐个航点导航 + 测绘记录
         #
-        #  Navigation._trajectory_task 每 0.02 s 检查 traj_running_event。
-        #  后台线程检测到地形后清除该 event → 轨迹在下一个内部循环
-        #  退出，同时保存剩余轨迹到 traj_list_before_stop。
-        #  主线程据此区分「正常完成」与「打断」，执行动作后重新接续。
+        #  火山打断条件: debis_flow 且距离 < 50px 且本轮未触发过。
+        #  打断后: 记录最近航点 → 执行动作 → 跳转到轨迹接续段。
         # ============================================================
-        while len(traj_list) > 0:
+        debris_flow_hit = False
+        for i, wp in enumerate(survey_waypoints):
+            rel_x = raw_waypoints[i][0]
+            rel_y = raw_waypoints[i][1]
             logger.info(
-                f"[TRAJ] Starting segment: {len(traj_list)} points remaining"
+                f"[MISSION] WP {i+1}/{len(survey_waypoints)}: "
+                f"abs={wp} rel=({rel_x:.0f}, {rel_y:.0f})"
             )
-            success = navi.navigation_follow_trajectory(traj_list)
 
-            if self._ring_triggered.is_set():
-                # ---- 地形环打断 ----
-                label = self._ring_label
-                logger.info(
-                    f"[MISSION] Interrupted by ring: '{label}'"
-                )
-                navi.stop_move()       # 悬停在当前位置
-                time.sleep(0.2)         # 等待悬停稳定
+            while True:
+                success = navi.navigation_to_waypoint(wp)
 
-                self._perform_ring_action(label)
+                if self._ring_triggered.is_set():
+                    # ---- 火山打断 ----
+                    logger.info(f"[MISSION] Interrupted by debris_flow")
+                    navi.stop_move()
+                    time.sleep(0.2)
 
-                # 设置冷却期（避免原地重复触发）
-                self._ring_cooldown_until = time.perf_counter() + RING_COOLDOWN
-                self._ring_triggered.clear()
+                    # 找最近测绘航点
+                    nearest_idx = self._find_nearest_survey_waypoint(raw_waypoints)
+                    self._debris_flow_wp_index = nearest_idx
+                    self._debris_flow_triggered_once = True
+                    logger.info(
+                        f"[MISSION] Nearest survey WP index = {nearest_idx} "
+                        f"({raw_waypoints[nearest_idx]})"
+                    )
 
-                # 从剩余轨迹接续航行
-                traj_list = list(navi.traj_list_before_stop)
-                if len(traj_list) == 0:
-                    logger.info("[TRAJ] No remaining points, mission done")
+                    # 执行火山动作
+                    self._action_debris_flow()
+                    self._ring_triggered.clear()
+                    debris_flow_hit = True
+                    break   # 跳出 while → 跳出 for 进入第二段
+
+                elif not success:
+                    raise RuntimeError(f"Nav to wp {i+1} {wp} failed")
+                else:
+                    self._record_survey_label(rel_x, rel_y)
+                    time.sleep(0.3)
                     break
+
+            if debris_flow_hit:
+                break
+
+        # ============================================================
+        #  第二段: 轨迹接续（仅火山打断后执行）
+        #
+        #  取火山航点之后的所有航点（不含火山航点），生成 smooth 轨迹。
+        #  轨迹 with wait=False + 轮询到达检测 → 每到一个航点记录 label。
+        # ============================================================
+        if debris_flow_hit:
+            resume_start = self._debris_flow_wp_index + 1
+            if resume_start < len(survey_waypoints):
+                resume_abs = waypoints[resume_start:]  # 测绘航点 → … → 降落点
+                raw_resume = raw_waypoints[resume_start:]  # 相对坐标用于记录
                 logger.info(
-                    f"[TRAJ] Resuming: {len(traj_list)} points remaining"
+                    f"[MISSION] Second leg: {len(resume_abs)} waypoints via smooth trajectory, "
+                    f"starting from raw[{resume_start}]={raw_waypoints[resume_start]}"
                 )
 
-            elif not success:
-                # ---- 非打断性失败（pose 过期、超时等）----
-                raise RuntimeError("Navigation trajectory failed unexpectedly")
+                traj_list = self._build_smooth_traj(resume_abs)
 
+                # 异步启动轨迹，主线程轮询到达检测
+                navi.navigation_follow_trajectory(traj_list, wait=False)
+                logger.info("[TRAJ] Second-leg trajectory started (async)")
+
+                next_rec = 0  # raw_resume 中下一个待记录的航点索引
+                wp_arrival_thres2 = 15.0 ** 2  # 到达判定阈值 15cm
+                while next_rec < len(raw_resume):
+                    time.sleep(0.1)
+                    # 检查轨迹是否异常终止
+                    if not navi.traj_running_event.is_set() and navi.traj_progress < 0.99:
+                        logger.warning("[TRAJ] Second-leg trajectory stopped early")
+                        break
+
+                    wx, wy = raw_resume[next_rec]
+                    abs_wx = wx + self._origin_x
+                    abs_wy = wy + self._origin_y
+                    dx = float(navi.current_x) - abs_wx
+                    dy = float(navi.current_y) - abs_wy
+                    if dx * dx + dy * dy <= wp_arrival_thres2:
+                        if (wx, wy) != (0.0, 0.0):
+                            self._record_survey_label(wx, wy)
+                        else:
+                            logger.info("[SURVEY] Reached landing wp, skip grid record")
+                        next_rec += 1
+
+                # 等待轨迹线程完全结束
+                logger.info("[TRAJ] Waiting for second-leg trajectory to finish")
+                navi.traj_running_event.wait()
             else:
-                # ---- 正常完成 ----
-                logger.info("[TRAJ] Segment completed successfully")
-                break
+                logger.info("[MISSION] No remaining waypoints after debris_flow")
 
         # ---- 停止地形环检测 ----
         self._stop_ring.set()
 
-        # ---- 降落在坐标原点 ----
+        # ---- 降落 ----
         logger.info("[MISSION] Landing at origin")
-        navi.pointing_landing((self._origin_x, self._origin_y))
+        navi.pointing_landing(landing_wp)
 
 
 # ================================================================
-#  __main__: 初始化 ROS 组件 → 创建 Mission → 执行任务
+#  __main__
 # ================================================================
 if __name__ == "__main__":
-    # ---- 1. 权限配置 ----
+    # ---- 1. 权限 ----
     rm = RosManager()
     rm.chmod("/dev/ttyUSB0")   # CP2102 雷达
     rm.chmod("/dev/ttyACM0")   # LX 飞控
-    rm.chmod("/dev/video0")    # USB 摄像头（起飞矩形校准 + 地形环检测）
+    rm.chmod("/dev/video0")    # USB 摄像头
 
-    # ---- 2. 启动 ROS 建图组件 ----
+    # ---- 2. ROS 建图 ----
     rm.launch_package("ldlidar_stl_ros2", "ld19.launch.py")
     rm.launch_package("realsense2_camera", "rs_launch.py")
     rm.launch_package("cartographer_ros", "cartographer.launch.py")
@@ -589,57 +613,39 @@ if __name__ == "__main__":
         "0 0 0 0 0 0 camera_pose_frame base_link"
     )
 
-    # ---- 3. 连接飞控（上位机已运行 server_ros.py，使用 FC_Client）----
+    # ---- 3. 飞控 ----
     fc = FC_Client()
     fc.connect()
     time.sleep(0.5)
 
-    # ---- 4. 初始化传感器 ----
+    # ---- 4. 传感器 ----
     t265 = T265("ros")
     t265.start()
-
     radar = LD_Radar()
     radar.start("ros")
-
     screen = UARTScreen(fc)
 
-    # ---- 5. 初始化仿真视觉（/dev/video0 常开）----
+    # ---- 5. 视觉 ----
     sim_vision = SimVisionTask(camera_index=CAMERA_INDEX)
     sim_vision.open()
 
-    # ---- 6. 桥梁层 ----
+    # ---- 6-7. 导航 ----
     mapper = RosMapper()
-
-    # ---- 7. 导航层 ----
-    navi = Navigation(
-        fc=fc,
-        rs=t265,
-        radar=radar,
-        mapper=mapper,
-    )
-
-    # ---- 8. 启动 ROS Python 节点执行器 ----
+    navi = Navigation(fc=fc, rs=t265, radar=radar, mapper=mapper)
     RosNodeRunner().add_nodes().run()
 
-    # ---- 9. 创建 Mission ----
+    # ---- 8. Mission ----
     mission = Mission(
-        fc=fc,
-        rs=t265,
-        radar=radar,
-        navi=navi,
-        sim_vision=sim_vision,
+        fc=fc, rs=t265, radar=radar, navi=navi, sim_vision=sim_vision,
     )
 
     # TODO: 地面站起飞命令等待
-    #   1. fc.set_digital_output(0, True)  — 打开水泵 / 数字输出通道 0
-    #   2. 参考 former_code/2024_D_24.py __main__ 中 FCWirelessTransport /
-    #      start_ground_station / enable_ground_command_reception 的完整流程，
-    #      等待地面站通过飞控 UT2/HC-14 无线链路发送 START_MISSION 命令
-    #   3. 收到 START_MISSION 后等待 5 秒再执行 mission.run()
-    #      (可复用 2024_D_24.py 的 fc.receive_ground_command / accept_ground_command /
-    #       prepare_ground_mission 调用链)
-    #   4. mission.run() 完成后向地面站上报 COMPLETED / FAILED 并 complete/fail
-    #      ground_command
+    #   1. fc.set_digital_output(0, True)  — 打开水泵
+    #   2. 参考 former_code/2024_D_24.py 的 FCWirelessTransport /
+    #      start_ground_station / enable_ground_command_reception 流程，
+    #      等待地面站通过飞控 UT2/HC-14 发送 START_MISSION 命令
+    #   3. 收到命令后等 5s 再 mission.run()
+    #   4. 完成后上报 COMPLETED / FAILED
 
     try:
         mission.run()
