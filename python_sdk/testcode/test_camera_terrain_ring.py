@@ -25,6 +25,7 @@ test_camera_terrain_ring.py
 """
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -90,13 +91,20 @@ def run_detection_loop(
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[CAM] /dev/video{camera_index} opened: {actual_w}x{actual_h}")
-    print(f"[CFG] detection @ {freq} Hz, conf >= {confidence_threshold}, dist_warn < {dist_warn}px")
-    print(f"[CTRL] Press q or ESC to quit\n")
 
-    window_name = "terrain_ring_detection"
+    # 无桌面环境时自动关闭预览窗口（避免 Qt/X11 报错）
+    if show_display and not os.environ.get("DISPLAY"):
+        print("[DISP] No DISPLAY detected, automatically switching to headless mode")
+        show_display = False
+    print(f"[CFG] detection @ {freq} Hz, conf >= {confidence_threshold}, dist_warn < {dist_warn}px")
+    print(
+        f"[CTRL] Preview: {'ON' if show_display else 'OFF (headless)'}  |  "
+        "Press Ctrl+C to quit\n"
+    )
+
     if show_display:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 960, 540)
+        cv2.namedWindow("terrain_ring_detection", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("terrain_ring_detection", 960, 540)
 
     frame_count = 0
     detect_count = 0
@@ -197,7 +205,7 @@ def run_detection_loop(
                     1,
                     cv2.LINE_AA,
                 )
-                cv2.imshow(window_name, display_frame)
+                cv2.imshow("terrain_ring_detection", display_frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
