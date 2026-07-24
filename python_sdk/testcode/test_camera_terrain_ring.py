@@ -292,23 +292,22 @@ def run_detection_loop(
                     detection.center, (frame_h, frame_w)
                 )
                 now = time.perf_counter()
-                # 每 10 次检测输出一次汇总，避免刷屏
-                if now - t_last_print >= 1.0 or detect_count == 1:
-                    t_last_print = now
-                    elapsed = now - t_start
+                # 检测到目标时每帧都打印（不节流），避免漏报
+                t_last_print = now
+                elapsed = now - t_start
+                print(
+                    f"[{elapsed:6.1f}s] #{detect_count:4d}  "
+                    f"class={detection.class_name:<16s}  "
+                    f"conf={detection.confidence:.3f}  "
+                    f"center=({detection.center[0]:6.1f}, {detection.center[1]:6.1f})px  "
+                    f"offset=(x={offset_x:+7.1f}, y={offset_y:+7.1f})px  "
+                    f"像素距离={detection.distance_to_image_center:.1f}px"
+                )
+                if detection.distance_to_image_center < dist_warn:
                     print(
-                        f"[{elapsed:6.1f}s] #{detect_count:4d}  "
-                        f"class={detection.class_name:<16s}  "
-                        f"conf={detection.confidence:.3f}  "
-                        f"center=({detection.center[0]:6.1f}, {detection.center[1]:6.1f})px  "
-                        f"offset=(x={offset_x:+7.1f}, y={offset_y:+7.1f})px  "
-                        f"像素距离={detection.distance_to_image_center:.1f}px"
+                        f"  ⚠ WARN: 像素距离 {detection.distance_to_image_center:.1f}px "
+                        f"低于阈值 {dist_warn:.0f}px —— 地形环过近！"
                     )
-                    if detection.distance_to_image_center < dist_warn:
-                        print(
-                            f"  ⚠ WARN: 像素距离 {detection.distance_to_image_center:.1f}px "
-                            f"低于阈值 {dist_warn:.0f}px —— 地形环过近！"
-                        )
             else:
                 now = time.perf_counter()
                 if now - t_last_print >= 2.0:
