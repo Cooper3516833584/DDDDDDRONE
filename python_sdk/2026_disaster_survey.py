@@ -586,6 +586,12 @@ class Mission(object):
             else:
                 logger.info("[MISSION] No remaining waypoints after debris_flow")
 
+        # ---- 打印最终测绘网格 ----
+        logger.info("=" * 50)
+        logger.info("[MISSION] === Final Survey Grid ===")
+        self._log_survey_grid()
+        logger.info("=" * 50)
+
         # ---- 停止地形环检测 ----
         self._stop_ring.set()
 
