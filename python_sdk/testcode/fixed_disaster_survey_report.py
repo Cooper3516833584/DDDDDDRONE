@@ -93,6 +93,18 @@ def main(argv=None) -> int:
 
     fc = FC_Client()
     node = None
+    survey_requests = 0
+    survey_lock = threading.Lock()
+
+    def provide_survey():
+        nonlocal survey_requests
+        with survey_lock:
+            survey_requests += 1
+            count = survey_requests
+        if count == 1 or count % 10 == 0:
+            print("FleetBus survey requests served: {}".format(count), flush=True)
+        return survey
+
     try:
         fc.connect(args.host, args.port)
         node = attach_air_fleet_node(
@@ -100,7 +112,7 @@ def main(argv=None) -> int:
             UnavailableNavigation(),
             stop_event,
             readonly=True,
-            survey_provider=lambda: survey,
+            survey_provider=provide_survey,
         )
         print(
             "FleetBus survey active: water=({}, {}) fire=({}, {}) duration={}s".format(
