@@ -16,11 +16,13 @@ from fleet_bus.models import (
     NodeFlags,
     NodeId,
     NodeTiming,
+    SurveyState,
 )
 from fleet_bus.pose_provider import NavigationAirStateProvider
 from fleet_bus.protocol import (
     decode_ack,
     decode_report,
+    decode_survey_report,
     encode_command,
     encode_drone_goto,
     pack_frame,
@@ -199,6 +201,55 @@ class AirFleetNodeTests(unittest.TestCase):
         ack = decode_ack(unpack_frame(self.transport.writes[0]).payload)
         self.assertEqual(AckStatus.REJECTED, ack.status)
         self.assertEqual(AckReason.UNSUPPORTED, ack.reason)
+
+        self.node.feed_bytes(
+            request(6, CommandPayload(CommandId.TARGETED_STOP))
+        )
+        self.wait_for_writes(2)
+        stop_ack = decode_ack(unpack_frame(self.transport.writes[1]).payload)
+        self.assertEqual(AckStatus.COMPLETED, stop_ack.status)
+        self.assertTrue(self.flight_stop.is_set())
+
+    def test_survey_request_returns_task_snapshot(self):
+        self.node.close()
+        self.transport = FakeTransport()
+        terrain = (1,) * 14 + (7,)
+        self.node = AirFleetNode(
+            self.transport,
+            lambda: self.state,
+            self.commands,
+            self.flight_stop,
+            NodeTiming(turnaround_s=0),
+            survey_provider=lambda: SurveyState(
+                survey_revision=9,
+                survey_flags=1,
+                wildfire_event_id=3,
+                wildfire_row=2,
+                wildfire_col=4,
+                terrain_codes=terrain,
+            ),
+        )
+        self.node.start()
+        self.node.feed_bytes(
+            pack_frame(
+                Frame(
+                    1, NodeId.GROUND, NodeId.DRONE,
+                    MessageKind.SURVEY_REQUEST, 0, 10, 12, b"",
+                )
+            )
+        )
+        self.wait_for_writes(1)
+        survey = decode_survey_report(
+            unpack_frame(self.transport.writes[0]).payload
+        )
+        self.assertEqual((10, 12, 9, 3, 2, 4), (
+            survey.request_session,
+            survey.request_seq,
+            survey.survey_revision,
+            survey.wildfire_event_id,
+            survey.wildfire_row,
+            survey.wildfire_col,
+        ))
 
 
 class PoseProviderTests(unittest.TestCase):

@@ -18,6 +18,8 @@ from .models import (
     NodeId,
     NodeTiming,
     ReportPayload,
+    SurveyReportPayload,
+    SurveyState,
 )
 from .protocol import (
     FrameParser,
@@ -27,6 +29,7 @@ from .protocol import (
     decode_drone_goto,
     encode_ack,
     encode_report,
+    encode_survey_report,
     new_session,
     pack_frame,
 )
@@ -43,6 +46,7 @@ class AirFleetNode:
         stop_event: threading.Event,
         timing: NodeTiming = NodeTiming(),
         readonly: bool = False,
+        survey_provider: Optional[Callable[[], SurveyState]] = None,
         wait: Callable[[float], None] = time.sleep,
     ) -> None:
         self._transport = transport
@@ -51,6 +55,7 @@ class AirFleetNode:
         self._flight_stop_event = stop_event
         self._timing = timing
         self._readonly = readonly
+        self._survey_provider = survey_provider
         self._wait = wait
         self._parser = FrameParser(int(NodeId.DRONE))
         self._inbox = queue.Queue(timing.queue_size)
@@ -115,6 +120,8 @@ class AirFleetNode:
             return cached
         if frame.kind == int(MessageKind.POLL):
             response = self._report(frame)
+        elif frame.kind == int(MessageKind.SURVEY_REQUEST):
+            response = self._survey_report(frame)
         elif frame.kind == int(MessageKind.COMMAND):
             response = self._command(frame)
         else:
@@ -148,6 +155,25 @@ class AirFleetNode:
         )
         return self._response(request, MessageKind.REPORT, payload)
 
+    def _survey_report(self, request: Frame) -> bytes:
+        state = SurveyState() if self._survey_provider is None else self._survey_provider()
+        payload = encode_survey_report(
+            SurveyReportPayload(
+                request.session,
+                request.seq,
+                state.survey_revision,
+                state.survey_flags,
+                state.wildfire_event_id,
+                state.wildfire_row,
+                state.wildfire_col,
+                state.debris_event_id,
+                state.debris_row,
+                state.debris_col,
+                state.terrain_codes,
+            )
+        )
+        return self._response(request, MessageKind.SURVEY_REPORT, payload)
+
     def _command(self, request: Frame) -> bytes:
         try:
             command = decode_command(request.payload)
@@ -159,6 +185,15 @@ class AirFleetNode:
             )
 
         if command.command_id == int(CommandId.PING):
+            return self._ack(
+                request, command.command_id, AckStatus.COMPLETED, AckReason.NONE
+            )
+
+        if (
+            self._readonly
+            and command.command_id == int(CommandId.TARGETED_STOP)
+        ):
+            self._flight_stop_event.set()
             return self._ack(
                 request, command.command_id, AckStatus.COMPLETED, AckReason.NONE
             )
@@ -248,6 +283,7 @@ def attach_air_fleet_node(
     navigation: object,
     stop_event: threading.Event,
     readonly: bool = False,
+    survey_provider: Optional[Callable[[], SurveyState]] = None,
 ) -> AirFleetNode:
     """Create the one FCWirelessTransport callback owner for FleetBus mode."""
     from FlightController.Components.GroundStationLink.transport import (
@@ -267,6 +303,7 @@ def attach_air_fleet_node(
         commands,
         stop_event,
         readonly=readonly,
+        survey_provider=survey_provider,
     )
     holder["node"] = node
     node.start()

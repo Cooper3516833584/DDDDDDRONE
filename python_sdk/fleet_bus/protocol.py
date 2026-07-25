@@ -10,6 +10,7 @@ from .models import (
     CarNavigateCommand,
     CommandPayload,
     CoordinateFrameCommand,
+    DisasterRescueCommand,
     DroneGotoCommand,
     Frame,
     GoalFlags,
@@ -18,6 +19,7 @@ from .models import (
     PathReportPayload,
     PollPayload,
     ReportPayload,
+    SurveyReportPayload,
 )
 
 
@@ -38,6 +40,9 @@ DRONE_GOTO = struct.Struct("<Biii")
 HEADING = struct.Struct("<H")
 POINT_REPORT_HEADER = struct.Struct("<IHIB")
 POINT = struct.Struct("<ii")
+SURVEY_REPORT_HEADER = struct.Struct("<IHHBHBBHBB")
+DISASTER_RESCUE_HEADER = struct.Struct("<HBB")
+SURVEY_CELL_COUNT = 15
 
 FIXED_HEADER_LEN = HEADER.size
 FRAME_OVERHEAD = FIXED_HEADER_LEN + CRC.size + len(TAIL)
@@ -443,6 +448,65 @@ def decode_drone_goto(data: bytes) -> DroneGotoCommand:
         heading = HEADING.unpack_from(data, DRONE_GOTO.size)[0]
         _require_heading(heading)
     return DroneGotoCommand(x_cm, y_cm, z_cm, heading)
+
+
+def _encode_terrain_codes(terrain_codes: Tuple[int, ...]) -> bytes:
+    if len(terrain_codes) != SURVEY_CELL_COUNT:
+        raise ProtocolError("payload", "terrain grid must contain 15 cells")
+    return bytes(_require_range("terrain_code", value, 0, 7) for value in terrain_codes)
+
+
+def encode_disaster_rescue(command: DisasterRescueCommand) -> bytes:
+    return DISASTER_RESCUE_HEADER.pack(
+        _require_range("event_id", command.event_id, 1, 0xFFFF),
+        _require_range("wildfire_row", command.wildfire_row, 0, 2),
+        _require_range("wildfire_col", command.wildfire_col, 0, 4),
+    ) + _encode_terrain_codes(command.terrain_codes)
+
+
+def decode_disaster_rescue(data: bytes) -> DisasterRescueCommand:
+    expected = DISASTER_RESCUE_HEADER.size + SURVEY_CELL_COUNT
+    if len(data) != expected:
+        raise ProtocolError("payload", "CAR_DISASTER_RESCUE body has invalid length")
+    event_id, row, col = DISASTER_RESCUE_HEADER.unpack_from(data)
+    if row > 2 or col > 4:
+        raise ProtocolError("payload", "wildfire cell is outside the 3x5 survey grid")
+    return DisasterRescueCommand(event_id, row, col, tuple(data[DISASTER_RESCUE_HEADER.size:]))
+
+
+def encode_survey_report(payload: SurveyReportPayload) -> bytes:
+    for name, event_id, row, col in (
+        ("wildfire", payload.wildfire_event_id, payload.wildfire_row, payload.wildfire_col),
+        ("debris", payload.debris_event_id, payload.debris_row, payload.debris_col),
+    ):
+        _require_u16(name + "_event_id", event_id)
+        if event_id:
+            _require_range(name + "_row", row, 0, 2)
+            _require_range(name + "_col", col, 0, 4)
+        elif row != 0xFF or col != 0xFF:
+            raise ProtocolError("payload", name + " event cell must be 255 when absent")
+    return SURVEY_REPORT_HEADER.pack(
+        _require_u32("request_session", payload.request_session),
+        _require_u16("request_seq", payload.request_seq),
+        _require_u16("survey_revision", payload.survey_revision),
+        _require_u8("survey_flags", payload.survey_flags),
+        payload.wildfire_event_id,
+        payload.wildfire_row,
+        payload.wildfire_col,
+        payload.debris_event_id,
+        payload.debris_row,
+        payload.debris_col,
+    ) + _encode_terrain_codes(payload.terrain_codes)
+
+
+def decode_survey_report(data: bytes) -> SurveyReportPayload:
+    expected = SURVEY_REPORT_HEADER.size + SURVEY_CELL_COUNT
+    if len(data) != expected:
+        raise ProtocolError("payload", "SURVEY_REPORT payload has invalid length")
+    values = SURVEY_REPORT_HEADER.unpack_from(data)
+    payload = SurveyReportPayload(*values, tuple(data[SURVEY_REPORT_HEADER.size:]))
+    encode_survey_report(payload)
+    return payload
 
 
 def _encode_point_report(
