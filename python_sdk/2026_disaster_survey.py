@@ -21,7 +21,7 @@ ROS 建图组件启动流程参考 base_test.py 与 former_code/2024_D_24.py。
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -57,8 +57,12 @@ CALIB_APPROACH_SPEED = 15
 CALIB_FREQ = 10
 CALIB_TIMEOUT = 60
 
-# 摄像头索引（校准和地形环共用 /dev/video0）
-CAMERA_INDEX = 0
+# 摄像头（Sonix 0c45:636b, /dev/video2）
+# 如需防枚举变化可创建 udev 规则:
+#   SUBSYSTEM=="video4linux", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="636b",
+#   KERNEL=="video2", SYMLINK+="video_survey"
+# 然后将 CAMERA_INDEX 改为 "/dev/video_survey" 即可
+CAMERA_INDEX: "Union[int, str]" = 2
 
 # 地形环检测频率
 RING_DETECT_FREQ = 10         # Hz
@@ -318,17 +322,17 @@ class Mission(object):
     # ================================================================
 
     def _record_survey_label(
-        self, rel_x: float, rel_y: float, label: Optional[str] = None
+        self, rel_x: float, rel_y: float, label: Optional[str] = None,
+        sample_count: int = 0,
     ) -> None:
+        """将指定 label 记录到测绘网格。未提供 label 时使用 _latest_ring_label。"""
         x_key = int(round(rel_x))
         y_key = int(round(rel_y))
         row = SURVEY_X_TO_ROW.get(x_key)
         col = SURVEY_Y_TO_COL.get(y_key)
 
         if row is None or col is None:
-            logger.warning(
-                f"[SURVEY] ({x_key}, {y_key}) not in grid, skip"
-            )
+            logger.warning(f"[SURVEY] ({x_key}, {y_key}) not in grid, skip")
             return
 
         new_wildfire = False
@@ -356,9 +360,10 @@ class Mission(object):
                 else:
                     self._debris_event = (event_id, row, col)
                 self._survey_revision = (self._survey_revision + 1) & 0xFFFF
+        extra = f" (from {sample_count} samples)" if sample_count > 0 else ""
         logger.info(
             f"[SURVEY] Grid[{row}][{col}] (x={x_key}, y={y_key})"
-            f" = {selected_label}"
+            f" = {selected_label}{extra}"
         )
         if new_wildfire:
             threading.Thread(
@@ -597,59 +602,115 @@ class Mission(object):
             self._ring_thread.start()
 
         # ============================================================
-        #  第一段: 逐个航点导航 + 测绘记录
+        #  第一段: 平滑轨迹巡航 + 航点测绘记录
         #
-        #  泥石流打断条件: debis_flow 且距离 < 50px 且本轮未触发过。
-        #  打断后: 记录最近航点 → 执行动作 → 跳转到轨迹接续段。
+        #  以当前位置为起点，生成一条经过所有航点（含降落点）的
+        #  整体平滑轨迹，异步执行。主线程 50 Hz 轮询当前位置，
+        #  对每个测绘航点在 10 cm 半径内收集 label，离开时取众数记录。
+        #
+        #  泥石流打断条件同前: debis_flow 距离 < 50px 且本轮未触发过。
+        #  打断后: navi.traj_running_event.clear() 停止轨迹，
+        #          记录最近航点 → 执行动作 → 跳转到第二段接续。
         # ============================================================
+        # 构造完整轨迹（测绘航点 + 降落点），起点为当前位置
+        traj_list = self._build_smooth_traj(waypoints)
+
+        # 启动异步轨迹
+        navi.navigation_follow_trajectory(traj_list, wait=False)
+        logger.info(f"[TRAJ] First-leg trajectory started (async), {len(traj_list)} pts")
+
+        # 每航点 label 缓冲区
+        wp_label_bufs: List[List[str]] = [[] for _ in range(len(survey_waypoints))]
+        wp_recorded = [False] * len(survey_waypoints)
+        wp_entry_radius2 = 10.0 ** 2   # 进入 10 cm 半径开始收集
+        wp_exit_radius2 = 18.0 ** 2    # 离开 18 cm 半径停止收集（迟滞防抖）
+        next_wp = 0
+        within_wp = False
         debris_flow_hit = False
-        for i, wp in enumerate(survey_waypoints):
-            rel_x = raw_waypoints[i][0]
-            rel_y = raw_waypoints[i][1]
-            logger.info(
-                f"[MISSION] WP {i+1}/{len(survey_waypoints)}: "
-                f"abs={wp} rel=({rel_x:.0f}, {rel_y:.0f})"
-            )
 
-            while True:
-                success = navi.navigation_to_waypoint(wp)
+        while next_wp < len(survey_waypoints):
+            time.sleep(0.02)  # 50 Hz
 
-                if self._ring_triggered.is_set():
-                    # ---- 泥石流打断 ----
-                    logger.info(f"[MISSION] Interrupted by debris_flow")
-                    navi.stop_move()
-                    time.sleep(0.2)
+            # 泥石流打断
+            if self._ring_triggered.is_set():
+                logger.info("[MISSION] Interrupted by debris_flow")
+                navi.stop_move()
+                time.sleep(0.2)
 
-                    # 找最近测绘航点
-                    nearest_idx = self._find_nearest_survey_waypoint(raw_waypoints)
-                    self._debris_flow_wp_index = nearest_idx
-                    self._debris_flow_triggered_once = True
-                    logger.info(
-                        f"[MISSION] Nearest survey WP index = {nearest_idx} "
-                        f"({raw_waypoints[nearest_idx]})"
-                    )
+                # 若正处在航点收集区内，先记录该航点再打断
+                if within_wp and not wp_recorded[next_wp]:
+                    buf = wp_label_bufs[next_wp]
+                    if buf:
+                        mode_label = max(set(buf), key=buf.count)
+                    else:
+                        mode_label = self._latest_ring_label
+                    wx, wy = raw_waypoints[next_wp]
+                    self._record_survey_label(wx, wy, label=mode_label, sample_count=len(buf))
+                    wp_recorded[next_wp] = True
+                    next_wp += 1
 
-                    debris_x, debris_y = raw_waypoints[nearest_idx]
-                    self._record_survey_label(
-                        debris_x, debris_y, label="debris_flow"
-                    )
-
-                    # 执行泥石流动作
-                    self._flash_indicator((255, 255, 0))
-                    self._action_debris_flow()
-                    self._ring_triggered.clear()
-                    debris_flow_hit = True
-                    break   # 跳出 while → 跳出 for 进入第二段
-
-                elif not success:
-                    raise RuntimeError(f"Nav to wp {i+1} {wp} failed")
-                else:
-                    self._record_survey_label(rel_x, rel_y)
-                    time.sleep(0.3)
-                    break
-
-            if debris_flow_hit:
+                nearest_idx = self._find_nearest_survey_waypoint(raw_waypoints)
+                self._debris_flow_wp_index = nearest_idx
+                self._debris_flow_triggered_once = True
+                logger.info(
+                    f"[MISSION] Nearest survey WP index = {nearest_idx} "
+                    f"({raw_waypoints[nearest_idx]})"
+                )
+                debris_x, debris_y = raw_waypoints[nearest_idx]
+                self._record_survey_label(
+                    debris_x, debris_y, label="debris_flow"
+                )
+                self._flash_indicator((255, 255, 0))
+                self._action_debris_flow()
+                self._ring_triggered.clear()
+                debris_flow_hit = True
                 break
+
+            # 轨迹异常终止
+            if not navi.traj_running_event.is_set() and navi.traj_progress < 0.99:
+                logger.warning("[TRAJ] First-leg trajectory stopped early")
+                break
+
+            wx, wy = raw_waypoints[next_wp]
+            abs_wx = wx + self._origin_x
+            abs_wy = wy + self._origin_y
+            dx = float(navi.current_x) - abs_wx
+            dy = float(navi.current_y) - abs_wy
+            dist2 = dx * dx + dy * dy
+
+            if not within_wp:
+                # 进入航点收集区
+                if dist2 <= wp_entry_radius2:
+                    within_wp = True
+                    wp_label_bufs[next_wp].clear()
+                    logger.debug(
+                        f"[POLL] Entered zone of WP {next_wp} "
+                        f"({wx:.0f}, {wy:.0f})"
+                    )
+            else:
+                # 在收集区内: 持续采集 label
+                if self._latest_ring_label is not None:
+                    wp_label_bufs[next_wp].append(self._latest_ring_label)
+                # 离开收集区: 取众数记录
+                if dist2 > wp_exit_radius2:
+                    buf = wp_label_bufs[next_wp]
+                    if buf:
+                        mode_label = max(set(buf), key=buf.count)
+                    else:
+                        mode_label = self._latest_ring_label
+                    logger.debug(
+                        f"[POLL] Left zone of WP {next_wp}, "
+                        f"mode='{mode_label}' from {len(buf)} samples"
+                    )
+                    self._record_survey_label(wx, wy, label=mode_label, sample_count=len(buf))
+                    wp_recorded[next_wp] = True
+                    next_wp += 1
+                    within_wp = False
+
+        # 收尾: 轨迹线程可能仍在运行，等待完成
+        if not debris_flow_hit:
+            logger.info("[TRAJ] First-leg trajectory complete")
+            navi.traj_running_event.wait()
 
         # ============================================================
         #  第二段: 轨迹接续（仅泥石流打断后执行）
