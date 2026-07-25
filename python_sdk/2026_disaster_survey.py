@@ -17,10 +17,15 @@
 ROS 建图组件启动流程参考 base_test.py 与 former_code/2024_D_24.py。
 视觉闭环校准流程参考 former_code/2022_24.py 的 vision_approach 模式。
 地形检测使用 vision_for_simulation 仿真视觉包（YOLO + 传统图像处理）。
+
+视觉日志: python_sdk/vision_for_simulation/ring_detection_*.log
+每帧检测结果、航点出入事件均以时间戳记录，无需设置环境变量。
 """
+import os
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
@@ -123,6 +128,28 @@ class SimVisionTask:
     def stop(self):
         self._stop_flag = True
 
+    def flush_frames(self) -> None:
+        """丢弃摄像头缓冲区中的旧帧。
+
+        持续读帧直到 cv2.CAP_PROP_POS_MSEC 时间戳接近当前时间
+        或达到 max_count 上限，确保后续 read() 获取实时画面。
+        """
+        if self._cap is None:
+            return
+        t_now = time.perf_counter()
+        max_count = 200
+        for n in range(max_count):
+            ok, _ = self._cap.read()
+            if not ok:
+                break
+            # V4L2 时间戳: 帧被驱动捕获的绝对时间 (s)
+            frame_ts = self._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            age = t_now - frame_ts
+            if 0.0 <= age < 0.15:  # 帧年龄 < 150ms → 已是实时画面
+                logger.debug(f"[VISION] Flushed {n + 1} frames, last age={age:.2f}s")
+                return
+        logger.debug(f"[VISION] Flushed {max_count} frames, may still be stale")
+
     def _read_frame(self) -> Optional[np.ndarray]:
         if self._cap is None:
             return None
@@ -163,6 +190,11 @@ class Mission(object):
     泥石流整次飞行最多触发一次。
     """
 
+    _VISION_LOG_DIR = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "vision_for_simulation",
+    )
+
     def __init__(self, *args, **kwargs):
         self.fc: FC_Like = kwargs["fc"]
         self.navi: Navigation = kwargs["navi"]
@@ -187,7 +219,7 @@ class Mission(object):
 
         # 泥石流打断 — 单次飞行仅触发一次
         self._debris_flow_triggered_once: bool = False
-        self._debris_flow_wp_index: int = -1   # 打断时最近航点在 raw_waypoints 中的索引
+        self._debris_flow_wp_index: int = -1
         self._ring_triggered = threading.Event()
         self._ring_label: str = ""
 
@@ -195,11 +227,38 @@ class Mission(object):
         self._stop_ring = threading.Event()
         self._ring_thread: Optional[threading.Thread] = None
 
+        # 视觉专用日志文件（独立于 loguru，无需改环境变量）
+        os.makedirs(self._VISION_LOG_DIR, exist_ok=True)
+        self._vision_log_path = os.path.join(
+            self._VISION_LOG_DIR,
+            f"ring_detection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+        )
+        self._vision_log_file = None  # TextIO | None, opened lazily by _tvlog
+        self._vision_log_lock = threading.Lock()
+
+    def _tvlog(self, msg: str) -> None:
+        """写入视觉专用日志文件（带毫秒时间戳，线程安全）。"""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        line = f"{ts} {msg}\n"
+        with self._vision_log_lock:
+            if self._vision_log_file is None:
+                self._vision_log_file = open(self._vision_log_path, "a", encoding="utf-8")
+            self._vision_log_file.write(line)
+            self._vision_log_file.flush()
+
+    def _tvlog_close(self) -> None:
+        """关闭视觉日志文件。"""
+        with self._vision_log_lock:
+            if self._vision_log_file is not None:
+                self._vision_log_file.close()
+                self._vision_log_file = None
+
     def stop(self):
         self._stop_ring.set()
         if self.sim_vision is not None:
             self.sim_vision.stop()
         self.navi.stop()
+        self._tvlog_close()
         logger.info("[MISSION] Mission stopped")
 
     # ================================================================
@@ -232,17 +291,12 @@ class Mission(object):
 
             offset = self.sim_vision.detect_takeoff_offset()
             if offset is None:
-                logger.debug("[CALIB] No rectangle detected this frame")
                 self.navi.stop_move()
                 time.sleep(dt)
                 continue
 
             x_px, y_px = offset
             dist_px = float(np.hypot(x_px, y_px))
-            logger.debug(
-                f"[CALIB] rect offset=(x={x_px:.0f}, y={y_px:.0f})px, "
-                f"dist={dist_px:.1f}px"
-            )
 
             if dist_px <= close_threshold_px:
                 self.navi.stop_move()
@@ -256,6 +310,22 @@ class Mission(object):
     # ================================================================
     #  地形环后台检测（10 Hz）
     # ================================================================
+
+    def _start_ring_detection(self) -> None:
+        """启动地形环后台检测线程并 flush 摄像头缓冲区。
+
+        延迟到进入第一个测绘航点后才启动，避免起飞→校准→巡航过渡期
+        摄像头无人读取导致积压。
+        """
+        if self.sim_vision is None:
+            return
+        self.sim_vision.flush_frames()
+        self._stop_ring.clear()
+        self._ring_thread = threading.Thread(
+            target=self._ring_detection_loop, daemon=True
+        )
+        self._ring_thread.start()
+        logger.info("[RING] Detection thread started (deferred)")
 
     def _ring_detection_loop(self):
         """后台 daemon 线程: 10 Hz 检测地形环。
@@ -274,9 +344,8 @@ class Mission(object):
             offset = self.sim_vision.detect_ring_offset()
             if offset is not None:
                 x_px, y_px, label = offset
-                logger.debug(
-                    f"[RING] frame: label={label}, "
-                    f"offset=(x={x_px:.0f}, y={y_px:.0f})px"
+                self._tvlog(
+                    f"RING frame: label={label} offset=(x={x_px:.0f}, y={y_px:.0f})px"
                 )
                 self._latest_ring_label = label
 
@@ -292,7 +361,7 @@ class Mission(object):
                         self._ring_triggered.set()
                         self.navi.traj_running_event.clear()
             else:
-                logger.debug("[RING] No ring detected this frame")
+                self._tvlog("RING frame: (none)")
 
             self._stop_ring.wait(dt)
 
@@ -500,14 +569,6 @@ class Mission(object):
         survey_waypoints = waypoints[:-1]   # 15 个测绘航点
         landing_wp = waypoints[-1]           # 降落点
 
-        # ---- 启动地形环后台检测 ----
-        if self.sim_vision is not None:
-            self._stop_ring.clear()
-            self._ring_thread = threading.Thread(
-                target=self._ring_detection_loop, daemon=True
-            )
-            self._ring_thread.start()
-
         # ============================================================
         #  第一段: 平滑轨迹巡航 + 航点测绘记录
         #
@@ -585,25 +646,23 @@ class Mission(object):
                 if dist2 <= wp_entry_radius2:
                     within_wp = True
                     wp_label_bufs[next_wp].clear()
-                    logger.debug(
-                        f"[POLL] Entered zone of WP {next_wp} "
-                        f"({wx:.0f}, {wy:.0f})"
-                    )
+                    self._tvlog(f"WP {next_wp} ENTER zone ({wx:.0f}, {wy:.0f})")
+
+                    # 进入第一个航点时启动地形环后台检测
+                    if next_wp == 0 and self._ring_thread is None:
+                        self._start_ring_detection()
             else:
                 # 在收集区内: 持续采集 label
                 if self._latest_ring_label is not None:
                     wp_label_bufs[next_wp].append(self._latest_ring_label)
                 # 离开收集区: 取众数记录
                 if dist2 > wp_exit_radius2:
+                    self._tvlog(f"WP {next_wp} EXIT zone ({wx:.0f}, {wy:.0f})")
                     buf = wp_label_bufs[next_wp]
                     if buf:
                         mode_label = max(set(buf), key=buf.count)
                     else:
                         mode_label = self._latest_ring_label
-                    logger.debug(
-                        f"[POLL] Left zone of WP {next_wp}, "
-                        f"mode='{mode_label}' from {len(buf)} samples"
-                    )
                     self._record_survey_label(wx, wy, label=mode_label, sample_count=len(buf))
                     wp_recorded[next_wp] = True
                     next_wp += 1
