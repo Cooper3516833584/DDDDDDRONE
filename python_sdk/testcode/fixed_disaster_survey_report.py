@@ -6,9 +6,13 @@ flight controller's UT2/USART2 wireless bridge.
 """
 
 import argparse
+from pathlib import Path
 import signal
+import sys
 import threading
 from typing import Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fleet_bus.models import SurveyFlags, SurveyState, TerrainCode
 
