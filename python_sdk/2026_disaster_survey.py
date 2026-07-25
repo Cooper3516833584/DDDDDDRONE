@@ -7,9 +7,9 @@
   3. 记录校准点为坐标原点
   4. 逐个航点导航（3×5 蛇形，100/170/240 × -40/-110/-180/-250/-320），
      每到达一个测绘航点记录 YOLO 地形 label 到网格
-  5. 巡航期间 10 Hz 检测地形环。火山(debris_flow)像素距离 < 50px
+  5. 巡航期间 10 Hz 检测地形环。泥石流(debris_flow)像素距离 < 50px
      时打断（整次飞行仅触发一次），记录当前最近航点，执行泥石流动作后
-     以 smooth 轨迹接续所有后续航点（不含记录的火山航点），
+     以 smooth 轨迹接续所有后续航点（不含泥石流航点），
      到达后续航点时继续记录 label
   6. 完成全部航点后降落在坐标原点
 
@@ -63,9 +63,9 @@ RING_DETECT_FREQ = 10         # Hz
 
 # YOLO 仿真模型 7 类地形:
 #   0:snow_mountain  1:field  2:river  3:settlements
-#   4:lake           5:debris_flow(火山)  6:wildfire
+#   4:lake           5:debris_flow(泥石流)  6:wildfire
 
-# 火山打断像素距离阈值（偏移 < 50px 才触发）
+# 泥石流打断像素距离阈值（偏移 < 50px 才触发）
 DEBRIS_FLOW_PX_THRESH = 50    # px
 
 # 测绘网格坐标 → 行列映射
@@ -154,9 +154,9 @@ class SimVisionTask:
 class Mission(object):
     """2026 模拟赛 — 空地协同测绘救灾系统。
 
-    第一段: 逐个航点导航 + 测绘记录，火山 (debris_flow) 像素距离 < 50px 时打断。
-    第二段: 火山动作后以 smooth 轨迹遍历剩余航点，继续记录 label。
-    火山整次飞行最多触发一次。
+    第一段: 逐个航点导航 + 测绘记录，泥石流 (debris_flow) 像素距离 < 50px 时打断。
+    第二段: 泥石流动作后以 smooth 轨迹遍历剩余航点，继续记录 label。
+    泥石流整次飞行最多触发一次。
     """
 
     def __init__(self, *args, **kwargs):
@@ -181,7 +181,7 @@ class Mission(object):
         # 后台检测线程持续更新的最新 label
         self._latest_ring_label: Optional[str] = None
 
-        # 火山打断 — 单次飞行仅触发一次
+        # 泥石流打断 — 单次飞行仅触发一次
         self._debris_flow_triggered_once: bool = False
         self._debris_flow_wp_index: int = -1   # 打断时最近航点在 raw_waypoints 中的索引
         self._ring_triggered = threading.Event()
@@ -228,12 +228,17 @@ class Mission(object):
 
             offset = self.sim_vision.detect_takeoff_offset()
             if offset is None:
+                logger.debug("[CALIB] No rectangle detected this frame")
                 self.navi.stop_move()
                 time.sleep(dt)
                 continue
 
             x_px, y_px = offset
             dist_px = float(np.hypot(x_px, y_px))
+            logger.debug(
+                f"[CALIB] rect offset=(x={x_px:.0f}, y={y_px:.0f})px, "
+                f"dist={dist_px:.1f}px"
+            )
 
             if dist_px <= close_threshold_px:
                 self.navi.stop_move()
@@ -252,7 +257,7 @@ class Mission(object):
         """后台 daemon 线程: 10 Hz 检测地形环。
 
         - 始终更新 _latest_ring_label（测绘记录用）
-        - 火山 (debris_flow) 仅在像素距离 < DEBRIS_FLOW_PX_THRESH 且
+        - 泥石流 (debris_flow) 仅在像素距离 < DEBRIS_FLOW_PX_THRESH 且
           整次飞行未触发过时打断轨迹
         """
         dt = 1.0 / max(RING_DETECT_FREQ, 5)
@@ -265,9 +270,13 @@ class Mission(object):
             offset = self.sim_vision.detect_ring_offset()
             if offset is not None:
                 x_px, y_px, label = offset
+                logger.debug(
+                    f"[RING] frame: label={label}, "
+                    f"offset=(x={x_px:.0f}, y={y_px:.0f})px"
+                )
                 self._latest_ring_label = label
 
-                # 火山打断: 像素距离 < 50px 且本轮飞行未触发过
+                # 泥石流打断: 像素距离 < 50px 且本轮飞行未触发过
                 if label == "debris_flow" and not self._debris_flow_triggered_once:
                     dist_px = float(np.hypot(x_px, y_px))
                     if dist_px < DEBRIS_FLOW_PX_THRESH and not self._ring_triggered.is_set():
@@ -278,6 +287,8 @@ class Mission(object):
                         self._ring_label = label
                         self._ring_triggered.set()
                         self.navi.traj_running_event.clear()
+            else:
+                logger.debug("[RING] No ring detected this frame")
 
             self._stop_ring.wait(dt)
 
@@ -335,11 +346,11 @@ class Mission(object):
         return best_idx
 
     # ================================================================
-    #  火山动作
+    #  泥石流动作
     # ================================================================
 
     def _action_debris_flow(self) -> None:
-        """火山救灾动作序列。
+        """泥石流救灾动作序列。
 
         黄灯 → 降至 90cm → 关泵 → 等 5s → 回升 150cm → 绿灯。
         """
@@ -492,7 +503,7 @@ class Mission(object):
         # ============================================================
         #  第一段: 逐个航点导航 + 测绘记录
         #
-        #  火山打断条件: debis_flow 且距离 < 50px 且本轮未触发过。
+        #  泥石流打断条件: debis_flow 且距离 < 50px 且本轮未触发过。
         #  打断后: 记录最近航点 → 执行动作 → 跳转到轨迹接续段。
         # ============================================================
         debris_flow_hit = False
@@ -508,7 +519,7 @@ class Mission(object):
                 success = navi.navigation_to_waypoint(wp)
 
                 if self._ring_triggered.is_set():
-                    # ---- 火山打断 ----
+                    # ---- 泥石流打断 ----
                     logger.info(f"[MISSION] Interrupted by debris_flow")
                     navi.stop_move()
                     time.sleep(0.2)
@@ -522,7 +533,7 @@ class Mission(object):
                         f"({raw_waypoints[nearest_idx]})"
                     )
 
-                    # 执行火山动作
+                    # 执行泥石流动作
                     self._action_debris_flow()
                     self._ring_triggered.clear()
                     debris_flow_hit = True
@@ -539,9 +550,9 @@ class Mission(object):
                 break
 
         # ============================================================
-        #  第二段: 轨迹接续（仅火山打断后执行）
+        #  第二段: 轨迹接续（仅泥石流打断后执行）
         #
-        #  取火山航点之后的所有航点（不含火山航点），生成 smooth 轨迹。
+        #  取泥石流航点之后的所有航点（不含泥石流航点），生成 smooth 轨迹。
         #  轨迹 with wait=False + 轮询到达检测 → 每到一个航点记录 label。
         # ============================================================
         if debris_flow_hit:
