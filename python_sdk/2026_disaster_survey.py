@@ -43,6 +43,8 @@ from vision_for_simulation.terrain_ring import (
     detect_nearest_terrain_ring,
 )
 from vision_for_simulation.camera_offsets import _center_to_offset
+from fleet_bus.air_node import attach_air_fleet_node
+from fleet_bus.models import SurveyFlags, SurveyState, TerrainCode
 
 # ============ 可调参数 ============
 CRUISE_SPEED = 22            # 水平导航速度 cm/s
@@ -73,6 +75,15 @@ DEBRIS_FLOW_PX_THRESH = 50    # px
 # 列 (5): y=-40→0, y=-110→1, y=-180→2, y=-250→3, y=-320→4
 SURVEY_X_TO_ROW: Dict[int, int] = {100: 0, 170: 1, 240: 2}
 SURVEY_Y_TO_COL: Dict[int, int] = {-40: 0, -110: 1, -180: 2, -250: 3, -320: 4}
+TERRAIN_LABEL_TO_CODE = {
+    "snow_mountain": int(TerrainCode.SNOW_MOUNTAIN),
+    "field": int(TerrainCode.FIELD),
+    "river": int(TerrainCode.RIVER),
+    "settlements": int(TerrainCode.SETTLEMENTS),
+    "lake": int(TerrainCode.LAKE),
+    "debris_flow": int(TerrainCode.DEBRIS_FLOW),
+    "wildfire": int(TerrainCode.WILDFIRE),
+}
 # =================================
 
 
@@ -177,6 +188,14 @@ class Mission(object):
             [None, None, None, None, None],
             [None, None, None, None, None],
         ]
+        self._survey_lock = threading.Lock()
+        self._survey_revision = 0
+        self._survey_complete = False
+        self._next_disaster_event_id = 1
+        self._wildfire_event = (0, 0xFF, 0xFF)
+        self._debris_event = (0, 0xFF, 0xFF)
+        self._reported_disasters = set()
+        self._indicator_lock = threading.Lock()
 
         # 后台检测线程持续更新的最新 label
         self._latest_ring_label: Optional[str] = None
@@ -298,7 +317,9 @@ class Mission(object):
     #  测绘网格记录
     # ================================================================
 
-    def _record_survey_label(self, rel_x: float, rel_y: float) -> None:
+    def _record_survey_label(
+        self, rel_x: float, rel_y: float, label: Optional[str] = None
+    ) -> None:
         x_key = int(round(rel_x))
         y_key = int(round(rel_y))
         row = SURVEY_X_TO_ROW.get(x_key)
@@ -310,12 +331,87 @@ class Mission(object):
             )
             return
 
-        self._survey_grid[row][col] = self._latest_ring_label
+        new_wildfire = False
+        with self._survey_lock:
+            selected_label = self._latest_ring_label if label is None else label
+            if selected_label not in TERRAIN_LABEL_TO_CODE:
+                logger.warning(
+                    f"[SURVEY] Unknown/empty terrain label at Grid[{row}][{col}], skip"
+                )
+                return
+            if self._survey_grid[row][col] != selected_label:
+                self._survey_grid[row][col] = selected_label
+                self._survey_revision = (self._survey_revision + 1) & 0xFFFF
+            disaster_key = (selected_label, row, col)
+            if (
+                selected_label in ("wildfire", "debris_flow")
+                and disaster_key not in self._reported_disasters
+            ):
+                event_id = self._next_disaster_event_id
+                self._next_disaster_event_id = event_id % 0xFFFF + 1
+                self._reported_disasters.add(disaster_key)
+                if selected_label == "wildfire":
+                    self._wildfire_event = (event_id, row, col)
+                    new_wildfire = True
+                else:
+                    self._debris_event = (event_id, row, col)
+                self._survey_revision = (self._survey_revision + 1) & 0xFFFF
         logger.info(
             f"[SURVEY] Grid[{row}][{col}] (x={x_key}, y={y_key})"
-            f" = {self._latest_ring_label}"
+            f" = {selected_label}"
         )
+        if new_wildfire:
+            threading.Thread(
+                target=self._flash_indicator,
+                args=((255, 0, 0),),
+                name="wildfire-indicator",
+                daemon=True,
+            ).start()
         self._log_survey_grid()
+
+    def _flash_indicator(
+        self, color: Tuple[int, int, int], flashes: int = 4, interval: float = 0.20
+    ) -> None:
+        with self._indicator_lock:
+            for _ in range(flashes):
+                self.fc.set_indicator_led(*color)
+                time.sleep(interval)
+                self.fc.set_indicator_led(0, 0, 0)
+                time.sleep(interval)
+            self.fc.set_indicator_led(0, 255, 0)
+
+    def _mark_survey_complete(self) -> bool:
+        with self._survey_lock:
+            if any(label is None for row in self._survey_grid for label in row):
+                logger.error("[SURVEY] Grid is incomplete; not publishing COMPLETE")
+                return False
+            if not self._survey_complete:
+                self._survey_complete = True
+                self._survey_revision = (self._survey_revision + 1) & 0xFFFF
+        return True
+
+    def get_survey_state(self) -> SurveyState:
+        with self._survey_lock:
+            codes = tuple(
+                TERRAIN_LABEL_TO_CODE.get(label, int(TerrainCode.UNKNOWN))
+                for row in self._survey_grid
+                for label in row
+            )
+            wildfire_id, wildfire_row, wildfire_col = self._wildfire_event
+            debris_id, debris_row, debris_col = self._debris_event
+            return SurveyState(
+                survey_revision=self._survey_revision,
+                survey_flags=(
+                    int(SurveyFlags.COMPLETE) if self._survey_complete else 0
+                ),
+                wildfire_event_id=wildfire_id,
+                wildfire_row=wildfire_row,
+                wildfire_col=wildfire_col,
+                debris_event_id=debris_id,
+                debris_row=debris_row,
+                debris_col=debris_col,
+                terrain_codes=codes,
+            )
 
     def _log_survey_grid(self) -> None:
         rows = []
@@ -533,7 +629,13 @@ class Mission(object):
                         f"({raw_waypoints[nearest_idx]})"
                     )
 
+                    debris_x, debris_y = raw_waypoints[nearest_idx]
+                    self._record_survey_label(
+                        debris_x, debris_y, label="debris_flow"
+                    )
+
                     # 执行泥石流动作
+                    self._flash_indicator((255, 255, 0))
                     self._action_debris_flow()
                     self._ring_triggered.clear()
                     debris_flow_hit = True
@@ -602,6 +704,7 @@ class Mission(object):
         logger.info("=" * 50)
         logger.info("[MISSION] === Final Survey Grid ===")
         self._log_survey_grid()
+        self._mark_survey_complete()
         logger.info("=" * 50)
 
         # ---- 停止地形环检测 ----
@@ -656,6 +759,13 @@ if __name__ == "__main__":
     mission = Mission(
         fc=fc, rs=t265, radar=radar, navi=navi, sim_vision=sim_vision,
     )
+    remote_stop_event = threading.Event()
+    fleet_node = None
+
+    def wait_for_remote_stop():
+        remote_stop_event.wait()
+        logger.warning("[FLEET] Remote STOP received")
+        mission.stop()
 
     # TODO: 地面站起飞命令等待
     #   1. fc.set_digital_output(0, True)  — 打开水泵
@@ -666,10 +776,27 @@ if __name__ == "__main__":
     #   4. 完成后上报 COMPLETED / FAILED
 
     try:
+        fleet_node = attach_air_fleet_node(
+            fc,
+            navi,
+            remote_stop_event,
+            readonly=True,
+            survey_provider=mission.get_survey_state,
+        )
+        threading.Thread(
+            target=wait_for_remote_stop,
+            name="fleet-remote-stop",
+            daemon=True,
+        ).start()
         mission.run()
     except Exception as e:
         logger.exception(f"[MANAGER] Mission Failed: {e}")
     finally:
+        if fleet_node is not None:
+            try:
+                fleet_node.close()
+            except Exception as e:
+                logger.exception(f"[FLEET] Close failed: {e}")
         mission.stop()
         if fc.state.unlock.value:
             logger.warning("[MANAGER] Auto Landing (Emergency)")
