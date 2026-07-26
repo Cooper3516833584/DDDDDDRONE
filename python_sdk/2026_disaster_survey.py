@@ -1053,7 +1053,8 @@ class Mission(object):
         self._log_survey_grid()
 
     def _flash_indicator(
-        self, color: Tuple[int, int, int], flashes: int = 4, interval: float = 0.20
+        self, color: Tuple[int, int, int], flashes: int = 4, interval: float = 0.20,
+        end_color: Tuple[int, int, int] = (0, 0, 0),
     ) -> None:
         with self._indicator_lock:
             for _ in range(flashes):
@@ -1061,7 +1062,7 @@ class Mission(object):
                 time.sleep(interval)
                 self.fc.set_indicator_led(0, 0, 0)
                 time.sleep(interval)
-            self.fc.set_indicator_led(0, 255, 0)
+            self.fc.set_indicator_led(*end_color)
 
     def _mark_survey_complete(self) -> bool:
         with self._survey_lock:
@@ -1411,7 +1412,7 @@ class Mission(object):
                 self._record_survey_label(
                     debris_x, debris_y, label="debris_flow"
                 )
-                self._flash_indicator((255, 255, 0))
+                self._flash_indicator((255, 255, 0), end_color=(0, 255, 0))
                 self._action_debris_flow()
                 self._ring_triggered.clear()
                 debris_flow_hit = True
@@ -1442,6 +1443,7 @@ class Mission(object):
                         f"WP {next_wp} ENTER zone ({wx:.0f}, {wy:.0f}) "
                         f"after_frame={wp_observation_seq}"
                     )
+                    fc.set_indicator_led(0, 0, 255)  # 蓝灯 — 进入航点测绘区
             else:
                 # 在收集区内只追加尚未统计的新推理帧。
                 observations = wp_observation_bufs[next_wp]
@@ -1449,6 +1451,10 @@ class Mission(object):
                     observations,
                     wp_observation_seq,
                 )
+
+                # 在收集区内一旦识别到 wildfire 就将指示灯设为红色。
+                if any(obs.label == "wildfire" for obs in observations):
+                    fc.set_indicator_led(255, 0, 0)
 
                 # 离开收集区：用独立帧的稳定多数结果记录。
                 if dist2 > wp_exit_radius2:
@@ -1466,6 +1472,7 @@ class Mission(object):
                     wp_recorded[next_wp] = True
                     next_wp += 1
                     within_wp = False
+                    fc.set_indicator_led(0, 0, 0)  # 灭灯 — 离开航点测绘区
 
         # 收尾: 等待轨迹线程真正清除运行事件，避免与降落轨迹并发。
         if not debris_flow_hit:
@@ -1544,6 +1551,7 @@ class Mission(object):
                                 f"({wx:.0f}, {wy:.0f}) "
                                 f"after_frame={rec_observation_seq}"
                             )
+                            fc.set_indicator_led(0, 0, 255)  # 蓝灯 — 进入航点测绘区
                     else:
                         rec_observation_seq = (
                             self._collect_new_survey_observation(
@@ -1551,6 +1559,13 @@ class Mission(object):
                                 rec_observation_seq,
                             )
                         )
+
+                        # 在收集区内一旦识别到 wildfire 就将指示灯设为红色。
+                        if any(
+                            obs.label == "wildfire" for obs in rec_observations
+                        ):
+                            fc.set_indicator_led(255, 0, 0)
+
                         if dist2 > wp_leave_thres2:
                             selected_label = self._select_survey_label(
                                 rec_observations
@@ -1569,6 +1584,7 @@ class Mission(object):
                             )
                             next_rec += 1
                             rec_within_wp = False
+                            fc.set_indicator_led(0, 0, 0)  # 灭灯 — 离开航点测绘区
 
                 if not self._wait_for_trajectory_finish(
                     "second-leg",
