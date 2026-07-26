@@ -34,6 +34,8 @@ BASE_TASK = _load_base_task()
 
 WAYPOINT_VISION_TIMEOUT = 3.0  # s
 WAYPOINT_VISION_POLL_INTERVAL = 0.02  # s
+WAYPOINT_VISION_MIN_DURATION = 1.0  # s; keeps the blue measurement LED visible
+WAYPOINT_VISION_MAX_DISTANCE_PX = 150.0
 INDICATOR_BLUE = (0, 0, 255)
 INDICATOR_RED = (255, 0, 0)
 
@@ -52,7 +54,10 @@ class WaypointMission(BASE_TASK.Mission):
 
         after_seq = self.sim_vision.latest_frame_seq
         observations: List[BASE_TASK.RingObservation] = []
-        deadline = time.perf_counter() + WAYPOINT_VISION_TIMEOUT
+        started_at = time.perf_counter()
+        earliest_finish = started_at + WAYPOINT_VISION_MIN_DURATION
+        deadline = started_at + WAYPOINT_VISION_TIMEOUT
+        rejected_off_center = 0
 
         self._tvlog(
             f"WP {waypoint_index} ARRIVED "
@@ -69,14 +74,26 @@ class WaypointMission(BASE_TASK.Mission):
             observation = self._get_latest_ring_observation()
             if observation is not None and observation.frame_seq > after_seq:
                 after_seq = observation.frame_seq
-                if observation.label in BASE_TASK.TERRAIN_LABEL_TO_CODE:
+                distance_px = (
+                    observation.offset_x ** 2 + observation.offset_y ** 2
+                ) ** 0.5
+                if (
+                    observation.label in BASE_TASK.TERRAIN_LABEL_TO_CODE
+                    and distance_px < WAYPOINT_VISION_MAX_DISTANCE_PX
+                ):
                     observations.append(observation)
+                elif observation.label in BASE_TASK.TERRAIN_LABEL_TO_CODE:
+                    rejected_off_center += 1
 
                 selected_label = self._select_survey_label(observations)
-                if selected_label is not None:
+                if (
+                    selected_label is not None
+                    and time.perf_counter() >= earliest_finish
+                ):
                     self._tvlog(
                         f"WP {waypoint_index} LABEL "
                         f"samples={len(observations)} "
+                        f"rejected_off_center={rejected_off_center} "
                         f"consensus={selected_label}"
                     )
                     return selected_label, len(observations)
@@ -86,7 +103,9 @@ class WaypointMission(BASE_TASK.Mission):
         selected_label = self._select_survey_label(observations)
         self._tvlog(
             f"WP {waypoint_index} LABEL_TIMEOUT "
-            f"samples={len(observations)} consensus={selected_label}"
+            f"samples={len(observations)} "
+            f"rejected_off_center={rejected_off_center} "
+            f"consensus={selected_label}"
         )
         return selected_label, len(observations)
 
@@ -221,12 +240,21 @@ class WaypointMission(BASE_TASK.Mission):
                 )
 
             fc.set_indicator_led(*INDICATOR_BLUE)
-            logger.info(f"[MISSION] WP {waypoint_index} reached -> blue indicator")
-
-            label, sample_count = self._read_waypoint_label(
-                waypoint_index,
-                raw_waypoint,
+            logger.info(
+                f"[MISSION] WP {waypoint_index} measurement started "
+                f"-> blue indicator"
             )
+            try:
+                label, sample_count = self._read_waypoint_label(
+                    waypoint_index,
+                    raw_waypoint,
+                )
+            finally:
+                fc.set_indicator_led(0, 0, 0)
+                logger.info(
+                    f"[MISSION] WP {waypoint_index} measurement finished "
+                    f"-> indicator off"
+                )
             self._handle_waypoint_label(
                 waypoint_index,
                 raw_waypoint,

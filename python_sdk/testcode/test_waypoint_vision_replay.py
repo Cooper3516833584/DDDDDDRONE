@@ -11,8 +11,9 @@ Examples:
         vision_for_simulation/ring_detection_20260726_133030.log
 
     python3 testcode/test_waypoint_vision_replay.py LOG \
-        --distance-thresholds none,50,75,90 \
+        --distance-thresholds none,75,120,150,180 \
         --arrival-timeout 3.0 \
+        --min-duration 1.0 \
         --delay 0.0
 """
 
@@ -233,6 +234,7 @@ def replay_window(
     detections: Sequence[Detection],
     distance_threshold: Optional[float],
     arrival_timeout: float,
+    min_duration: float,
     delay: float,
 ) -> ReplayResult:
     start = window.start + timedelta(seconds=max(0.0, delay))
@@ -264,11 +266,14 @@ def replay_window(
         samples.append(detection)
         if window.kind == "arrived":
             selected = select_label(samples)
-            if selected is not None:
+            decided_after_s = (
+                detection.timestamp - window.start
+            ).total_seconds()
+            if selected is not None and decided_after_s >= min_duration:
                 return ReplayResult(
                     selected,
                     len(samples),
-                    (detection.timestamp - window.start).total_seconds(),
+                    decided_after_s,
                 )
 
     return ReplayResult(
@@ -327,6 +332,7 @@ def print_report(
     thresholds: Sequence[Optional[float]],
     expected_labels: Sequence[str],
     arrival_timeout: float,
+    min_duration: float,
     delay: float,
     nul_bytes: int,
     unmatched_timestamped_lines: int,
@@ -354,9 +360,10 @@ def print_report(
         )
 
     print(
-        "Replay: arrival_timeout={:.2f}s delay={:.2f}s "
+        "Replay: arrival_timeout={:.2f}s min_duration={:.2f}s delay={:.2f}s "
         "min_frames={} min_ratio={:.2f}".format(
             arrival_timeout,
+            min_duration,
             delay,
             MIN_CONFIRM_FRAMES,
             MIN_CONFIRM_RATIO,
@@ -388,6 +395,7 @@ def print_report(
                 detections,
                 threshold,
                 arrival_timeout,
+                min_duration,
                 delay,
             )
             label = replayed.label
@@ -423,7 +431,7 @@ def main() -> None:
     parser.add_argument("log", type=Path, help="ring_detection_*.log path")
     parser.add_argument(
         "--distance-thresholds",
-        default="none,50,75,90",
+        default="none,75,120,150,180",
         help="comma-separated pixel thresholds; use 'none' for no filtering",
     )
     parser.add_argument(
@@ -431,6 +439,12 @@ def main() -> None:
         type=float,
         default=3.0,
         help="replay window for ARRIVED logs in seconds (default: 3.0)",
+    )
+    parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=1.0,
+        help="wait this long before accepting consensus (default: 1.0)",
     )
     parser.add_argument(
         "--delay",
@@ -447,6 +461,10 @@ def main() -> None:
 
     if args.arrival_timeout <= 0:
         parser.error("--arrival-timeout must be positive")
+    if args.min_duration < 0:
+        parser.error("--min-duration must not be negative")
+    if args.min_duration > args.arrival_timeout:
+        parser.error("--min-duration must not exceed --arrival-timeout")
     if args.delay < 0:
         parser.error("--delay must not be negative")
     if not args.log.is_file():
@@ -473,6 +491,7 @@ def main() -> None:
         thresholds,
         expected_labels,
         args.arrival_timeout,
+        args.min_duration,
         args.delay,
         nul_bytes,
         unmatched,

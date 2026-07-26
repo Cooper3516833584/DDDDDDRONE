@@ -89,6 +89,12 @@ VISION_FRAME_MAX_AGE = 0.5    # s
 CAMERA_FIRST_FRAME_TIMEOUT = 8.0  # s
 CAMERA_READ_FAILURE_LOG_INTERVAL = 2.0  # s
 
+# Terrain YOLO only sees the centered 60% x 60% region. Keeping both ratios
+# equal preserves the camera aspect ratio. Takeoff calibration and recording
+# continue to use the complete camera frame.
+RING_MODEL_CROP_WIDTH_RATIO = 0.60
+RING_MODEL_CROP_HEIGHT_RATIO = 0.60
+
 # 飞行画面录像：编码在独立线程中执行，队列满时保留最新帧，避免阻塞采集。
 VIDEO_RECORD_ENABLED = True
 VIDEO_RECORD_FPS = 10.0
@@ -146,6 +152,30 @@ class RingObservation:
     confidence: float
     offset_x: float
     offset_y: float
+
+
+def _center_crop(
+    frame: np.ndarray,
+    width_ratio: float,
+    height_ratio: float,
+) -> Tuple[np.ndarray, int, int]:
+    """Return a centered crop and its ``(left, top)`` origin."""
+    if frame is None or frame.ndim < 2:
+        raise ValueError("frame must be a non-empty image")
+    if frame.shape[0] == 0 or frame.shape[1] == 0:
+        raise ValueError("frame must not be empty")
+    if not 0.0 < width_ratio <= 1.0 or not 0.0 < height_ratio <= 1.0:
+        raise ValueError("crop ratios must be in (0, 1]")
+
+    frame_height, frame_width = frame.shape[:2]
+    crop_width = max(1, min(frame_width, int(round(frame_width * width_ratio))))
+    crop_height = max(
+        1,
+        min(frame_height, int(round(frame_height * height_ratio))),
+    )
+    left = (frame_width - crop_width) // 2
+    top = (frame_height - crop_height) // 2
+    return frame[top:top + crop_height, left:left + crop_width], left, top
 
 
 def _open_persistent_camera(
@@ -538,15 +568,21 @@ class SimVisionTask:
                 )
                 return False
             frame, last_seq, _ = snapshot
+            model_frame, _, _ = _center_crop(
+                frame,
+                RING_MODEL_CROP_WIDTH_RATIO,
+                RING_MODEL_CROP_HEIGHT_RATIO,
+            )
             t0 = time.perf_counter()
             try:
-                detect_nearest_terrain_ring(frame)
+                detect_nearest_terrain_ring(model_frame)
             except Exception as exc:
                 logger.exception(f"[VISION] YOLO warm-up failed: {exc}")
                 return False
             logger.info(
                 f"[VISION] YOLO warm-up {index + 1}/{max(1, iterations)} "
-                f"done in {time.perf_counter() - t0:.2f}s"
+                f"done in {time.perf_counter() - t0:.2f}s "
+                f"(input={model_frame.shape[1]}x{model_frame.shape[0]})"
             )
         return True
 
@@ -570,7 +606,12 @@ class SimVisionTask:
         if snapshot is None:
             return None
         frame, frame_seq, captured_at = snapshot
-        detection = detect_nearest_terrain_ring(frame)
+        model_frame, crop_left, crop_top = _center_crop(
+            frame,
+            RING_MODEL_CROP_WIDTH_RATIO,
+            RING_MODEL_CROP_HEIGHT_RATIO,
+        )
+        detection = detect_nearest_terrain_ring(model_frame)
         if detection is None:
             return RingObservation(
                 frame_seq=frame_seq,
@@ -582,7 +623,11 @@ class SimVisionTask:
                 offset_y=0.0,
             )
         h, w = int(frame.shape[0]), int(frame.shape[1])
-        offset_x, offset_y = _center_to_offset(detection.center, (h, w))
+        full_frame_center = (
+            detection.center[0] + crop_left,
+            detection.center[1] + crop_top,
+        )
+        offset_x, offset_y = _center_to_offset(full_frame_center, (h, w))
         return RingObservation(
             frame_seq=frame_seq,
             captured_at=captured_at,
