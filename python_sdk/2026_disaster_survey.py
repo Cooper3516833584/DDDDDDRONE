@@ -54,6 +54,7 @@ from vision_for_simulation.terrain_ring import (
 )
 from vision_for_simulation.camera_offsets import _center_to_offset
 from fleet_bus.air_node import attach_air_fleet_node
+from fleet_bus.preflight import navigation_tf_is_fresh
 from fleet_bus.models import (
     AckReason,
     CommandId,
@@ -117,6 +118,8 @@ SURVEY_MIN_CONFIRM_RATIO = 0.60
 TRAJECTORY_FINISH_TIMEOUT = 45.0  # s
 TRAJECTORY_ENDPOINT_THRESHOLD = 15.0  # cm
 ELECTROMAGNET_OUTPUT_CHANNEL = 0
+PREFLIGHT_TF_MAX_AGE_SECONDS = 0.5
+PREFLIGHT_TF_STABLE_SECONDS = 1.0
 
 # 测绘网格坐标 → 行列映射
 # 行 (3): x=100→0, x=170→1, x=240→2
@@ -1293,19 +1296,38 @@ class Mission(object):
         # ---- Cartographer 就绪等待（起飞前）----
         # 仿照 base_test.py: 先确保 Cartographer / TF 坐标可靠，再解锁起飞。
         CART_TIMEOUT = 30.0
-        logger.info(f"[MISSION] Waiting Cartographer TF ({CART_TIMEOUT}s)...")
+        logger.info(
+            "[MISSION] Waiting for fresh Cartographer TF and navigation pose "
+            f"({CART_TIMEOUT}s)..."
+        )
         t0 = time.perf_counter()
+        fresh_since = None
         while True:
-            time.sleep(1)
-            logger.info(f"[MISSION] current_point: {navi.current_point}")
-            if navi.current_point[0] + navi.current_point[1] != 0:
-                break
-            if time.perf_counter() - t0 > CART_TIMEOUT:
-                raise RuntimeError(f"Cartographer TF timeout ({CART_TIMEOUT}s)")
-        logger.info(f"[MISSION] Cartographer TF ok ({time.perf_counter() - t0:.1f}s)")
+            now = time.perf_counter()
+            if navigation_tf_is_fresh(navi, PREFLIGHT_TF_MAX_AGE_SECONDS):
+                if fresh_since is None:
+                    fresh_since = now
+                if now - fresh_since >= PREFLIGHT_TF_STABLE_SECONDS:
+                    break
+            else:
+                fresh_since = None
+            if now - t0 > CART_TIMEOUT:
+                raise RuntimeError(
+                    "Cartographer TF/navigation pose did not remain fresh "
+                    f"within {CART_TIMEOUT}s"
+                )
+            time.sleep(0.1)
+        logger.info(
+            "[MISSION] Cartographer TF and navigation pose fresh "
+            f"({time.perf_counter() - t0:.1f}s, point={navi.current_point})"
+        )
         fc.set_indicator_led(0, 0, 0)
 
         # ---- 定点起飞 ----
+        if not navigation_tf_is_fresh(navi, PREFLIGHT_TF_MAX_AGE_SECONDS):
+            raise RuntimeError(
+                "Cartographer TF/navigation pose became stale before takeoff"
+            )
         logger.info(f"[MISSION] Takeoff to {self.cruise_height}cm")
         navi.pointing_takeoff((0, 0), self.cruise_height)
         navi.set_yaw(0)
