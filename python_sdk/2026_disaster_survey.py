@@ -76,6 +76,8 @@ RING_WARMUP_ITERATIONS = 2
 RING_READY_FRAMES = 2
 RING_READY_TIMEOUT = 5.0      # s
 VISION_FRAME_MAX_AGE = 0.5    # s
+CAMERA_FIRST_FRAME_TIMEOUT = 8.0  # s
+CAMERA_READ_FAILURE_LOG_INTERVAL = 2.0  # s
 
 # YOLO 仿真模型 7 类地形:
 #   0:snow_mountain  1:field  2:river  3:settlements
@@ -134,7 +136,6 @@ def _open_persistent_camera(
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             return cap
         cap.release()
     raise RuntimeError(f"Unable to open camera index {index}")
@@ -156,11 +157,22 @@ class SimVisionTask:
         self._latest_frame_seq = 0
         self._latest_frame_time = 0.0
         self._takeoff_frame_seq = 0
+        self._capture_error: Optional[str] = None
+        self._capture_read_failures = 0
+        self._capture_started_at = 0.0
 
     def open(self):
         if self._cap is None:
             self._cap = _open_persistent_camera(self._camera_index)
             self._capture_stop.clear()
+            with self._capture_condition:
+                self._latest_frame = None
+                self._latest_frame_seq = 0
+                self._latest_frame_time = 0.0
+                self._takeoff_frame_seq = 0
+                self._capture_error = None
+                self._capture_read_failures = 0
+                self._capture_started_at = time.perf_counter()
             self._capture_thread = threading.Thread(
                 target=self._capture_loop,
                 name="simulation-camera-capture",
@@ -197,20 +209,46 @@ class SimVisionTask:
 
     def _capture_loop(self) -> None:
         """唯一读取 VideoCapture 的线程；始终只保留最新一帧。"""
+        last_failure_log_at = time.perf_counter()
         while not self._capture_stop.is_set():
             cap = self._cap
             if cap is None:
                 break
-            ok, frame = cap.read()
+            try:
+                ok, frame = cap.read()
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                with self._capture_condition:
+                    self._capture_error = error
+                    self._capture_condition.notify_all()
+                logger.exception(f"[VISION] Camera read raised an exception: {error}")
+                return
             if not ok or frame is None:
+                now = time.perf_counter()
+                with self._capture_condition:
+                    self._capture_read_failures += 1
+                    failures = self._capture_read_failures
+                if now - last_failure_log_at >= CAMERA_READ_FAILURE_LOG_INTERVAL:
+                    logger.warning(
+                        f"[VISION] Camera {self._camera_index} returned no frame "
+                        f"({failures} failed reads)"
+                    )
+                    last_failure_log_at = now
                 self._capture_stop.wait(0.05)
                 continue
             captured_at = time.perf_counter()
             with self._capture_condition:
+                first_frame = self._latest_frame_seq == 0
                 self._latest_frame = frame
                 self._latest_frame_seq += 1
                 self._latest_frame_time = captured_at
                 self._capture_condition.notify_all()
+            if first_frame:
+                logger.info(
+                    f"[VISION] Camera {self._camera_index} first frame ready "
+                    f"in {captured_at - self._capture_started_at:.2f}s "
+                    f"({frame.shape[1]}x{frame.shape[0]})"
+                )
 
     @property
     def latest_frame_seq(self) -> int:
@@ -228,6 +266,7 @@ class SimVisionTask:
             while (
                 self._latest_frame_seq <= after_seq
                 and not self._capture_stop.is_set()
+                and self._capture_error is None
             ):
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
@@ -248,12 +287,29 @@ class SimVisionTask:
         """起飞前用新鲜实拍帧加载并预热 YOLO；不采纳检测结果。"""
         last_seq = 0
         for index in range(max(1, iterations)):
+            frame_timeout = (
+                CAMERA_FIRST_FRAME_TIMEOUT if index == 0 else 2.0
+            )
             snapshot = self._get_latest_frame(
                 after_seq=last_seq,
-                timeout=2.0,
+                timeout=frame_timeout,
             )
             if snapshot is None:
-                logger.error("[VISION] No fresh camera frame for YOLO warm-up")
+                with self._capture_condition:
+                    capture_error = self._capture_error
+                    read_failures = self._capture_read_failures
+                    capture_thread_alive = (
+                        self._capture_thread is not None
+                        and self._capture_thread.is_alive()
+                    )
+                logger.error(
+                    "[VISION] No fresh camera frame for YOLO warm-up "
+                    f"(iteration={index + 1}, "
+                    f"timeout={frame_timeout:.1f}s, "
+                    f"capture_thread_alive={capture_thread_alive}, "
+                    f"failed_reads={read_failures}, "
+                    f"capture_error={capture_error!r})"
+                )
                 return False
             frame, last_seq, _ = snapshot
             t0 = time.perf_counter()
