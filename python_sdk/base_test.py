@@ -60,22 +60,22 @@ class Mission(object):
         while True:
             time.sleep(1)
             logger.info(f"current_point: {navi.current_point}")
-            if navi.current_point[0] + navi.current_point[1] != 0:
-                break
-        fc.set_indicator_led(0, 0, 0)
-        # 定点起飞
-        navi.pointing_takeoff((0,0),self.cruise_height)
-        navi.set_yaw(0)
-        navi.wait_for_yaw()
-        time.sleep(0.5)
-        # # 进入导航模式
-        navi.navigation_to_waypoint((100,0))
-        time.sleep(1)
-        navi.navigation_to_waypoint((100,-100))
-        time.sleep(1)
-        navi.navigation_to_waypoint((0,-100))
-        time.sleep(1)
-        navi.pointing_landing((0,0))
+            #     if navi.current_point[0] + navi.current_point[1] != 0:
+            #         break
+        # fc.set_indicator_led(0, 0, 0)
+        # # 定点起飞
+        # navi.pointing_takeoff((0,0),self.cruise_height)
+        # navi.set_yaw(0)
+        # navi.wait_for_yaw()
+        # time.sleep(0.5)
+        # # # 进入导航模式
+        # navi.navigation_to_waypoint((100,0))
+        # time.sleep(1)
+        # navi.navigation_to_waypoint((100,-100))
+        # time.sleep(1)
+        # navi.navigation_to_waypoint((0,-100))
+        # time.sleep(1)
+        # navi.pointing_landing((0,0))
         
 
 
