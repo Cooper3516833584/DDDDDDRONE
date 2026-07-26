@@ -60,8 +60,8 @@ class Mission(object):
         while True:
             time.sleep(1)
             logger.info(f"current_point: {navi.current_point}")
-            #     if navi.current_point[0] + navi.current_point[1] != 0:
-            #         break
+        #     if navi.current_point[0] + navi.current_point[1] != 0:
+        #         break
         # fc.set_indicator_led(0, 0, 0)
         # # 定点起飞
         # navi.pointing_takeoff((0,0),self.cruise_height)
