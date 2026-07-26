@@ -1,4 +1,5 @@
 # Root-level Excel workbooks
+/.codex_ssh_askpass.cmd
 /*.xls
 /*.xlsx
 /*.xlsm
@@ -15,6 +16,7 @@ __pycache__/
 /fc_log/
 /python_sdk/fc_log/
 /python_sdk/visual/
+/python_sdk/temp/
 /python_sdk/vision_for_simulation/ring_detection_*.log
 /python_sdk/vision_for_simulation/camera_recording_*.avi
 /python_sdk/vision_for_simulation/camera_recording_*.csv
