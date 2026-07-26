@@ -19,12 +19,13 @@ ROS 建图组件启动流程参考 base_test.py 与 former_code/2024_D_24.py。
 地形检测使用 vision_for_simulation 仿真视觉包（YOLO + 传统图像处理）。
 
 视觉日志: python_sdk/vision_for_simulation/ring_detection_*.log
-每帧检测结果、航点出入事件均以时间戳记录，无需设置环境变量。
+每次地形推理结果、航点出入事件均以时间戳记录，无需设置环境变量。
 """
 import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -49,7 +50,13 @@ from vision_for_simulation.terrain_ring import (
 )
 from vision_for_simulation.camera_offsets import _center_to_offset
 from fleet_bus.air_node import attach_air_fleet_node
-from fleet_bus.models import AckReason, CommandId, SurveyFlags, SurveyState, TerrainCode
+from fleet_bus.models import (
+    AckReason,
+    CommandId,
+    SurveyFlags,
+    SurveyState,
+    TerrainCode,
+)
 
 # ============ 可调参数 ============
 CRUISE_SPEED = 22            # 水平导航速度 cm/s
@@ -69,8 +76,14 @@ CALIB_TIMEOUT = 60
 # 然后将 CAMERA_INDEX 改为 "/dev/video_survey" 即可
 CAMERA_INDEX: "Union[int, str]" = 2
 
-# 地形环检测频率
+# 地形环检测目标频率（实际频率受单次 YOLO 推理耗时限制）
 RING_DETECT_FREQ = 10         # Hz
+RING_WARMUP_ITERATIONS = 2
+RING_READY_FRAMES = 2
+RING_READY_TIMEOUT = 5.0      # s
+VISION_FRAME_MAX_AGE = 0.5    # s
+CAMERA_FIRST_FRAME_TIMEOUT = 8.0  # s
+CAMERA_READ_FAILURE_LOG_INTERVAL = 2.0  # s
 
 # YOLO 仿真模型 7 类地形:
 #   0:snow_mountain  1:field  2:river  3:settlements
@@ -78,6 +91,13 @@ RING_DETECT_FREQ = 10         # Hz
 
 # 泥石流打断像素距离阈值（偏移 < 50px 才触发）
 DEBRIS_FLOW_PX_THRESH = 50    # px
+DEBRIS_FLOW_CONFIRM_FRAMES = 2
+
+# 航点标签确认：只统计独立推理帧，至少 2 帧且多数占比不低于 60%
+SURVEY_MIN_CONFIRM_FRAMES = 2
+SURVEY_MIN_CONFIRM_RATIO = 0.60
+TRAJECTORY_FINISH_TIMEOUT = 45.0  # s
+TRAJECTORY_ENDPOINT_THRESHOLD = 15.0  # cm
 
 # 测绘网格坐标 → 行列映射
 # 行 (3): x=100→0, x=170→1, x=240→2
@@ -86,8 +106,10 @@ SURVEY_X_TO_ROW: Dict[int, int] = {100: 0, 170: 1, 240: 2}
 SURVEY_Y_TO_COL: Dict[int, int] = {-40: 0, -110: 1, -180: 2, -250: 3, -320: 4}
 FIELD_TAKEOFF_CENTRE_CM = (75, 75)
 SURVEY_CELL_POSITIONS_CM = tuple(
-    (FIELD_TAKEOFF_CENTRE_CM[0] - local_y,
-     FIELD_TAKEOFF_CENTRE_CM[1] + local_x)
+    (
+        FIELD_TAKEOFF_CENTRE_CM[0] - local_y,
+        FIELD_TAKEOFF_CENTRE_CM[1] + local_x,
+    )
     for local_x in (100, 170, 240)
     for local_y in (-40, -110, -180, -250, -320)
 )
@@ -103,7 +125,22 @@ TERRAIN_LABEL_TO_CODE = {
 # =================================
 
 
-def _open_persistent_camera(index: int, width: int = 1280, height: int = 720) -> cv2.VideoCapture:
+@dataclass(frozen=True)
+class RingObservation:
+    frame_seq: int
+    captured_at: float
+    inferred_at: float
+    label: Optional[str]
+    confidence: float
+    offset_x: float
+    offset_y: float
+
+
+def _open_persistent_camera(
+    index: Union[int, str],
+    width: int = 1280,
+    height: int = 720,
+) -> cv2.VideoCapture:
     if sys.platform.startswith("linux"):
         backends = (cv2.CAP_V4L2, cv2.CAP_ANY)
     elif sys.platform.startswith("win"):
@@ -127,77 +164,225 @@ class SimVisionTask:
     同时承担起飞矩形检测（起飞后校准用）和地形环检测（巡航中避障/动作触发用）。
     """
 
-    def __init__(self, camera_index: int = CAMERA_INDEX):
+    def __init__(self, camera_index: Union[int, str] = CAMERA_INDEX):
         self._cap: Optional[cv2.VideoCapture] = None
         self._camera_index = camera_index
-        self._stop_flag = False
+        self._capture_stop = threading.Event()
+        self._capture_condition = threading.Condition()
+        self._capture_thread: Optional[threading.Thread] = None
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame_seq = 0
+        self._latest_frame_time = 0.0
+        self._takeoff_frame_seq = 0
+        self._capture_error: Optional[str] = None
+        self._capture_read_failures = 0
+        self._capture_started_at = 0.0
 
     def open(self):
         if self._cap is None:
             self._cap = _open_persistent_camera(self._camera_index)
+            self._capture_stop.clear()
+            with self._capture_condition:
+                self._latest_frame = None
+                self._latest_frame_seq = 0
+                self._latest_frame_time = 0.0
+                self._takeoff_frame_seq = 0
+                self._capture_error = None
+                self._capture_read_failures = 0
+                self._capture_started_at = time.perf_counter()
+            self._capture_thread = threading.Thread(
+                target=self._capture_loop,
+                name="simulation-camera-capture",
+                daemon=True,
+            )
+            self._capture_thread.start()
             logger.info(f"[VISION] Camera {self._camera_index} opened")
 
     def close(self):
+        self.stop()
+        if (
+            self._capture_thread is not None
+            and self._capture_thread is not threading.current_thread()
+        ):
+            self._capture_thread.join(timeout=1.0)
         if self._cap is not None:
             self._cap.release()
             logger.info(f"[VISION] Camera {self._camera_index} released")
+        if (
+            self._capture_thread is not None
+            and self._capture_thread is not threading.current_thread()
+            and self._capture_thread.is_alive()
+        ):
+            self._capture_thread.join(timeout=0.5)
+            if self._capture_thread.is_alive():
+                logger.warning("[VISION] Camera capture thread did not stop in time")
         self._cap = None
+        self._capture_thread = None
 
     def stop(self):
-        self._stop_flag = True
+        self._capture_stop.set()
+        with self._capture_condition:
+            self._capture_condition.notify_all()
 
-    def flush_frames(self) -> None:
-        """丢弃摄像头缓冲区中的旧帧。
-
-        持续读帧直到 cv2.CAP_PROP_POS_MSEC 时间戳接近当前时间
-        或达到 max_count 上限，确保后续 read() 获取实时画面。
-        """
-        if self._cap is None:
-            return
-        t_now = time.perf_counter()
-        max_count = 200
-        for n in range(max_count):
-            ok, _ = self._cap.read()
-            if not ok:
+    def _capture_loop(self) -> None:
+        """唯一读取 VideoCapture 的线程；始终只保留最新一帧。"""
+        last_failure_log_at = time.perf_counter()
+        while not self._capture_stop.is_set():
+            cap = self._cap
+            if cap is None:
                 break
-            # V4L2 时间戳: 帧被驱动捕获的绝对时间 (s)
-            frame_ts = self._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-            age = t_now - frame_ts
-            if 0.0 <= age < 0.15:  # 帧年龄 < 150ms → 已是实时画面
-                logger.debug(f"[VISION] Flushed {n + 1} frames, last age={age:.2f}s")
+            try:
+                ok, frame = cap.read()
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                with self._capture_condition:
+                    self._capture_error = error
+                    self._capture_condition.notify_all()
+                logger.exception(f"[VISION] Camera read raised an exception: {error}")
                 return
-        logger.debug(f"[VISION] Flushed {max_count} frames, may still be stale")
+            if not ok or frame is None:
+                now = time.perf_counter()
+                with self._capture_condition:
+                    self._capture_read_failures += 1
+                    failures = self._capture_read_failures
+                if now - last_failure_log_at >= CAMERA_READ_FAILURE_LOG_INTERVAL:
+                    logger.warning(
+                        f"[VISION] Camera {self._camera_index} returned no frame "
+                        f"({failures} failed reads)"
+                    )
+                    last_failure_log_at = now
+                self._capture_stop.wait(0.05)
+                continue
+            captured_at = time.perf_counter()
+            with self._capture_condition:
+                first_frame = self._latest_frame_seq == 0
+                self._latest_frame = frame
+                self._latest_frame_seq += 1
+                self._latest_frame_time = captured_at
+                self._capture_condition.notify_all()
+            if first_frame:
+                logger.info(
+                    f"[VISION] Camera {self._camera_index} first frame ready "
+                    f"in {captured_at - self._capture_started_at:.2f}s "
+                    f"({frame.shape[1]}x{frame.shape[0]})"
+                )
 
-    def _read_frame(self) -> Optional[np.ndarray]:
-        if self._cap is None:
-            return None
-        ok, frame = self._cap.read()
-        if not ok or frame is None:
-            return None
-        return frame
+    @property
+    def latest_frame_seq(self) -> int:
+        with self._capture_condition:
+            return self._latest_frame_seq
+
+    def _get_latest_frame(
+        self,
+        after_seq: int = 0,
+        timeout: float = 0.5,
+        max_age: float = VISION_FRAME_MAX_AGE,
+    ) -> Optional[Tuple[np.ndarray, int, float]]:
+        deadline = time.perf_counter() + max(0.0, timeout)
+        with self._capture_condition:
+            while (
+                self._latest_frame_seq <= after_seq
+                and not self._capture_stop.is_set()
+                and self._capture_error is None
+            ):
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    return None
+                self._capture_condition.wait(remaining)
+
+            if self._latest_frame is None or self._latest_frame_seq <= after_seq:
+                return None
+            if time.perf_counter() - self._latest_frame_time > max_age:
+                return None
+            return (
+                self._latest_frame.copy(),
+                self._latest_frame_seq,
+                self._latest_frame_time,
+            )
+
+    def warm_up_ring_detector(self, iterations: int = RING_WARMUP_ITERATIONS) -> bool:
+        """起飞前用新鲜实拍帧加载并预热 YOLO；不采纳检测结果。"""
+        last_seq = 0
+        for index in range(max(1, iterations)):
+            frame_timeout = (
+                CAMERA_FIRST_FRAME_TIMEOUT if index == 0 else 2.0
+            )
+            snapshot = self._get_latest_frame(
+                after_seq=last_seq,
+                timeout=frame_timeout,
+            )
+            if snapshot is None:
+                with self._capture_condition:
+                    capture_error = self._capture_error
+                    read_failures = self._capture_read_failures
+                    capture_thread_alive = (
+                        self._capture_thread is not None
+                        and self._capture_thread.is_alive()
+                    )
+                logger.error(
+                    "[VISION] No fresh camera frame for YOLO warm-up "
+                    f"(iteration={index + 1}, "
+                    f"timeout={frame_timeout:.1f}s, "
+                    f"capture_thread_alive={capture_thread_alive}, "
+                    f"failed_reads={read_failures}, "
+                    f"capture_error={capture_error!r})"
+                )
+                return False
+            frame, last_seq, _ = snapshot
+            t0 = time.perf_counter()
+            try:
+                detect_nearest_terrain_ring(frame)
+            except Exception as exc:
+                logger.exception(f"[VISION] YOLO warm-up failed: {exc}")
+                return False
+            logger.info(
+                f"[VISION] YOLO warm-up {index + 1}/{max(1, iterations)} "
+                f"done in {time.perf_counter() - t0:.2f}s"
+            )
+        return True
 
     def detect_takeoff_offset(self) -> Optional[Tuple[float, float]]:
         """检测起飞矩形，返回 ``(x_px, y_px)`` 或 None。"""
-        frame = self._read_frame()
-        if frame is None:
+        snapshot = self._get_latest_frame(after_seq=self._takeoff_frame_seq)
+        if snapshot is None:
             return None
+        frame, self._takeoff_frame_seq, _ = snapshot
         detection = detect_takeoff_rectangle(frame)
         if detection is None:
             return None
         h, w = int(frame.shape[0]), int(frame.shape[1])
         return _center_to_offset(detection.center, (h, w))
 
-    def detect_ring_offset(self) -> Optional[Tuple[float, float, str]]:
-        """YOLO 检测最近地形环，返回 ``(x_px, y_px, label)`` 或 None。"""
-        frame = self._read_frame()
-        if frame is None:
+    def detect_ring_observation(
+        self, after_seq: int
+    ) -> Optional[RingObservation]:
+        """对 ``after_seq`` 之后的最新帧推理，并保留采集时序信息。"""
+        snapshot = self._get_latest_frame(after_seq=after_seq)
+        if snapshot is None:
             return None
+        frame, frame_seq, captured_at = snapshot
         detection = detect_nearest_terrain_ring(frame)
         if detection is None:
-            return None
+            return RingObservation(
+                frame_seq=frame_seq,
+                captured_at=captured_at,
+                inferred_at=time.perf_counter(),
+                label=None,
+                confidence=0.0,
+                offset_x=0.0,
+                offset_y=0.0,
+            )
         h, w = int(frame.shape[0]), int(frame.shape[1])
         offset_x, offset_y = _center_to_offset(detection.center, (h, w))
-        return offset_x, offset_y, detection.class_name
+        return RingObservation(
+            frame_seq=frame_seq,
+            captured_at=captured_at,
+            inferred_at=time.perf_counter(),
+            label=detection.class_name,
+            confidence=detection.confidence,
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
 
 
 class Mission(object):
@@ -243,17 +428,23 @@ class Mission(object):
 
         # 后台检测线程持续更新的最新 label
         self._latest_ring_label: Optional[str] = None
-        self._latest_ring_updated_at = 0.0
+        self._latest_ring_observation: Optional[RingObservation] = None
+        self._ring_observation_lock = threading.Lock()
 
         # 泥石流打断 — 单次飞行仅触发一次
         self._debris_flow_triggered_once: bool = False
         self._debris_flow_wp_index: int = -1
         self._ring_triggered = threading.Event()
         self._ring_label: str = ""
+        self._debris_flow_confirm_count = 0
 
         # 线程控制
         self._stop_ring = threading.Event()
         self._ring_thread: Optional[threading.Thread] = None
+        self._ring_ready = threading.Event()
+        self._ring_failed = threading.Event()
+        self._ring_actions_enabled = threading.Event()
+        self._ring_start_frame_seq = 0
 
         # 视觉专用日志文件（独立于 loguru，无需改环境变量）
         os.makedirs(self._VISION_LOG_DIR, exist_ok=True)
@@ -283,6 +474,14 @@ class Mission(object):
 
     def stop(self):
         self._stop_ring.set()
+        self._ring_actions_enabled.clear()
+        if (
+            self._ring_thread is not None
+            and self._ring_thread is not threading.current_thread()
+        ):
+            self._ring_thread.join(timeout=2.0)
+            if self._ring_thread.is_alive():
+                logger.warning("[RING] Detection thread did not stop in time")
         if self.sim_vision is not None:
             self.sim_vision.stop()
         self.navi.stop()
@@ -292,7 +491,7 @@ class Mission(object):
     def navigation_pose_to_field(
         self, navigation_x_cm: float, navigation_y_cm: float
     ) -> Optional[Tuple[float, float]]:
-        """Convert navigation coordinates to the 480×400 cm field frame."""
+        """将导航坐标转换为 480×400 cm 场地绝对坐标。"""
         if not self._origin_ready:
             return None
         relative_x = navigation_x_cm - self._origin_x
@@ -349,66 +548,185 @@ class Mission(object):
             time.sleep(dt)
 
     # ================================================================
-    #  地形环后台检测（10 Hz）
+    #  地形环后台检测（目标 10 Hz）
     # ================================================================
 
-    def _start_ring_detection(self) -> None:
-        """启动地形环后台检测线程并 flush 摄像头缓冲区。
-
-        延迟到进入第一个测绘航点后才启动，避免起飞→校准→巡航过渡期
-        摄像头无人读取导致积压。
-        """
+    def _start_ring_detection(self) -> bool:
+        """校准后启动检测线程，并在开始轨迹前等待新帧推理就绪。"""
         if self.sim_vision is None:
-            return
-        self.sim_vision.flush_frames()
+            return False
+        self._ring_start_frame_seq = self.sim_vision.latest_frame_seq
+        with self._ring_observation_lock:
+            self._latest_ring_observation = None
+            self._latest_ring_label = None
+        self._debris_flow_confirm_count = 0
         self._stop_ring.clear()
+        self._ring_ready.clear()
+        self._ring_failed.clear()
+        self._ring_actions_enabled.clear()
         self._ring_thread = threading.Thread(
-            target=self._ring_detection_loop, daemon=True
+            target=self._ring_detection_loop,
+            name="terrain-ring-detection",
+            daemon=True,
         )
         self._ring_thread.start()
-        logger.info("[RING] Detection thread started (deferred)")
+        logger.info(
+            f"[RING] Detection thread started after frame "
+            f"{self._ring_start_frame_seq}"
+        )
+
+        deadline = time.perf_counter() + RING_READY_TIMEOUT
+        while time.perf_counter() < deadline:
+            if self._ring_ready.wait(0.05):
+                logger.info("[RING] Detection ready")
+                return True
+            if self._ring_failed.is_set():
+                break
+
+        self._stop_ring.set()
+        if self._ring_thread is not None:
+            self._ring_thread.join(timeout=1.0)
+        logger.error(
+            f"[RING] Detection not ready within {RING_READY_TIMEOUT:.1f}s"
+        )
+        return False
+
+    def _get_latest_ring_observation(self) -> Optional[RingObservation]:
+        with self._ring_observation_lock:
+            return self._latest_ring_observation
+
+    @staticmethod
+    def _select_survey_label(
+        observations: List[RingObservation],
+    ) -> Optional[str]:
+        """从独立推理帧中选择稳定标签；证据不足时返回 None。"""
+        valid = [
+            observation
+            for observation in observations
+            if observation.label in TERRAIN_LABEL_TO_CODE
+        ]
+        if len(valid) < SURVEY_MIN_CONFIRM_FRAMES:
+            return None
+
+        counts: Dict[str, int] = {}
+        confidence_sums: Dict[str, float] = {}
+        for observation in valid:
+            label = str(observation.label)
+            counts[label] = counts.get(label, 0) + 1
+            confidence_sums[label] = (
+                confidence_sums.get(label, 0.0) + observation.confidence
+            )
+
+        selected_label = max(
+            counts,
+            key=lambda label: (counts[label], confidence_sums[label]),
+        )
+        if counts[selected_label] / len(valid) < SURVEY_MIN_CONFIRM_RATIO:
+            return None
+        return selected_label
+
+    def _collect_new_survey_observation(
+        self,
+        observations: List[RingObservation],
+        after_seq: int,
+    ) -> int:
+        """最多追加一个尚未统计的最新独立推理结果。"""
+        observation = self._get_latest_ring_observation()
+        if observation is None or observation.frame_seq <= after_seq:
+            return after_seq
+        if observation.label in TERRAIN_LABEL_TO_CODE:
+            observations.append(observation)
+        return observation.frame_seq
 
     def _ring_detection_loop(self):
-        """后台 daemon 线程: 10 Hz 检测地形环。
+        """后台 daemon 线程：以目标频率检测地形环。
 
-        - 始终更新 _latest_ring_label（测绘记录用）
+        - 每次只处理比上一结果更新的相机帧
         - 泥石流 (debris_flow) 仅在像素距离 < DEBRIS_FLOW_PX_THRESH 且
           整次飞行未触发过时打断轨迹
         """
         dt = 1.0 / max(RING_DETECT_FREQ, 5)
         logger.info(f"[RING] Loop started ({RING_DETECT_FREQ} Hz)")
+        last_frame_seq = self._ring_start_frame_seq
+        processed_frames = 0
+        next_deadline = time.perf_counter()
 
         while not self._stop_ring.is_set():
             if self.sim_vision is None:
                 break
 
-            offset = self.sim_vision.detect_ring_offset()
-            if offset is not None:
-                x_px, y_px, label = offset
-                self._tvlog(
-                    f"RING frame: label={label} offset=(x={x_px:.0f}, y={y_px:.0f})px"
+            try:
+                observation = self.sim_vision.detect_ring_observation(
+                    after_seq=last_frame_seq
                 )
-                self._latest_ring_label = label
-                self._latest_ring_updated_at = time.monotonic()
+            except Exception as exc:
+                logger.exception(f"[RING] Detection failed: {exc}")
+                self._ring_failed.set()
+                break
 
-                # 泥石流打断: 像素距离 < 50px 且本轮飞行未触发过
-                if label == "debris_flow" and not self._debris_flow_triggered_once:
-                    dist_px = float(np.hypot(x_px, y_px))
-                    if dist_px < DEBRIS_FLOW_PX_THRESH and not self._ring_triggered.is_set():
+            if observation is None:
+                continue
+
+            last_frame_seq = observation.frame_seq
+            processed_frames += 1
+            with self._ring_observation_lock:
+                self._latest_ring_observation = observation
+                self._latest_ring_label = observation.label
+
+            frame_age_ms = (
+                observation.inferred_at - observation.captured_at
+            ) * 1000.0
+            if observation.label is not None:
+                self._tvlog(
+                    f"RING frame={observation.frame_seq}: "
+                    f"label={observation.label} conf={observation.confidence:.2f} "
+                    f"offset=(x={observation.offset_x:.0f}, "
+                    f"y={observation.offset_y:.0f})px age={frame_age_ms:.0f}ms"
+                )
+
+                # 泥石流打断：只在巡航动作启用后接受连续独立帧确认。
+                dist_px = float(
+                    np.hypot(observation.offset_x, observation.offset_y)
+                )
+                debris_candidate = (
+                    self._ring_actions_enabled.is_set()
+                    and observation.label == "debris_flow"
+                    and dist_px < DEBRIS_FLOW_PX_THRESH
+                    and not self._debris_flow_triggered_once
+                )
+                if debris_candidate:
+                    self._debris_flow_confirm_count += 1
+                    if (
+                        self._debris_flow_confirm_count
+                        >= DEBRIS_FLOW_CONFIRM_FRAMES
+                        and not self._ring_triggered.is_set()
+                    ):
                         logger.info(
                             f"[RING] debris_flow dist={dist_px:.1f}px < "
-                            f"{DEBRIS_FLOW_PX_THRESH}px → interrupting"
+                            f"{DEBRIS_FLOW_PX_THRESH}px confirmed by "
+                            f"{self._debris_flow_confirm_count} frames → interrupting"
                         )
-                        self._ring_label = label
+                        self._ring_label = observation.label
                         self._ring_triggered.set()
                         self.navi.traj_running_event.clear()
+                else:
+                    self._debris_flow_confirm_count = 0
             else:
-                self._tvlog("RING frame: (none)")
-                # A missed detection must not reuse the previous cell's label.
-                self._latest_ring_label = None
-                self._latest_ring_updated_at = 0.0
+                self._debris_flow_confirm_count = 0
+                self._tvlog(
+                    f"RING frame={observation.frame_seq}: "
+                    f"(none) age={frame_age_ms:.0f}ms"
+                )
 
-            self._stop_ring.wait(dt)
+            if processed_frames >= RING_READY_FRAMES:
+                self._ring_ready.set()
+
+            next_deadline += dt
+            delay = next_deadline - time.perf_counter()
+            if delay > 0:
+                self._stop_ring.wait(delay)
+            else:
+                next_deadline = time.perf_counter()
 
         logger.info("[RING] Loop stopped")
 
@@ -419,8 +737,9 @@ class Mission(object):
     def _record_survey_label(
         self, rel_x: float, rel_y: float, label: Optional[str] = None,
         sample_count: int = 0,
+        flash_wildfire: bool = True,
     ) -> None:
-        """将指定 label 记录到测绘网格。未提供 label 时使用 _latest_ring_label。"""
+        """将指定 label 记录到测绘网格；识别失败时保持该格为空。"""
         x_key = int(round(rel_x))
         y_key = int(round(rel_y))
         row = SURVEY_X_TO_ROW.get(x_key)
@@ -433,12 +752,6 @@ class Mission(object):
         new_wildfire = False
         with self._survey_lock:
             selected_label = label
-            if (
-                selected_label is None
-                and self._latest_ring_label is not None
-                and time.monotonic() - self._latest_ring_updated_at <= 0.25
-            ):
-                selected_label = self._latest_ring_label
             if selected_label not in TERRAIN_LABEL_TO_CODE:
                 if self._survey_grid[row][col] is not None:
                     self._survey_grid[row][col] = None
@@ -470,7 +783,7 @@ class Mission(object):
             f"[SURVEY] Grid[{row}][{col}] (x={x_key}, y={y_key})"
             f" = {selected_label}{extra}"
         )
-        if new_wildfire:
+        if new_wildfire and flash_wildfire:
             threading.Thread(
                 target=self._flash_indicator,
                 args=((255, 0, 0),),
@@ -508,7 +821,14 @@ class Mission(object):
     def get_survey_state(self) -> SurveyState:
         with self._survey_lock:
             codes = tuple(
-                TERRAIN_LABEL_TO_CODE.get(label, int(TerrainCode.UNKNOWN))
+                (
+                    TERRAIN_LABEL_TO_CODE.get(
+                        label,
+                        int(TerrainCode.UNKNOWN),
+                    )
+                    if label is not None
+                    else int(TerrainCode.UNKNOWN)
+                )
                 for row in self._survey_grid
                 for label in row
             )
@@ -615,6 +935,43 @@ class Mission(object):
         )
         return traj_list
 
+    def _wait_for_trajectory_finish(
+        self,
+        name: str,
+        endpoint: Tuple[float, float],
+        timeout: float = TRAJECTORY_FINISH_TIMEOUT,
+    ) -> bool:
+        """等待异步轨迹线程清除运行事件，并核验最终水平位置。"""
+        logger.info(f"[TRAJ] Waiting for {name} trajectory to finish")
+        deadline = time.perf_counter() + max(1.0, timeout)
+        while self.navi.traj_running_event.is_set():
+            if time.perf_counter() >= deadline:
+                logger.error(
+                    f"[TRAJ] {name} trajectory finish timeout "
+                    f"({timeout:.1f}s)"
+                )
+                self.navi.traj_running_event.clear()
+                self.navi.stop_move()
+                return False
+            time.sleep(0.05)
+
+        dx = float(self.navi.current_x) - float(endpoint[0])
+        dy = float(self.navi.current_y) - float(endpoint[1])
+        distance = float(np.hypot(dx, dy))
+        if distance > TRAJECTORY_ENDPOINT_THRESHOLD:
+            logger.error(
+                f"[TRAJ] {name} trajectory ended {distance:.1f}cm "
+                f"from endpoint {endpoint}"
+            )
+            self.navi.stop_move()
+            return False
+
+        logger.info(
+            f"[TRAJ] {name} trajectory finished "
+            f"({distance:.1f}cm from endpoint)"
+        )
+        return True
+
     # ================================================================
     #  主任务
     # ================================================================
@@ -647,6 +1004,13 @@ class Mission(object):
             (240, -320),   # 14
             (0, 0),        # 15 降落点
         ]
+
+        # ---- 起飞前视觉模型预热（此时尚未解锁或移动）----
+        if (
+            self.sim_vision is not None
+            and not self.sim_vision.warm_up_ring_detector()
+        ):
+            raise RuntimeError("Terrain-ring detector warm-up failed")
 
         # ---- 导航参数 ----
         navi.set_navigation_speed(CRUISE_SPEED)
@@ -704,7 +1068,13 @@ class Mission(object):
             (x + self._origin_x, y + self._origin_y) for (x, y) in raw_waypoints
         ]
         survey_waypoints = waypoints[:-1]   # 15 个测绘航点
-        landing_wp = waypoints[-1]           # 降落点
+        landing_wp = (0.0, 0.0)             # 降落点为 navi 原点
+
+        # 校准结束后只接受此刻之后采集的新帧。检测就绪前保持原点悬停，
+        # 不启动轨迹，避免模型过渡期与航点位置错位。
+        if self.sim_vision is not None:
+            if not self._start_ring_detection():
+                raise RuntimeError("Terrain-ring detector did not become ready")
 
         # ============================================================
         #  第一段: 平滑轨迹巡航 + 航点测绘记录
@@ -717,24 +1087,32 @@ class Mission(object):
         #  打断后: navi.traj_running_event.clear() 停止轨迹，
         #          记录最近航点 → 执行动作 → 跳转到第二段接续。
         # ============================================================
-        # 构造完整轨迹（测绘航点 + 降落点），起点为当前位置
-        traj_list = self._build_smooth_traj(waypoints)
+        # 构造完整轨迹（测绘航点 + navi 原点降落），起点为当前位置
+        traj_waypoints = survey_waypoints + [(0.0, 0.0)]
+        traj_list = self._build_smooth_traj(traj_waypoints)
 
         # 启动异步轨迹
         navi.navigation_follow_trajectory(traj_list, wait=False)
         logger.info(f"[TRAJ] First-leg trajectory started (async), {len(traj_list)} pts")
+        self._ring_actions_enabled.set()
 
-        # 每航点 label 缓冲区
-        wp_label_bufs: List[List[str]] = [[] for _ in range(len(survey_waypoints))]
+        # 每航点只收集独立推理帧，避免 50 Hz 主循环重复统计同一结果。
+        wp_observation_bufs: List[List[RingObservation]] = [
+            [] for _ in range(len(survey_waypoints))
+        ]
         wp_recorded = [False] * len(survey_waypoints)
         wp_entry_radius2 = 10.0 ** 2   # 进入 10 cm 半径开始收集
         wp_exit_radius2 = 18.0 ** 2    # 离开 18 cm 半径停止收集（迟滞防抖）
         next_wp = 0
         within_wp = False
+        wp_observation_seq = 0
         debris_flow_hit = False
 
         while next_wp < len(survey_waypoints):
             time.sleep(0.02)  # 50 Hz
+
+            if self._ring_failed.is_set():
+                raise RuntimeError("Terrain-ring detector stopped unexpectedly")
 
             # 泥石流打断
             if self._ring_triggered.is_set():
@@ -744,13 +1122,19 @@ class Mission(object):
 
                 # 若正处在航点收集区内，先记录该航点再打断
                 if within_wp and not wp_recorded[next_wp]:
-                    buf = wp_label_bufs[next_wp]
-                    if buf:
-                        mode_label = max(set(buf), key=buf.count)
-                    else:
-                        mode_label = None
+                    observations = wp_observation_bufs[next_wp]
+                    wp_observation_seq = self._collect_new_survey_observation(
+                        observations,
+                        wp_observation_seq,
+                    )
+                    mode_label = self._select_survey_label(observations)
                     wx, wy = raw_waypoints[next_wp]
-                    self._record_survey_label(wx, wy, label=mode_label, sample_count=len(buf))
+                    self._record_survey_label(
+                        wx,
+                        wy,
+                        label=mode_label,
+                        sample_count=len(observations),
+                    )
                     wp_recorded[next_wp] = True
                     next_wp += 1
 
@@ -787,35 +1171,47 @@ class Mission(object):
                 # 进入航点收集区
                 if dist2 <= wp_entry_radius2:
                     within_wp = True
-                    wp_label_bufs[next_wp].clear()
-                    self._latest_ring_label = None
-                    self._latest_ring_updated_at = 0.0
-                    self._tvlog(f"WP {next_wp} ENTER zone ({wx:.0f}, {wy:.0f})")
-
-                    # 进入第一个航点时启动地形环后台检测
-                    if next_wp == 0 and self._ring_thread is None:
-                        self._start_ring_detection()
-            else:
-                # 在收集区内: 持续采集 label
-                if self._latest_ring_label is not None:
-                    wp_label_bufs[next_wp].append(self._latest_ring_label)
-                # 离开收集区: 取众数记录
-                if dist2 > wp_exit_radius2:
-                    self._tvlog(f"WP {next_wp} EXIT zone ({wx:.0f}, {wy:.0f})")
-                    buf = wp_label_bufs[next_wp]
-                    if buf:
-                        mode_label = max(set(buf), key=buf.count)
+                    wp_observation_bufs[next_wp].clear()
+                    if self.sim_vision is not None:
+                        wp_observation_seq = self.sim_vision.latest_frame_seq
                     else:
-                        mode_label = None
-                    self._record_survey_label(wx, wy, label=mode_label, sample_count=len(buf))
+                        wp_observation_seq = 0
+                    self._tvlog(
+                        f"WP {next_wp} ENTER zone ({wx:.0f}, {wy:.0f}) "
+                        f"after_frame={wp_observation_seq}"
+                    )
+            else:
+                # 在收集区内只追加尚未统计的新推理帧。
+                observations = wp_observation_bufs[next_wp]
+                wp_observation_seq = self._collect_new_survey_observation(
+                    observations,
+                    wp_observation_seq,
+                )
+
+                # 离开收集区：用独立帧的稳定多数结果记录。
+                if dist2 > wp_exit_radius2:
+                    mode_label = self._select_survey_label(observations)
+                    self._tvlog(
+                        f"WP {next_wp} EXIT zone ({wx:.0f}, {wy:.0f}) "
+                        f"samples={len(observations)} consensus={mode_label}"
+                    )
+                    self._record_survey_label(
+                        wx,
+                        wy,
+                        label=mode_label,
+                        sample_count=len(observations),
+                    )
                     wp_recorded[next_wp] = True
                     next_wp += 1
                     within_wp = False
 
-        # 收尾: 轨迹线程可能仍在运行，等待完成
+        # 收尾: 等待轨迹线程真正清除运行事件，避免与降落轨迹并发。
         if not debris_flow_hit:
-            logger.info("[TRAJ] First-leg trajectory complete")
-            navi.traj_running_event.wait()
+            if not self._wait_for_trajectory_finish(
+                "first-leg",
+                landing_wp,
+            ):
+                raise RuntimeError("First-leg trajectory did not reach landing point")
 
         # ============================================================
         #  第二段: 轨迹接续（仅泥石流打断后执行）
@@ -826,8 +1222,10 @@ class Mission(object):
         if debris_flow_hit:
             resume_start = self._debris_flow_wp_index + 1
             if resume_start < len(survey_waypoints):
-                resume_abs = waypoints[resume_start:]  # 测绘航点 → … → 降落点
-                raw_resume = raw_waypoints[resume_start:]  # 相对坐标用于记录
+                resume_abs = waypoints[resume_start:len(survey_waypoints)] + [(0.0, 0.0)]
+                raw_resume = raw_waypoints[
+                    resume_start:len(survey_waypoints)
+                ]  # 仅包含待记录的测绘航点
                 logger.info(
                     f"[MISSION] Second leg: {len(resume_abs)} waypoints via smooth trajectory, "
                     f"starting from raw[{resume_start}]={raw_waypoints[resume_start]}"
@@ -841,8 +1239,16 @@ class Mission(object):
 
                 next_rec = 0  # raw_resume 中下一个待记录的航点索引
                 wp_arrival_thres2 = 15.0 ** 2  # 到达判定阈值 15cm
+                wp_leave_thres2 = 22.0 ** 2
+                rec_within_wp = False
+                rec_observations: List[RingObservation] = []
+                rec_observation_seq = 0
                 while next_rec < len(raw_resume):
                     time.sleep(0.1)
+                    if self._ring_failed.is_set():
+                        raise RuntimeError(
+                            "Terrain-ring detector stopped unexpectedly"
+                        )
                     # 检查轨迹是否异常终止
                     if not navi.traj_running_event.is_set() and navi.traj_progress < 0.99:
                         logger.warning("[TRAJ] Second-leg trajectory stopped early")
@@ -853,16 +1259,62 @@ class Mission(object):
                     abs_wy = wy + self._origin_y
                     dx = float(navi.current_x) - abs_wx
                     dy = float(navi.current_y) - abs_wy
-                    if dx * dx + dy * dy <= wp_arrival_thres2:
-                        if (wx, wy) != (0.0, 0.0):
-                            self._record_survey_label(wx, wy)
-                        else:
-                            logger.info("[SURVEY] Reached landing wp, skip grid record")
-                        next_rec += 1
+                    dist2 = dx * dx + dy * dy
 
-                # 等待轨迹线程完全结束
-                logger.info("[TRAJ] Waiting for second-leg trajectory to finish")
-                navi.traj_running_event.wait()
+                    if (wx, wy) == (0.0, 0.0):
+                        if dist2 <= wp_arrival_thres2:
+                            logger.info("[SURVEY] Reached landing wp, skip grid record")
+                            next_rec += 1
+                        continue
+
+                    if not rec_within_wp:
+                        if dist2 <= wp_arrival_thres2:
+                            rec_within_wp = True
+                            rec_observations.clear()
+                            if self.sim_vision is not None:
+                                rec_observation_seq = (
+                                    self.sim_vision.latest_frame_seq
+                                )
+                            else:
+                                rec_observation_seq = 0
+                            self._tvlog(
+                                f"WP {resume_start + next_rec} ENTER zone "
+                                f"({wx:.0f}, {wy:.0f}) "
+                                f"after_frame={rec_observation_seq}"
+                            )
+                    else:
+                        rec_observation_seq = (
+                            self._collect_new_survey_observation(
+                                rec_observations,
+                                rec_observation_seq,
+                            )
+                        )
+                        if dist2 > wp_leave_thres2:
+                            selected_label = self._select_survey_label(
+                                rec_observations
+                            )
+                            self._tvlog(
+                                f"WP {resume_start + next_rec} EXIT zone "
+                                f"({wx:.0f}, {wy:.0f}) "
+                                f"samples={len(rec_observations)} "
+                                f"consensus={selected_label}"
+                            )
+                            self._record_survey_label(
+                                wx,
+                                wy,
+                                label=selected_label,
+                                sample_count=len(rec_observations),
+                            )
+                            next_rec += 1
+                            rec_within_wp = False
+
+                if not self._wait_for_trajectory_finish(
+                    "second-leg",
+                    landing_wp,
+                ):
+                    raise RuntimeError(
+                        "Second-leg trajectory did not reach landing point"
+                    )
             else:
                 logger.info("[MISSION] No remaining waypoints after debris_flow")
 
@@ -874,6 +1326,7 @@ class Mission(object):
         logger.info("=" * 50)
 
         # ---- 停止地形环检测 ----
+        self._ring_actions_enabled.clear()
         self._stop_ring.set()
 
         # ---- 降落 ----
@@ -970,7 +1423,9 @@ if __name__ == "__main__":
         remote_stop_event.wait(5.0)
     except Exception as e:
         if fleet_node is not None and start_command is not None:
-            fleet_node.command_queue.fail(start_command, int(AckReason.INTERNAL_ERROR))
+            fleet_node.command_queue.fail(
+                start_command, int(AckReason.INTERNAL_ERROR)
+            )
         logger.exception(f"[MANAGER] Mission Failed: {e}")
     finally:
         if fleet_node is not None:
