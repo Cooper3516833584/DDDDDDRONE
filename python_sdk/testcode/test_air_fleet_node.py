@@ -233,6 +233,29 @@ class AirFleetNodeTests(unittest.TestCase):
         queued = self.commands.receive(timeout=0.1)
         self.assertEqual(CommandId.DRONE_START_MISSION, queued.command_id)
 
+    def test_readonly_task_can_prepare_payload_without_pose(self):
+        self.node.close()
+        self.state = AirFleetState(int(NodeFlags.READY), 10)
+        self.transport = FakeTransport()
+        self.node = AirFleetNode(
+            self.transport,
+            lambda: self.state,
+            self.commands,
+            self.flight_stop,
+            NodeTiming(turnaround_s=0),
+            readonly=True,
+            allow_start_mission=True,
+        )
+        self.node.start()
+        self.node.feed_bytes(
+            request(13, CommandPayload(CommandId.DRONE_PREPARE_MISSION))
+        )
+        self.wait_for_writes(1)
+        ack = decode_ack(unpack_frame(self.transport.writes[0]).payload)
+        self.assertEqual(AckStatus.ACCEPTED, ack.status)
+        queued = self.commands.receive(timeout=0.1)
+        self.assertEqual(CommandId.DRONE_PREPARE_MISSION, queued.command_id)
+
     def test_survey_request_returns_task_snapshot(self):
         self.node.close()
         self.transport = FakeTransport()

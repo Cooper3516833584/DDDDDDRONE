@@ -116,6 +116,7 @@ SURVEY_MIN_CONFIRM_FRAMES = 2
 SURVEY_MIN_CONFIRM_RATIO = 0.60
 TRAJECTORY_FINISH_TIMEOUT = 45.0  # s
 TRAJECTORY_ENDPOINT_THRESHOLD = 15.0  # cm
+ELECTROMAGNET_OUTPUT_CHANNEL = 3
 
 # 测绘网格坐标 → 行列映射
 # 行 (3): x=100→0, x=170→1, x=240→2
@@ -141,6 +142,11 @@ TERRAIN_LABEL_TO_CODE = {
     "wildfire": int(TerrainCode.WILDFIRE),
 }
 # =================================
+
+
+def set_electromagnet(fc: FC_Like, engaged: bool) -> None:
+    """Hold or release the rescue payload through the established FC output."""
+    fc.set_digital_output(ELECTROMAGNET_OUTPUT_CHANNEL, engaged)
 
 
 @dataclass(frozen=True)
@@ -1153,8 +1159,8 @@ class Mission(object):
         ok = navi.wait_for_height(time_thres=0.5, height_thres=10, timeout=10)
         if not ok:
             logger.warning(f"[ACTION:debris_flow] Low height not reached")
-        # 3. 关泵
-        fc.set_digital_output(0, False)
+        # 3. 释放电磁铁
+        set_electromagnet(fc, False)
         # 4. 等 5s
         time.sleep(5.0)
         # 5. 回升
@@ -1641,8 +1647,9 @@ if __name__ == "__main__":
         logger.warning("[FLEET] Remote STOP received")
         mission.stop()
 
-    # 地面站负责从屏幕点击时刻计满 10 秒，再发送 FleetBus START。
-    # 本进程只在任务线程收到该命令后进入 mission.run()，STOP 始终可抢占。
+    # 地面站在屏幕 START 后先发送 PREPARE 使电磁铁吸合，计满起飞延时后
+    # 再发送 FleetBus START。本进程只在收到 START 后进入 mission.run()，
+    # STOP 始终可抢占。
 
     try:
         fleet_node = attach_air_fleet_node(
@@ -1664,6 +1671,14 @@ if __name__ == "__main__":
         while not remote_stop_event.is_set():
             command = fleet_node.command_queue.receive(timeout=0.25)
             if command is None:
+                continue
+            if command.command_id == int(CommandId.DRONE_PREPARE_MISSION):
+                set_electromagnet(fc, True)
+                fleet_node.command_queue.complete(command)
+                logger.info(
+                    f"[PAYLOAD] Ground START preparation accepted; electromagnet "
+                    f"engaged on output {ELECTROMAGNET_OUTPUT_CHANNEL}"
+                )
                 continue
             if command.command_id == int(CommandId.DRONE_START_MISSION):
                 start_command = command
@@ -1696,6 +1711,11 @@ if __name__ == "__main__":
             ret = fc.wait_for_lock()
             if not ret:
                 fc.lock()
+        try:
+            set_electromagnet(fc, False)
+            logger.info("[PAYLOAD] Electromagnet released during shutdown")
+        except Exception as e:
+            logger.exception(f"[PAYLOAD] Electromagnet shutdown failed: {e}")
         sim_vision.close()
 
     logger.info("[MANAGER] Mission finished")

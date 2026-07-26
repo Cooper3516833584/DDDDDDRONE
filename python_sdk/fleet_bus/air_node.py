@@ -203,7 +203,10 @@ class AirFleetNode:
 
         if self._readonly and not (
             self._allow_start_mission
-            and command.command_id == int(CommandId.DRONE_START_MISSION)
+            and command.command_id in (
+                int(CommandId.DRONE_START_MISSION),
+                int(CommandId.DRONE_PREPARE_MISSION),
+            )
         ):
             return self._ack(
                 request, command.command_id, AckStatus.REJECTED, AckReason.UNSUPPORTED
@@ -212,7 +215,10 @@ class AirFleetNode:
         if command.command_id != int(CommandId.TARGETED_STOP):
             state = self._state_provider()
             if (
-                command.command_id != int(CommandId.DRONE_START_MISSION)
+                command.command_id not in (
+                    int(CommandId.DRONE_START_MISSION),
+                    int(CommandId.DRONE_PREPARE_MISSION),
+                )
                 and not state.node_flags & 0x0001
             ):
                 return self._ack(
@@ -246,6 +252,7 @@ class AirFleetNode:
             int(CommandId.DRONE_HOLD),
             int(CommandId.CANCEL_TASK),
             int(CommandId.DRONE_START_MISSION),
+            int(CommandId.DRONE_PREPARE_MISSION),
         ):
             if command.command_body:
                 raise ProtocolError("payload", "command body must be empty")
