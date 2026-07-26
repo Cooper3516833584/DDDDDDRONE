@@ -1097,8 +1097,7 @@ class Mission(object):
             return SurveyState(
                 survey_revision=self._survey_revision,
                 survey_flags=(
-                    int(SurveyFlags.ABSOLUTE_POSITIONS)
-                    | (int(SurveyFlags.COMPLETE) if self._survey_complete else 0)
+                    int(SurveyFlags.COMPLETE) if self._survey_complete else 0
                 ),
                 wildfire_event_id=wildfire_id,
                 wildfire_row=wildfire_row,
@@ -1107,7 +1106,10 @@ class Mission(object):
                 debris_row=debris_row,
                 debris_col=debris_col,
                 terrain_codes=codes,
-                cell_positions_cm=SURVEY_CELL_POSITIONS_CM,
+                # These fixed 3x5 centres are already shared by the ground
+                # station. Omitting them keeps the FC UT2/HC-14 bridge frame
+                # below the size that can block its acknowledged send path.
+                cell_positions_cm=(),
             )
 
     def _log_survey_grid(self) -> None:

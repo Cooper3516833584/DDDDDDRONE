@@ -16,7 +16,8 @@ available; receiving the frame alone never invokes takeoff or another flight
 operation.
 
 The disaster survey publishes its field pose in centimetres with the field
-bottom-left as `(0,0)`, `+X` to the right and `+Y` upward.  Its survey report
-sets `SurveyFlags.ABSOLUTE_POSITIONS` and appends the 15 row-major cell centres;
-an unrecognized cell remains `TerrainCode.UNKNOWN (0)` even when the survey is
+bottom-left as `(0,0)`, `+X` to the right and `+Y` upward. Its 3x5 cell centres
+are fixed and shared with the ground station, so the task omits the optional
+absolute-position extension to keep every FC UT2/HC-14 response bounded. An
+unrecognized cell remains `TerrainCode.UNKNOWN (0)` even when the survey is
 marked complete.
