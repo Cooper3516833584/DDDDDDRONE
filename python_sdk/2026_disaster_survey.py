@@ -931,7 +931,7 @@ class Mission(object):
             (x + self._origin_x, y + self._origin_y) for (x, y) in raw_waypoints
         ]
         survey_waypoints = waypoints[:-1]   # 15 个测绘航点
-        landing_wp = waypoints[-1]           # 降落点
+        landing_wp = (0.0, 0.0)             # 降落点为 navi 原点
 
         # 校准结束后只接受此刻之后采集的新帧。检测就绪前保持原点悬停，
         # 不启动轨迹，避免模型过渡期与航点位置错位。
@@ -950,8 +950,9 @@ class Mission(object):
         #  打断后: navi.traj_running_event.clear() 停止轨迹，
         #          记录最近航点 → 执行动作 → 跳转到第二段接续。
         # ============================================================
-        # 构造完整轨迹（测绘航点 + 降落点），起点为当前位置
-        traj_list = self._build_smooth_traj(waypoints)
+        # 构造完整轨迹（测绘航点 + navi 原点降落），起点为当前位置
+        traj_waypoints = survey_waypoints + [(0.0, 0.0)]
+        traj_list = self._build_smooth_traj(traj_waypoints)
 
         # 启动异步轨迹
         navi.navigation_follow_trajectory(traj_list, wait=False)
@@ -1081,7 +1082,7 @@ class Mission(object):
         if debris_flow_hit:
             resume_start = self._debris_flow_wp_index + 1
             if resume_start < len(survey_waypoints):
-                resume_abs = waypoints[resume_start:]  # 测绘航点 → … → 降落点
+                resume_abs = waypoints[resume_start:len(survey_waypoints)] + [(0.0, 0.0)]
                 raw_resume = raw_waypoints[resume_start:]  # 相对坐标用于记录
                 logger.info(
                     f"[MISSION] Second leg: {len(resume_abs)} waypoints via smooth trajectory, "
