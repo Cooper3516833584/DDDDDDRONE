@@ -7,7 +7,7 @@
   3. 记录校准点为坐标原点
   4. 逐个航点导航（3×5 蛇形，100/170/240 × -40/-110/-180/-250/-320），
      每到达一个测绘航点记录 YOLO 地形 label 到网格
-  5. 巡航期间 10 Hz 检测地形环。泥石流(debris_flow)像素距离 < 50px
+  5. 巡航期间 10 Hz 检测地形环。泥石流(debris_flow)像素距离 < 75px
      时打断（整次飞行仅触发一次），记录当前最近航点，执行泥石流动作后
      以 smooth 轨迹接续所有后续航点（不含泥石流航点），
      到达后续航点时继续记录 label
@@ -20,8 +20,12 @@ ROS 建图组件启动流程参考 base_test.py 与 former_code/2024_D_24.py。
 
 视觉日志: python_sdk/vision_for_simulation/ring_detection_*.log
 每次地形推理结果、航点出入事件均以时间戳记录，无需设置环境变量。
+飞行录像: python_sdk/vision_for_simulation/camera_recording_*.avi
+帧索引:   python_sdk/vision_for_simulation/camera_recording_*.csv
 """
+import csv
 import os
+import queue
 import sys
 import threading
 import time
@@ -85,12 +89,20 @@ VISION_FRAME_MAX_AGE = 0.5    # s
 CAMERA_FIRST_FRAME_TIMEOUT = 8.0  # s
 CAMERA_READ_FAILURE_LOG_INTERVAL = 2.0  # s
 
+# 飞行画面录像：编码在独立线程中执行，队列满时保留最新帧，避免阻塞采集。
+VIDEO_RECORD_ENABLED = True
+VIDEO_RECORD_FPS = 10.0
+VIDEO_RECORD_FOURCC = "MJPG"
+VIDEO_RECORD_QUEUE_SIZE = 2
+VIDEO_RECORD_MAX_SECONDS = 15 * 60
+VIDEO_RECORD_JOIN_TIMEOUT = 3.0
+
 # YOLO 仿真模型 7 类地形:
 #   0:snow_mountain  1:field  2:river  3:settlements
 #   4:lake           5:debris_flow(泥石流)  6:wildfire
 
-# 泥石流打断像素距离阈值（偏移 < 50px 才触发）
-DEBRIS_FLOW_PX_THRESH = 50    # px
+# 泥石流打断像素距离阈值（偏移 < 75px 才触发）
+DEBRIS_FLOW_PX_THRESH = 75    # px
 DEBRIS_FLOW_CONFIRM_FRAMES = 2
 
 # 航点标签确认：只统计独立推理帧，至少 2 帧且多数占比不低于 60%
@@ -177,11 +189,22 @@ class SimVisionTask:
         self._capture_error: Optional[str] = None
         self._capture_read_failures = 0
         self._capture_started_at = 0.0
+        self._record_stop = threading.Event()
+        self._record_queue = queue.Queue(maxsize=VIDEO_RECORD_QUEUE_SIZE)
+        self._record_thread: Optional[threading.Thread] = None
+        self._record_video_path: Optional[str] = None
+        self._record_index_path: Optional[str] = None
+        self._record_dropped_frames = 0
+        self._record_error: Optional[str] = None
 
     def open(self):
         if self._cap is None:
             self._cap = _open_persistent_camera(self._camera_index)
             self._capture_stop.clear()
+            self._record_stop.clear()
+            self._record_queue = queue.Queue(maxsize=VIDEO_RECORD_QUEUE_SIZE)
+            self._record_dropped_frames = 0
+            self._record_error = None
             with self._capture_condition:
                 self._latest_frame = None
                 self._latest_frame_seq = 0
@@ -190,6 +213,28 @@ class SimVisionTask:
                 self._capture_error = None
                 self._capture_read_failures = 0
                 self._capture_started_at = time.perf_counter()
+            if VIDEO_RECORD_ENABLED:
+                output_dir = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "vision_for_simulation",
+                )
+                os.makedirs(output_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                basename = f"camera_recording_{timestamp}"
+                self._record_video_path = os.path.join(
+                    output_dir,
+                    f"{basename}.avi",
+                )
+                self._record_index_path = os.path.join(
+                    output_dir,
+                    f"{basename}.csv",
+                )
+                self._record_thread = threading.Thread(
+                    target=self._record_loop,
+                    name="simulation-camera-recorder",
+                    daemon=True,
+                )
+                self._record_thread.start()
             self._capture_thread = threading.Thread(
                 target=self._capture_loop,
                 name="simulation-camera-capture",
@@ -205,6 +250,14 @@ class SimVisionTask:
             and self._capture_thread is not threading.current_thread()
         ):
             self._capture_thread.join(timeout=1.0)
+        self._record_stop.set()
+        if (
+            self._record_thread is not None
+            and self._record_thread is not threading.current_thread()
+        ):
+            self._record_thread.join(timeout=VIDEO_RECORD_JOIN_TIMEOUT)
+            if self._record_thread.is_alive():
+                logger.warning("[VISION] Camera recorder did not stop in time")
         if self._cap is not None:
             self._cap.release()
             logger.info(f"[VISION] Camera {self._camera_index} released")
@@ -218,11 +271,159 @@ class SimVisionTask:
                 logger.warning("[VISION] Camera capture thread did not stop in time")
         self._cap = None
         self._capture_thread = None
+        self._record_thread = None
 
     def stop(self):
         self._capture_stop.set()
+        self._record_stop.set()
         with self._capture_condition:
             self._capture_condition.notify_all()
+
+    def _enqueue_recording_frame(
+        self,
+        frame: np.ndarray,
+        frame_seq: int,
+        captured_at: float,
+        captured_wall_time: float,
+    ) -> None:
+        record_thread = self._record_thread
+        if (
+            not VIDEO_RECORD_ENABLED
+            or record_thread is None
+            or not record_thread.is_alive()
+            or self._record_stop.is_set()
+        ):
+            return
+
+        item = (
+            frame_seq,
+            captured_at,
+            captured_wall_time,
+            frame,
+        )
+        try:
+            self._record_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            self._record_queue.get_nowait()
+            self._record_dropped_frames += 1
+        except queue.Empty:
+            pass
+
+        try:
+            self._record_queue.put_nowait(item)
+        except queue.Full:
+            self._record_dropped_frames += 1
+
+    def _record_loop(self) -> None:
+        video_writer = None
+        index_file = None
+        index_writer = None
+        saved_frames = 0
+        first_captured_at = None
+
+        try:
+            while (
+                not self._record_stop.is_set()
+                or not self._record_queue.empty()
+            ):
+                try:
+                    (
+                        frame_seq,
+                        captured_at,
+                        captured_wall_time,
+                        frame,
+                    ) = self._record_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                if first_captured_at is None:
+                    first_captured_at = captured_at
+                elif (
+                    captured_at - first_captured_at
+                    > VIDEO_RECORD_MAX_SECONDS
+                ):
+                    logger.warning(
+                        "[VISION] Camera recording reached "
+                        f"{VIDEO_RECORD_MAX_SECONDS}s limit"
+                    )
+                    break
+
+                if video_writer is None:
+                    if (
+                        self._record_video_path is None
+                        or self._record_index_path is None
+                    ):
+                        raise RuntimeError("Camera recording paths are unset")
+                    frame_height, frame_width = frame.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(
+                        *VIDEO_RECORD_FOURCC
+                    )
+                    video_writer = cv2.VideoWriter(
+                        self._record_video_path,
+                        fourcc,
+                        VIDEO_RECORD_FPS,
+                        (frame_width, frame_height),
+                    )
+                    if not video_writer.isOpened():
+                        raise RuntimeError(
+                            "Unable to open camera video writer: "
+                            f"{self._record_video_path}"
+                        )
+                    index_file = open(
+                        self._record_index_path,
+                        "w",
+                        newline="",
+                        encoding="utf-8",
+                    )
+                    index_writer = csv.writer(index_file)
+                    index_writer.writerow(
+                        (
+                            "video_frame_index",
+                            "camera_frame_seq",
+                            "captured_wall_time",
+                            "captured_at_monotonic",
+                        )
+                    )
+                    logger.info(
+                        "[VISION] Camera recording started: "
+                        f"{self._record_video_path}"
+                    )
+
+                video_writer.write(frame)
+                if index_writer is not None:
+                    index_writer.writerow(
+                        (
+                            saved_frames,
+                            frame_seq,
+                            datetime.fromtimestamp(
+                                captured_wall_time
+                            ).isoformat(timespec="milliseconds"),
+                            f"{captured_at:.9f}",
+                        )
+                    )
+                saved_frames += 1
+                if index_file is not None and saved_frames % 10 == 0:
+                    index_file.flush()
+        except Exception as exc:
+            self._record_error = f"{type(exc).__name__}: {exc}"
+            logger.exception(
+                f"[VISION] Camera recording failed: {self._record_error}"
+            )
+        finally:
+            if video_writer is not None:
+                video_writer.release()
+            if index_file is not None:
+                index_file.flush()
+                index_file.close()
+            logger.info(
+                "[VISION] Camera recording stopped "
+                f"(saved={saved_frames}, "
+                f"dropped={self._record_dropped_frames})"
+            )
 
     def _capture_loop(self) -> None:
         """唯一读取 VideoCapture 的线程；始终只保留最新一帧。"""
@@ -254,12 +455,20 @@ class SimVisionTask:
                 self._capture_stop.wait(0.05)
                 continue
             captured_at = time.perf_counter()
+            captured_wall_time = time.time()
             with self._capture_condition:
                 first_frame = self._latest_frame_seq == 0
                 self._latest_frame = frame
                 self._latest_frame_seq += 1
+                frame_seq = self._latest_frame_seq
                 self._latest_frame_time = captured_at
                 self._capture_condition.notify_all()
+            self._enqueue_recording_frame(
+                frame,
+                frame_seq,
+                captured_at,
+                captured_wall_time,
+            )
             if first_frame:
                 logger.info(
                     f"[VISION] Camera {self._camera_index} first frame ready "
@@ -388,7 +597,7 @@ class SimVisionTask:
 class Mission(object):
     """2026 模拟赛 — 空地协同测绘救灾系统。
 
-    第一段: 逐个航点导航 + 测绘记录，泥石流 (debris_flow) 像素距离 < 50px 时打断。
+    第一段: 逐个航点导航 + 测绘记录，泥石流 (debris_flow) 像素距离 < 75px 时打断。
     第二段: 泥石流动作后以 smooth 轨迹遍历剩余航点，继续记录 label。
     泥石流整次飞行最多触发一次。
     """
@@ -1083,7 +1292,7 @@ class Mission(object):
         #  整体平滑轨迹，异步执行。主线程 50 Hz 轮询当前位置，
         #  对每个测绘航点在 10 cm 半径内收集 label，离开时取众数记录。
         #
-        #  泥石流打断条件同前: debis_flow 距离 < 50px 且本轮未触发过。
+        #  泥石流打断条件同前: debis_flow 距离 < 75px 且本轮未触发过。
         #  打断后: navi.traj_running_event.clear() 停止轨迹，
         #          记录最近航点 → 执行动作 → 跳转到第二段接续。
         # ============================================================
