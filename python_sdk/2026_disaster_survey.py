@@ -90,6 +90,8 @@ DEBRIS_FLOW_CONFIRM_FRAMES = 2
 # 航点标签确认：只统计独立推理帧，至少 2 帧且多数占比不低于 60%
 SURVEY_MIN_CONFIRM_FRAMES = 2
 SURVEY_MIN_CONFIRM_RATIO = 0.60
+TRAJECTORY_FINISH_TIMEOUT = 45.0  # s
+TRAJECTORY_ENDPOINT_THRESHOLD = 15.0  # cm
 
 # 测绘网格坐标 → 行列映射
 # 行 (3): x=100→0, x=170→1, x=240→2
@@ -706,6 +708,7 @@ class Mission(object):
     def _record_survey_label(
         self, rel_x: float, rel_y: float, label: Optional[str] = None,
         sample_count: int = 0,
+        flash_wildfire: bool = True,
     ) -> None:
         """将指定 label 记录到测绘网格。未提供 label 时使用 _latest_ring_label。"""
         x_key = int(round(rel_x))
@@ -747,7 +750,7 @@ class Mission(object):
             f"[SURVEY] Grid[{row}][{col}] (x={x_key}, y={y_key})"
             f" = {selected_label}{extra}"
         )
-        if new_wildfire:
+        if new_wildfire and flash_wildfire:
             threading.Thread(
                 target=self._flash_indicator,
                 args=((255, 0, 0),),
@@ -891,6 +894,43 @@ class Mission(object):
             f"({start_x:.0f}, {start_y:.0f}) through {len(waypoints)} waypoints"
         )
         return traj_list
+
+    def _wait_for_trajectory_finish(
+        self,
+        name: str,
+        endpoint: Tuple[float, float],
+        timeout: float = TRAJECTORY_FINISH_TIMEOUT,
+    ) -> bool:
+        """等待异步轨迹线程清除运行事件，并核验最终水平位置。"""
+        logger.info(f"[TRAJ] Waiting for {name} trajectory to finish")
+        deadline = time.perf_counter() + max(1.0, timeout)
+        while self.navi.traj_running_event.is_set():
+            if time.perf_counter() >= deadline:
+                logger.error(
+                    f"[TRAJ] {name} trajectory finish timeout "
+                    f"({timeout:.1f}s)"
+                )
+                self.navi.traj_running_event.clear()
+                self.navi.stop_move()
+                return False
+            time.sleep(0.05)
+
+        dx = float(self.navi.current_x) - float(endpoint[0])
+        dy = float(self.navi.current_y) - float(endpoint[1])
+        distance = float(np.hypot(dx, dy))
+        if distance > TRAJECTORY_ENDPOINT_THRESHOLD:
+            logger.error(
+                f"[TRAJ] {name} trajectory ended {distance:.1f}cm "
+                f"from endpoint {endpoint}"
+            )
+            self.navi.stop_move()
+            return False
+
+        logger.info(
+            f"[TRAJ] {name} trajectory finished "
+            f"({distance:.1f}cm from endpoint)"
+        )
+        return True
 
     # ================================================================
     #  主任务
@@ -1124,10 +1164,13 @@ class Mission(object):
                     next_wp += 1
                     within_wp = False
 
-        # 收尾: 轨迹线程可能仍在运行，等待完成
+        # 收尾: 等待轨迹线程真正清除运行事件，避免与降落轨迹并发。
         if not debris_flow_hit:
-            logger.info("[TRAJ] First-leg trajectory complete")
-            navi.traj_running_event.wait()
+            if not self._wait_for_trajectory_finish(
+                "first-leg",
+                landing_wp,
+            ):
+                raise RuntimeError("First-leg trajectory did not reach landing point")
 
         # ============================================================
         #  第二段: 轨迹接续（仅泥石流打断后执行）
@@ -1139,7 +1182,9 @@ class Mission(object):
             resume_start = self._debris_flow_wp_index + 1
             if resume_start < len(survey_waypoints):
                 resume_abs = waypoints[resume_start:len(survey_waypoints)] + [(0.0, 0.0)]
-                raw_resume = raw_waypoints[resume_start:]  # 相对坐标用于记录
+                raw_resume = raw_waypoints[
+                    resume_start:len(survey_waypoints)
+                ]  # 仅包含待记录的测绘航点
                 logger.info(
                     f"[MISSION] Second leg: {len(resume_abs)} waypoints via smooth trajectory, "
                     f"starting from raw[{resume_start}]={raw_waypoints[resume_start]}"
@@ -1222,9 +1267,13 @@ class Mission(object):
                             next_rec += 1
                             rec_within_wp = False
 
-                # 等待轨迹线程完全结束
-                logger.info("[TRAJ] Waiting for second-leg trajectory to finish")
-                navi.traj_running_event.wait()
+                if not self._wait_for_trajectory_finish(
+                    "second-leg",
+                    landing_wp,
+                ):
+                    raise RuntimeError(
+                        "Second-leg trajectory did not reach landing point"
+                    )
             else:
                 logger.info("[MISSION] No remaining waypoints after debris_flow")
 
