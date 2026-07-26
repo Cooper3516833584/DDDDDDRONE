@@ -116,7 +116,7 @@ SURVEY_MIN_CONFIRM_FRAMES = 2
 SURVEY_MIN_CONFIRM_RATIO = 0.60
 TRAJECTORY_FINISH_TIMEOUT = 45.0  # s
 TRAJECTORY_ENDPOINT_THRESHOLD = 15.0  # cm
-ELECTROMAGNET_OUTPUT_CHANNEL = 3
+ELECTROMAGNET_OUTPUT_CHANNEL = 0
 
 # 测绘网格坐标 → 行列映射
 # 行 (3): x=100→0, x=170→1, x=240→2
@@ -1669,18 +1669,22 @@ if __name__ == "__main__":
             name="fleet-remote-stop",
             daemon=True,
         ).start()
+
+        # 在等待地面站 PREPARE 之前就吸合电磁铁，确保起飞前负载已被锁住。
+        set_electromagnet(fc, True)
+        logger.info(
+            f"[PAYLOAD] Electromagnet engaged on output "
+            f"{ELECTROMAGNET_OUTPUT_CHANNEL} (before PREPARE)"
+        )
+
         logger.info("[FLEET] Waiting for ground-station START")
         while not remote_stop_event.is_set():
             command = fleet_node.command_queue.receive(timeout=0.25)
             if command is None:
                 continue
             if command.command_id == int(CommandId.DRONE_PREPARE_MISSION):
-                set_electromagnet(fc, True)
                 fleet_node.command_queue.complete(command)
-                logger.info(
-                    f"[PAYLOAD] Ground START preparation accepted; electromagnet "
-                    f"engaged on output {ELECTROMAGNET_OUTPUT_CHANNEL}"
-                )
+                logger.info("[PAYLOAD] Ground PREPARE acknowledged")
                 continue
             if command.command_id == int(CommandId.DRONE_START_MISSION):
                 start_command = command
