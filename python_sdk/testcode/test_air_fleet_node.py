@@ -210,10 +210,38 @@ class AirFleetNodeTests(unittest.TestCase):
         self.assertEqual(AckStatus.COMPLETED, stop_ack.status)
         self.assertTrue(self.flight_stop.is_set())
 
+    def test_readonly_task_can_explicitly_allow_start_without_pose(self):
+        self.node.close()
+        self.state = AirFleetState(int(NodeFlags.READY), 10)
+        self.transport = FakeTransport()
+        self.node = AirFleetNode(
+            self.transport,
+            lambda: self.state,
+            self.commands,
+            self.flight_stop,
+            NodeTiming(turnaround_s=0),
+            readonly=True,
+            allow_start_mission=True,
+        )
+        self.node.start()
+        self.node.feed_bytes(
+            request(7, CommandPayload(CommandId.DRONE_START_MISSION))
+        )
+        self.wait_for_writes(1)
+        ack = decode_ack(unpack_frame(self.transport.writes[0]).payload)
+        self.assertEqual(AckStatus.ACCEPTED, ack.status)
+        queued = self.commands.receive(timeout=0.1)
+        self.assertEqual(CommandId.DRONE_START_MISSION, queued.command_id)
+
     def test_survey_request_returns_task_snapshot(self):
         self.node.close()
         self.transport = FakeTransport()
         terrain = (1,) * 14 + (7,)
+        positions = tuple(
+            (115 + 70 * col, 175 + 70 * row)
+            for row in range(3)
+            for col in range(5)
+        )
         self.node = AirFleetNode(
             self.transport,
             lambda: self.state,
@@ -222,11 +250,12 @@ class AirFleetNodeTests(unittest.TestCase):
             NodeTiming(turnaround_s=0),
             survey_provider=lambda: SurveyState(
                 survey_revision=9,
-                survey_flags=1,
+                survey_flags=3,
                 wildfire_event_id=3,
                 wildfire_row=2,
                 wildfire_col=4,
                 terrain_codes=terrain,
+                cell_positions_cm=positions,
             ),
         )
         self.node.start()
@@ -250,6 +279,7 @@ class AirFleetNodeTests(unittest.TestCase):
             survey.wildfire_row,
             survey.wildfire_col,
         ))
+        self.assertEqual((395, 315), survey.cell_positions_cm[-1])
 
 
 class PoseProviderTests(unittest.TestCase):
@@ -298,6 +328,18 @@ class PoseProviderTests(unittest.TestCase):
             (result.x_cm, result.y_cm, result.z_cm, result.pose_quality),
         )
         self.assertFalse(result.node_flags & int(NodeFlags.POSE_VALID))
+
+    def test_task_transform_reports_field_absolute_pose(self):
+        fc = self.FC()
+        fc.state = self.State()
+        result = NavigationAirStateProvider(
+            fc,
+            self.Navigation(),
+            position_transform=lambda x, y: (75 - y, 75 + x),
+            heading_offset_deg=90,
+        )()
+        self.assertEqual((325, 200), (result.x_cm, result.y_cm))
+        self.assertEqual(0, result.heading_cdeg)
 
 
 if __name__ == "__main__":

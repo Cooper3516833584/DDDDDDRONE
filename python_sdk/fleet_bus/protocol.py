@@ -485,7 +485,7 @@ def encode_survey_report(payload: SurveyReportPayload) -> bytes:
             _require_range(name + "_col", col, 0, 4)
         elif row != 0xFF or col != 0xFF:
             raise ProtocolError("payload", name + " event cell must be 255 when absent")
-    return SURVEY_REPORT_HEADER.pack(
+    encoded = SURVEY_REPORT_HEADER.pack(
         _require_u32("request_session", payload.request_session),
         _require_u16("request_seq", payload.request_seq),
         _require_u16("survey_revision", payload.survey_revision),
@@ -497,14 +497,44 @@ def encode_survey_report(payload: SurveyReportPayload) -> bytes:
         payload.debris_row,
         payload.debris_col,
     ) + _encode_terrain_codes(payload.terrain_codes)
+    has_positions = bool(payload.survey_flags & 0x02)
+    if has_positions != bool(payload.cell_positions_cm):
+        raise ProtocolError(
+            "payload", "survey absolute-position flag/data mismatch"
+        )
+    if has_positions:
+        if len(payload.cell_positions_cm) != SURVEY_CELL_COUNT:
+            raise ProtocolError(
+                "payload", "survey positions must contain 15 cells"
+            )
+        encoded += b"".join(
+            POINT.pack(
+                _require_i32("cell_x_cm", x_cm),
+                _require_i32("cell_y_cm", y_cm),
+            )
+            for x_cm, y_cm in payload.cell_positions_cm
+        )
+    return encoded
 
 
 def decode_survey_report(data: bytes) -> SurveyReportPayload:
-    expected = SURVEY_REPORT_HEADER.size + SURVEY_CELL_COUNT
-    if len(data) != expected:
+    base_size = SURVEY_REPORT_HEADER.size + SURVEY_CELL_COUNT
+    if len(data) < base_size:
         raise ProtocolError("payload", "SURVEY_REPORT payload has invalid length")
     values = SURVEY_REPORT_HEADER.unpack_from(data)
-    payload = SurveyReportPayload(*values, tuple(data[SURVEY_REPORT_HEADER.size:]))
+    has_positions = bool(values[3] & 0x02)
+    expected = base_size + (SURVEY_CELL_COUNT * POINT.size if has_positions else 0)
+    if len(data) != expected:
+        raise ProtocolError("payload", "SURVEY_REPORT payload has invalid length")
+    positions = tuple(
+        POINT.unpack_from(data, base_size + index * POINT.size)
+        for index in range(SURVEY_CELL_COUNT)
+    ) if has_positions else ()
+    payload = SurveyReportPayload(
+        *values,
+        tuple(data[SURVEY_REPORT_HEADER.size:base_size]),
+        positions,
+    )
     encode_survey_report(payload)
     return payload
 

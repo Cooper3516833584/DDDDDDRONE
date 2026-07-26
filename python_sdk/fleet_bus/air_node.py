@@ -46,6 +46,7 @@ class AirFleetNode:
         stop_event: threading.Event,
         timing: NodeTiming = NodeTiming(),
         readonly: bool = False,
+        allow_start_mission: bool = False,
         survey_provider: Optional[Callable[[], SurveyState]] = None,
         wait: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -55,6 +56,7 @@ class AirFleetNode:
         self._flight_stop_event = stop_event
         self._timing = timing
         self._readonly = readonly
+        self._allow_start_mission = allow_start_mission
         self._survey_provider = survey_provider
         self._wait = wait
         self._parser = FrameParser(int(NodeId.DRONE))
@@ -170,6 +172,7 @@ class AirFleetNode:
                 state.debris_row,
                 state.debris_col,
                 state.terrain_codes,
+                state.cell_positions_cm,
             )
         )
         return self._response(request, MessageKind.SURVEY_REPORT, payload)
@@ -198,14 +201,20 @@ class AirFleetNode:
                 request, command.command_id, AckStatus.COMPLETED, AckReason.NONE
             )
 
-        if self._readonly:
+        if self._readonly and not (
+            self._allow_start_mission
+            and command.command_id == int(CommandId.DRONE_START_MISSION)
+        ):
             return self._ack(
                 request, command.command_id, AckStatus.REJECTED, AckReason.UNSUPPORTED
             )
 
         if command.command_id != int(CommandId.TARGETED_STOP):
             state = self._state_provider()
-            if not state.node_flags & 0x0001:
+            if (
+                command.command_id != int(CommandId.DRONE_START_MISSION)
+                and not state.node_flags & 0x0001
+            ):
                 return self._ack(
                     request,
                     command.command_id,
@@ -236,6 +245,7 @@ class AirFleetNode:
             int(CommandId.TARGETED_STOP),
             int(CommandId.DRONE_HOLD),
             int(CommandId.CANCEL_TASK),
+            int(CommandId.DRONE_START_MISSION),
         ):
             if command.command_body:
                 raise ProtocolError("payload", "command body must be empty")
@@ -283,7 +293,10 @@ def attach_air_fleet_node(
     navigation: object,
     stop_event: threading.Event,
     readonly: bool = False,
+    allow_start_mission: bool = False,
     survey_provider: Optional[Callable[[], SurveyState]] = None,
+    position_transform: Optional[Callable] = None,
+    heading_offset_deg: float = 0.0,
 ) -> AirFleetNode:
     """Create the one FCWirelessTransport callback owner for FleetBus mode."""
     from FlightController.Components.GroundStationLink.transport import (
@@ -299,10 +312,16 @@ def attach_air_fleet_node(
     commands = AirCommandQueue()
     node = AirFleetNode(
         transport,
-        NavigationAirStateProvider(fc, navigation),
+        NavigationAirStateProvider(
+            fc,
+            navigation,
+            position_transform=position_transform,
+            heading_offset_deg=heading_offset_deg,
+        ),
         commands,
         stop_event,
         readonly=readonly,
+        allow_start_mission=allow_start_mission,
         survey_provider=survey_provider,
     )
     holder["node"] = node

@@ -49,7 +49,7 @@ from vision_for_simulation.terrain_ring import (
 )
 from vision_for_simulation.camera_offsets import _center_to_offset
 from fleet_bus.air_node import attach_air_fleet_node
-from fleet_bus.models import SurveyFlags, SurveyState, TerrainCode
+from fleet_bus.models import AckReason, CommandId, SurveyFlags, SurveyState, TerrainCode
 
 # ============ 可调参数 ============
 CRUISE_SPEED = 22            # 水平导航速度 cm/s
@@ -84,6 +84,13 @@ DEBRIS_FLOW_PX_THRESH = 50    # px
 # 列 (5): y=-40→0, y=-110→1, y=-180→2, y=-250→3, y=-320→4
 SURVEY_X_TO_ROW: Dict[int, int] = {100: 0, 170: 1, 240: 2}
 SURVEY_Y_TO_COL: Dict[int, int] = {-40: 0, -110: 1, -180: 2, -250: 3, -320: 4}
+FIELD_TAKEOFF_CENTRE_CM = (75, 75)
+SURVEY_CELL_POSITIONS_CM = tuple(
+    (FIELD_TAKEOFF_CENTRE_CM[0] - local_y,
+     FIELD_TAKEOFF_CENTRE_CM[1] + local_x)
+    for local_x in (100, 170, 240)
+    for local_y in (-40, -110, -180, -250, -320)
+)
 TERRAIN_LABEL_TO_CODE = {
     "snow_mountain": int(TerrainCode.SNOW_MOUNTAIN),
     "field": int(TerrainCode.FIELD),
@@ -217,6 +224,7 @@ class Mission(object):
         # 坐标原点（视觉校准后设置）
         self._origin_x: float = 0.0
         self._origin_y: float = 0.0
+        self._origin_ready = False
 
         # 3×5 测绘网格
         self._survey_grid: List[List[Optional[str]]] = [
@@ -235,6 +243,7 @@ class Mission(object):
 
         # 后台检测线程持续更新的最新 label
         self._latest_ring_label: Optional[str] = None
+        self._latest_ring_updated_at = 0.0
 
         # 泥石流打断 — 单次飞行仅触发一次
         self._debris_flow_triggered_once: bool = False
@@ -279,6 +288,19 @@ class Mission(object):
         self.navi.stop()
         self._tvlog_close()
         logger.info("[MISSION] Mission stopped")
+
+    def navigation_pose_to_field(
+        self, navigation_x_cm: float, navigation_y_cm: float
+    ) -> Optional[Tuple[float, float]]:
+        """Convert navigation coordinates to the 480×400 cm field frame."""
+        if not self._origin_ready:
+            return None
+        relative_x = navigation_x_cm - self._origin_x
+        relative_y = navigation_y_cm - self._origin_y
+        return (
+            FIELD_TAKEOFF_CENTRE_CM[0] - relative_y,
+            FIELD_TAKEOFF_CENTRE_CM[1] + relative_x,
+        )
 
     # ================================================================
     #  起飞矩形视觉校准
@@ -367,6 +389,7 @@ class Mission(object):
                     f"RING frame: label={label} offset=(x={x_px:.0f}, y={y_px:.0f})px"
                 )
                 self._latest_ring_label = label
+                self._latest_ring_updated_at = time.monotonic()
 
                 # 泥石流打断: 像素距离 < 50px 且本轮飞行未触发过
                 if label == "debris_flow" and not self._debris_flow_triggered_once:
@@ -381,6 +404,9 @@ class Mission(object):
                         self.navi.traj_running_event.clear()
             else:
                 self._tvlog("RING frame: (none)")
+                # A missed detection must not reuse the previous cell's label.
+                self._latest_ring_label = None
+                self._latest_ring_updated_at = 0.0
 
             self._stop_ring.wait(dt)
 
@@ -406,10 +432,20 @@ class Mission(object):
 
         new_wildfire = False
         with self._survey_lock:
-            selected_label = self._latest_ring_label if label is None else label
+            selected_label = label
+            if (
+                selected_label is None
+                and self._latest_ring_label is not None
+                and time.monotonic() - self._latest_ring_updated_at <= 0.25
+            ):
+                selected_label = self._latest_ring_label
             if selected_label not in TERRAIN_LABEL_TO_CODE:
+                if self._survey_grid[row][col] is not None:
+                    self._survey_grid[row][col] = None
+                    self._survey_revision = (self._survey_revision + 1) & 0xFFFF
                 logger.warning(
-                    f"[SURVEY] Unknown/empty terrain label at Grid[{row}][{col}], skip"
+                    f"[SURVEY] Unknown/empty terrain label at Grid[{row}][{col}], "
+                    "keep blank"
                 )
                 return
             if self._survey_grid[row][col] != selected_label:
@@ -456,12 +492,17 @@ class Mission(object):
 
     def _mark_survey_complete(self) -> bool:
         with self._survey_lock:
-            if any(label is None for row in self._survey_grid for label in row):
-                logger.error("[SURVEY] Grid is incomplete; not publishing COMPLETE")
-                return False
             if not self._survey_complete:
                 self._survey_complete = True
                 self._survey_revision = (self._survey_revision + 1) & 0xFFFF
+            unknown_count = sum(
+                label is None for row in self._survey_grid for label in row
+            )
+        if unknown_count:
+            logger.warning(
+                f"[SURVEY] Complete with {unknown_count} unrecognized cells; "
+                "they remain UNKNOWN"
+            )
         return True
 
     def get_survey_state(self) -> SurveyState:
@@ -476,7 +517,8 @@ class Mission(object):
             return SurveyState(
                 survey_revision=self._survey_revision,
                 survey_flags=(
-                    int(SurveyFlags.COMPLETE) if self._survey_complete else 0
+                    int(SurveyFlags.ABSOLUTE_POSITIONS)
+                    | (int(SurveyFlags.COMPLETE) if self._survey_complete else 0)
                 ),
                 wildfire_event_id=wildfire_id,
                 wildfire_row=wildfire_row,
@@ -485,6 +527,7 @@ class Mission(object):
                 debris_row=debris_row,
                 debris_col=debris_col,
                 terrain_codes=codes,
+                cell_positions_cm=SURVEY_CELL_POSITIONS_CM,
             )
 
     def _log_survey_grid(self) -> None:
@@ -653,6 +696,7 @@ class Mission(object):
         # ---- 坐标原点 ----
         self._origin_x = float(navi.current_x)
         self._origin_y = float(navi.current_y)
+        self._origin_ready = True
         logger.info(f"[MISSION] Origin = ({self._origin_x:.1f}, {self._origin_y:.1f})")
 
         # 绝对坐标
@@ -704,7 +748,7 @@ class Mission(object):
                     if buf:
                         mode_label = max(set(buf), key=buf.count)
                     else:
-                        mode_label = self._latest_ring_label
+                        mode_label = None
                     wx, wy = raw_waypoints[next_wp]
                     self._record_survey_label(wx, wy, label=mode_label, sample_count=len(buf))
                     wp_recorded[next_wp] = True
@@ -744,6 +788,8 @@ class Mission(object):
                 if dist2 <= wp_entry_radius2:
                     within_wp = True
                     wp_label_bufs[next_wp].clear()
+                    self._latest_ring_label = None
+                    self._latest_ring_updated_at = 0.0
                     self._tvlog(f"WP {next_wp} ENTER zone ({wx:.0f}, {wy:.0f})")
 
                     # 进入第一个航点时启动地形环后台检测
@@ -760,7 +806,7 @@ class Mission(object):
                     if buf:
                         mode_label = max(set(buf), key=buf.count)
                     else:
-                        mode_label = self._latest_ring_label
+                        mode_label = None
                     self._record_survey_label(wx, wy, label=mode_label, sample_count=len(buf))
                     wp_recorded[next_wp] = True
                     next_wp += 1
@@ -881,19 +927,15 @@ if __name__ == "__main__":
     )
     remote_stop_event = threading.Event()
     fleet_node = None
+    start_command = None
 
     def wait_for_remote_stop():
         remote_stop_event.wait()
         logger.warning("[FLEET] Remote STOP received")
         mission.stop()
 
-    # TODO: 地面站起飞命令等待
-    #   1. fc.set_digital_output(0, True)  — 打开水泵
-    #   2. 参考 former_code/2024_D_24.py 的 FCWirelessTransport /
-    #      start_ground_station / enable_ground_command_reception 流程，
-    #      等待地面站通过飞控 UT2/HC-14 发送 START_MISSION 命令
-    #   3. 收到命令后等 5s 再 mission.run()
-    #   4. 完成后上报 COMPLETED / FAILED
+    # 地面站负责从屏幕点击时刻计满 10 秒，再发送 FleetBus START。
+    # 本进程只在任务线程收到该命令后进入 mission.run()，STOP 始终可抢占。
 
     try:
         fleet_node = attach_air_fleet_node(
@@ -901,15 +943,34 @@ if __name__ == "__main__":
             navi,
             remote_stop_event,
             readonly=True,
+            allow_start_mission=True,
             survey_provider=mission.get_survey_state,
+            position_transform=mission.navigation_pose_to_field,
+            heading_offset_deg=90.0,
         )
         threading.Thread(
             target=wait_for_remote_stop,
             name="fleet-remote-stop",
             daemon=True,
         ).start()
+        logger.info("[FLEET] Waiting for ground-station START")
+        while not remote_stop_event.is_set():
+            command = fleet_node.command_queue.receive(timeout=0.25)
+            if command is None:
+                continue
+            if command.command_id == int(CommandId.DRONE_START_MISSION):
+                start_command = command
+                break
+        if start_command is None:
+            raise RuntimeError("Mission stopped before ground-station START")
+        logger.info("[FLEET] Ground-station START accepted; running mission")
         mission.run()
+        fleet_node.command_queue.complete(start_command)
+        logger.info("[FLEET] Mission complete; keeping reports available for 5s")
+        remote_stop_event.wait(5.0)
     except Exception as e:
+        if fleet_node is not None and start_command is not None:
+            fleet_node.command_queue.fail(start_command, int(AckReason.INTERNAL_ERROR))
         logger.exception(f"[MANAGER] Mission Failed: {e}")
     finally:
         if fleet_node is not None:
