@@ -164,6 +164,7 @@ def main() -> int:
         return 1
 
     print("[✓] 已连接到 FC_Server，遥测数据同步中。\n")
+    time.sleep(3.0) # 等待FC_Server亮灯结束
 
     # ---- 确认飞控未解锁 ----
     if fc.state.unlock.value:

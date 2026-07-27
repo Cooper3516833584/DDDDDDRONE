@@ -36,6 +36,7 @@ WAYPOINT_VISION_TIMEOUT = 3.0  # s
 WAYPOINT_VISION_POLL_INTERVAL = 0.02  # s
 WAYPOINT_VISION_MIN_DURATION = 1.0  # s; keeps the blue measurement LED visible
 WAYPOINT_VISION_MAX_DISTANCE_PX = 150.0
+WAYPOINT_BLUE_PREVIEW_SECONDS = 1.0
 INDICATOR_BLUE = (0, 0, 255)
 INDICATOR_RED = (255, 0, 0)
 
@@ -245,6 +246,10 @@ class WaypointMission(BASE_TASK.Mission):
                 f"-> blue indicator"
             )
             try:
+                if self._stop_ring.wait(WAYPOINT_BLUE_PREVIEW_SECONDS):
+                    raise RuntimeError(
+                        "Mission stopped while showing waypoint indicator"
+                    )
                 label, sample_count = self._read_waypoint_label(
                     waypoint_index,
                     raw_waypoint,

@@ -20,8 +20,6 @@ ROS 建图组件启动流程参考 base_test.py 与 former_code/2024_D_24.py。
 
 视觉日志: python_sdk/vision_for_simulation/ring_detection_*.log
 每次地形推理结果、航点出入事件均以时间戳记录，无需设置环境变量。
-飞行录像: python_sdk/vision_for_simulation/camera_recording_*.avi
-帧索引:   python_sdk/vision_for_simulation/camera_recording_*.csv
 """
 import csv
 import os
@@ -95,8 +93,8 @@ CAMERA_READ_FAILURE_LOG_INTERVAL = 2.0  # s
 RING_MODEL_CROP_WIDTH_RATIO = 0.60
 RING_MODEL_CROP_HEIGHT_RATIO = 0.60
 
-# 飞行画面录像：编码在独立线程中执行，队列满时保留最新帧，避免阻塞采集。
-VIDEO_RECORD_ENABLED = True
+# 飞行画面录像已停用；地形识别与 ring_detection_*.log 日志保持不变。
+VIDEO_RECORD_ENABLED = False
 VIDEO_RECORD_FPS = 10.0
 VIDEO_RECORD_FOURCC = "MJPG"
 VIDEO_RECORD_QUEUE_SIZE = 2
@@ -271,6 +269,11 @@ class SimVisionTask:
                     daemon=True,
                 )
                 self._record_thread.start()
+            else:
+                logger.info(
+                    "[VISION] Camera recording disabled; "
+                    "terrain detection log remains enabled"
+                )
             self._capture_thread = threading.Thread(
                 target=self._capture_loop,
                 name="simulation-camera-capture",
@@ -491,7 +494,6 @@ class SimVisionTask:
                 self._capture_stop.wait(0.05)
                 continue
             captured_at = time.perf_counter()
-            captured_wall_time = time.time()
             with self._capture_condition:
                 first_frame = self._latest_frame_seq == 0
                 self._latest_frame = frame
@@ -499,12 +501,13 @@ class SimVisionTask:
                 frame_seq = self._latest_frame_seq
                 self._latest_frame_time = captured_at
                 self._capture_condition.notify_all()
-            self._enqueue_recording_frame(
-                frame,
-                frame_seq,
-                captured_at,
-                captured_wall_time,
-            )
+            if VIDEO_RECORD_ENABLED:
+                self._enqueue_recording_frame(
+                    frame,
+                    frame_seq,
+                    captured_at,
+                    time.time(),
+                )
             if first_frame:
                 logger.info(
                     f"[VISION] Camera {self._camera_index} first frame ready "
@@ -1443,7 +1446,7 @@ class Mission(object):
                         f"WP {next_wp} ENTER zone ({wx:.0f}, {wy:.0f}) "
                         f"after_frame={wp_observation_seq}"
                     )
-                    fc.set_indicator_led(0, 0, 255)  # 蓝灯 — 进入航点测绘区
+                    fc.set_indicator_led(0, 255, 0)  # 绿灯 — 进入航点测绘区
             else:
                 # 在收集区内只追加尚未统计的新推理帧。
                 observations = wp_observation_bufs[next_wp]
@@ -1551,7 +1554,7 @@ class Mission(object):
                                 f"({wx:.0f}, {wy:.0f}) "
                                 f"after_frame={rec_observation_seq}"
                             )
-                            fc.set_indicator_led(0, 0, 255)  # 蓝灯 — 进入航点测绘区
+                            fc.set_indicator_led(0, 255, 0)  # 绿灯 — 进入航点测绘区
                     else:
                         rec_observation_seq = (
                             self._collect_new_survey_observation(
