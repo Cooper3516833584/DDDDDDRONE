@@ -18,8 +18,8 @@ globals().pop("annotations", None)
 
 __all__ = ["track_landing_marker"]
 
-_FRAME_WIDTH = 512
-_FRAME_HEIGHT = 288
+_FRAME_WIDTH = 256
+_FRAME_HEIGHT = 256
 _FRAME_CENTER_U = (_FRAME_WIDTH - 1) / 2.0
 _FRAME_CENTER_V = (_FRAME_HEIGHT - 1) / 2.0
 _MAX_READ_FAILURES = 10
@@ -49,6 +49,7 @@ class _Detection:
     score: float
     ellipse: _Ellipse
     mask_index: int
+    near_cross: bool = False
 
 
 @_dataclass_slots
@@ -1518,6 +1519,80 @@ def _find_marker_candidate(
     return max(detections, key=lambda detection: detection.score)
 
 
+def _find_near_cross(
+    gray: _np.ndarray,
+    masks: list[_np.ndarray],
+    previous: _Detection | None,
+    resources: _VisionResources,
+) -> _Detection | None:
+    """Track the marker cross after both circular borders leave the frame."""
+    if previous is None or not masks:
+        return None
+
+    height, width = gray.shape
+    frame_diagonal = _math.hypot(width, height)
+    search_diameter = min(
+        1.35 * frame_diagonal,
+        max(0.90 * frame_diagonal, 1.20 * previous.diameter_px),
+    )
+    search_centers = [
+        (previous.center_u, previous.center_v),
+        ((width - 1) / 2.0, (height - 1) / 2.0),
+    ]
+
+    best: tuple[float, float, float, int] | None = None
+    for search_center in search_centers:
+        search_ellipse: _Ellipse = (
+            search_center,
+            (search_diameter, search_diameter),
+            0.0,
+        )
+        for mask_index, mask in enumerate(masks):
+            refined = _refine_center_from_cross(
+                gray,
+                mask,
+                search_ellipse,
+                resources,
+            )
+            if refined is None:
+                continue
+            center_u, center_v, cross_score = refined
+            if cross_score < 0.40:
+                continue
+            displacement = _math.hypot(
+                center_u - previous.center_u,
+                center_v - previous.center_v,
+            )
+            if displacement > max(28.0, 0.18 * search_diameter):
+                continue
+            temporal = _math.exp(
+                -displacement / max(1.0, 0.12 * search_diameter)
+            )
+            score = float(
+                _np.clip(
+                    0.46 + 0.40 * cross_score + 0.14 * temporal,
+                    0.0,
+                    0.86,
+                )
+            )
+            if best is None or score > best[2]:
+                best = (center_u, center_v, score, mask_index)
+
+    if best is None:
+        return None
+    center_u, center_v, score, mask_index = best
+    (_, _), axes, angle = previous.ellipse
+    return _Detection(
+        center_u=float(center_u),
+        center_v=float(center_v),
+        diameter_px=float(previous.diameter_px),
+        score=float(score),
+        ellipse=((float(center_u), float(center_v)), axes, angle),
+        mask_index=mask_index,
+        near_cross=True,
+    )
+
+
 def _detect_marker(
     gray: _np.ndarray,
     masks: list[_np.ndarray],
@@ -1721,6 +1796,7 @@ def _track_with_optical_flow(
         score=float(max(0.50, previous_detection.score * 0.985)),
         ellipse=ellipse,
         mask_index=previous_detection.mask_index,
+        near_cross=previous_detection.near_cross,
     )
     return _OpticalResult(detection=detection, points=updated_points)
 
@@ -1794,13 +1870,27 @@ class _MarkerTracker:
             previous.diameter_px if previous is not None else None,
             self._resources,
         )
-        if raw is None:
-            return None, None
         threshold = (
             _TRACK_SCORE_THRESHOLD
             if search_roi is not None
             else _SEARCH_SCORE_THRESHOLD
         )
+        if raw is not None and raw.score >= threshold:
+            return raw, raw.score
+
+        near_cross = _find_near_cross(
+            gray,
+            masks,
+            previous,
+            self._resources,
+        )
+        if (
+            near_cross is not None
+            and near_cross.score >= _TRACK_SCORE_THRESHOLD
+        ):
+            return near_cross, near_cross.score
+        if raw is None:
+            return None, None
         if raw.score < threshold:
             return None, raw.score
         return raw, raw.score
@@ -2040,13 +2130,14 @@ def _draw_debug(
             int(round(detection.center_u)),
             int(round(detection.center_v)),
         )
-        _cv2.ellipse(
-            display,
-            detection.ellipse,
-            (0, 255, 0),
-            2,
-            _cv2.LINE_AA,
-        )
+        if not detection.near_cross:
+            _cv2.ellipse(
+                display,
+                detection.ellipse,
+                (0, 255, 0),
+                2,
+                _cv2.LINE_AA,
+            )
         _cv2.drawMarker(
             display,
             target_point,
@@ -2064,7 +2155,8 @@ def _draw_debug(
             2,
             _cv2.LINE_AA,
         )
-        status = f"{tracker._state} score={detection.score:.2f}"
+        mode = " near-cross" if detection.near_cross else ""
+        status = f"{tracker._state}{mode} score={detection.score:.2f}"
         offset_text = f"x_px={output[0]:.2f}  y_px={output[1]:.2f}"
     else:
         status = f"{tracker._state} no reliable marker"
@@ -2134,7 +2226,7 @@ def track_landing_marker(
         detected in the current frame, yields ``(None, None)``.
 
     The return value is a generator. The camera is opened once, processes
-    512 x 288 frames, and is released when the generator is closed or exits.
+    256 x 256 frames, and is released when the generator is closed or exits.
     """
     cap = _open_camera(camera_index)
     capture: _LatestFrameCapture | None = None
