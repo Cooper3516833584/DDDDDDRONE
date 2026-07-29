@@ -29,15 +29,13 @@ from FlightController.Solutions.Navigation import Navigation
 
 
 FC_SERIAL_DEV = "/dev/ttyACM0"
-CRUISE_SPEED = 22.0
-CRUISE_HEIGHT = 120.0
+CRUISE_SPEED = 15.0
+CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 22.0
 TAKEOFF_POINT = (0.0, 0.0)
+LANDING_POINT = (150.0, 0.0)
 TEST_WAYPOINTS = (
-    (100.0, 0.0),
-    (100.0, -100.0),
-    (0.0, -100.0),
-    (0.0, 0.0),
+    (150.0, 0.0)
 )
 RADAR_POSE_READY_TIMEOUT = 15.0
 MONITOR_INTERVAL = 1.0
@@ -186,8 +184,8 @@ class Mission:
             if not self.navi.navigation_to_waypoint(waypoint, wait=True):
                 raise RuntimeError("failed to reach waypoint {}".format(waypoint))
 
-        logger.info("[TEST] Pointing landing at {}", TAKEOFF_POINT)
-        if not self.navi.pointing_landing(TAKEOFF_POINT):
+        logger.info("[TEST] Pointing landing at {}", LANDING_POINT)
+        if not self.navi.pointing_landing(LANDING_POINT):
             raise RuntimeError("pointing landing was not confirmed")
         logger.info("[TEST] Single-radar navigation flight completed")
 
