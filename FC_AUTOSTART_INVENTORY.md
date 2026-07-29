@@ -5,55 +5,37 @@
 - 目标主机：`fc@192.168.31.176`
 - 主机名：`fc-ubuntu`
 - 完整系统盘点时间：2026-07-26 20:08—20:13（UTC+08:00）
-- 串行启动配置最近核验时间：2026-07-27 10:46—10:53（UTC+08:00）
-- 最近核验时的开机时间：2026-07-27 10:28:47（UTC+08:00）
+- 项目自启动停用与最近核验时间：2026-07-29 10:37—10:41（UTC+08:00）
+- 最近核验时的开机时间：2026-07-29 10:30:31（UTC+08:00）
 - 默认启动目标：`graphical.target`
 - 桌面会话：GDM 自动登录用户 `fc`
 - 核验与配置方式：SSH；配置文件修改前已备份
-- 配置生效范围：下一次 GNOME 登录或人工调用 `/home/fc/start_tmux_test.sh`
+- 配置生效范围：下一次 GNOME 登录或重启；本次未注销、未重启、未停止当前进程
 
 本文所称“启用”是指配置会在下一次满足对应启动条件时被系统加载；“正在运行”是指采集时确实发现对应进程或会话。二者不能互相替代。
 
 ## 2. 结论摘要
 
-当前与无人机功能直接相关的开机链路不是 systemd、cron 或 `rc.local`，而是：
+截至 2026-07-29 10:41，`/home/fc/.config/autostart/` 中已经没有以 `.desktop` 结尾的项目自定义入口。原先启用的两个入口均已可恢复地改名为 `.desktop.disabled`：
 
 ```mermaid
 flowchart TD
     A["systemd graphical.target"] --> B["GDM 自动登录 fc"]
     B --> C["GNOME 用户自启动"]
-    C --> D["tmux-test.desktop"]
-    C --> F["fc-server-watchdog.desktop"]
-    D --> G["start_tmux_test.sh（flock 串行协调）"]
-    G --> H["tmux test: server_ros.py"]
-    H --> I["等待 TCP 5654"]
-    I --> J["同步调用一次性 t265-auto-init.sh"]
-    J --> K{"初始 USB 状态"}
-    K -->|"8087:0b37 T265"| L["确认 viewer 已退出且 T265 连续稳定 5 秒"]
-    K -->|"03e7:2150 VPU"| M["禁止启动任务，等待完整拔出"]
-    K -->|"无设备"| N["等待新的插入边沿"]
-    M --> N
-    N --> O["插入后独占运行 viewer 10 秒"]
-    O --> P{"VPU 消失且 T265 连续稳定 5 秒"}
-    P -->|"否"| M
-    P -->|"是"| Q["启动 tmux disaster-survey"]
-    L --> Q
-    Q --> R["2026_disaster_survey.py 启动 ROS/雷达/T265/Cartographer/TF/相机"]
-    R --> S["等待地面站 START"]
-    S --> T["START 后再次验证真实 pose/map/TF，失败则拒绝起飞"]
-    F --> W["监控飞控 by-id 与 server_ros 持有串口"]
-    W --> U["异常时杀掉 test 与 disaster-survey 并再次调用协调器"]
+    C --> D["无项目自定义 .desktop 入口"]
+    E["tmux-test.desktop.disabled"] -. "已停用" .-> D
+    F["fc-server-watchdog.desktop.disabled"] -. "已停用" .-> D
 ```
 
-`t265-auto-init.desktop` 已改名为 `.desktop.disabled`。T265 初始化脚本只由协调器同步调用，不再作为持续后台监控器，因此 viewer 与任务内 ROS RealSense 驱动不会在正常开机链路中并发启动。
+项目相关检查未发现其他替代入口：没有项目相关的用户或系统级 systemd 单元，没有 `fc`/`root` crontab，没有待执行 `at` 任务，`/etc/rc.local` 为空且服务未运行，登录 shell 文件中也没有项目启动引用。GDM 自动登录和系统包提供的标准服务/桌面组件保持不变。
 
 自定义启动项总体状态：
 
 | 启动项 | 状态 | 主要功能 | 风险级别 |
 |---|---|---|---|
-| `tmux-test.desktop` | 启用、配置已更新 | 串行启动 `server_ros.py`、T265 门禁和灾情测绘任务 | 高 |
+| `tmux-test.desktop.disabled` | 已停用（2026-07-29） | 原串行启动 `server_ros.py`、T265 门禁和灾情测绘任务 | 无下次登录自启动影响；当前进程另见第 5 节 |
 | `t265-auto-init.desktop.disabled` | 已停用 | 旧的独立持续监控入口；脚本改由协调器一次性调用 | 无独立运行影响 |
-| `fc-server-watchdog.desktop` | 启用，行为未修改 | 飞控 USB 串口变化时杀掉并重启服务器和任务 | 高 |
+| `fc-server-watchdog.desktop.disabled` | 已停用（2026-07-29） | 原飞控 USB 串口变化时杀掉并重启服务器和任务 | 无下次登录自启动影响；当前进程另见第 5 节 |
 | `realsense-viewer-boot-once.desktop.disabled` | 已停用 | 旧的一次性 T265 初始化方案 | 无当前运行影响 |
 | `start.sh.desktop.disabled` | 已停用且内部也禁用 | 旧服务器和屏幕任务启动方案，会删除 `.zsh_history` | 无当前运行影响，但不应重新启用 |
 
@@ -64,7 +46,7 @@ flowchart TD
 - `fc` 用户和 `root` 都没有 crontab。
 - 没有待执行的 `at` 任务。
 - `/etc/rc.local` 为空、权限为 `0644`，`rc-local.service` 为 `inactive (dead)`。
-- 当前没有 systemd failed unit。
+- 2026-07-29 核验时没有 systemd failed unit。
 
 ## 3. 启动前提：GDM 自动登录
 
@@ -87,7 +69,7 @@ TimedLoginDelay=0
 - 系统进入 `graphical.target` 后启动 GDM。
 - GDM 自动登录 `fc`。
 - `fc` 的 GNOME 会话建立后，读取 `~/.config/autostart/*.desktop`。
-- 因此当前两个启用的项目自定义 `.desktop` 项依赖图形登录，不是在内核或 systemd 系统服务阶段启动。
+- 当前没有启用的项目自定义 `.desktop` 项；GDM 自动登录仍会建立 GNOME 会话，但不会再从该目录启动无人机项目程序。
 
 `AutomaticLogin` 和零延时 `TimedLogin` 同时启用，功能存在重叠，但本次没有修改。
 
@@ -95,9 +77,9 @@ TimedLoginDelay=0
 
 目录：`/home/fc/.config/autostart/`
 
-### 4.1 `tmux-test.desktop`
+### 4.1 `tmux-test.desktop.disabled`
 
-状态：启用。
+状态：已于 2026-07-29 停用。原文件未改内容，只从 `tmux-test.desktop` 改名为 `tmux-test.desktop.disabled`，因此 GNOME 不再加载。
 
 ```ini
 Name=Drone Serial Startup Coordinator
@@ -225,9 +207,9 @@ Terminal=false
 
 该门禁只决定是否允许启动任务。`lsusb` 显示 T265 不等于已经具备可靠导航条件；任务收到地面站 `START` 后，仍由现有代码检查真实 RealSense 位姿、地图和 TF 新鲜度，失败时拒绝解锁和起飞。
 
-### 4.3 `fc-server-watchdog.desktop`
+### 4.3 `fc-server-watchdog.desktop.disabled`
 
-状态：启用。该文件修改时间为 2026-07-26 19:56:50。
+状态：已于 2026-07-29 停用。原文件未改内容，只从 `fc-server-watchdog.desktop` 改名为 `fc-server-watchdog.desktop.disabled`；原内容修改时间仍为 2026-07-26 19:56:50。
 
 ```ini
 Name=FC Server Watchdog
@@ -264,7 +246,7 @@ Terminal=false
 
 - 日志路径：`/home/fc/fc_server_watchdog.log`
 
-2026-07-26 的旧快照曾观察到 PID `33428` 和 tmux `fc-server-watchdog` 内的 watchdog 实例。2026-07-27 完成串行启动配置后没有重新记录 watchdog PID，但其桌面项和脚本均未修改，仍处于启用配置状态。
+2026-07-29 10:41 的复核仍观察到本次开机已启动的 watchdog 进程 PID `1400`。改名只影响下次登录，不会自动终止当前实例。
 
 风险：
 
@@ -314,62 +296,46 @@ X-GNOME-Autostart-enabled=false
 
 ## 5. 当前运行状态快照
 
-采集时间：2026-07-27 10:53（UTC+08:00），配置更新并停止旧任务后的快照。
+采集时间：2026-07-29 10:41（UTC+08:00），两个项目自启动入口改名并完成静态复核后的快照。
 
 ### 5.1 关键进程
 
 | PID | 进程 |
 |---:|---|
-| 1954/1957 | tmux `test` 与 `/usr/bin/python3 .../server_ros.py` |
+| 1400 | `/home/fc/.local/bin/fc-server-watchdog.sh` |
+| 1415 | `/home/fc/start_tmux_test.sh` |
+| 1834/1835 | tmux `test` 与 `/usr/bin/python3 .../server_ros.py` |
+| 2923 | `/home/fc/.local/bin/t265-auto-init.sh` |
 
-`server_ros.py` 正在 `0.0.0.0:5654` 监听。
+这些进程均由本次改名之前的 2026-07-29 10:30 开机链路启动。本次任务只关闭开机入口，没有终止进程、tmux 会话或硬件链路，避免在未知飞行/设备状态下绕过现有停止和资源释放路径。
 
 明确未运行：
 
 - `2026_disaster_survey.py`；
-- 独立的 `t265-auto-init.sh` 持续监控进程；
 - `realsense-viewer`。
 
-`fc-server-watchdog.desktop` 仍处于启用配置状态；本次最终快照未重新记录其 PID。
+`t265-auto-init.sh` 当前仍在运行，说明启动协调器尚处于 T265 门禁等待路径。下一次 GNOME 登录或重启时，因为五个项目文件均以 `.desktop.disabled` 结尾，这些程序不会再由用户自启动目录拉起。
 
 ### 5.2 tmux 会话
 
 | 会话 | 当前命令 | 工作目录 | 状态 |
 |---|---|---|---|
 | `test` | `python3` | `.../DDDDDrone_Cloned_v2/python_sdk` | 活动 |
-| `ldlidar_stl_ros2_0` | `python3` | 项目目录 | 活动 |
-| `realsense2_camera_0` | `python3` | 项目目录 | 活动 |
-| `cartographer_ros_0` | `python3` | 项目目录 | 活动 |
-| `tf2_ros_0` | `python3` | 项目目录 | 活动 |
 
-`disaster-survey` 已通过正常 `Ctrl-C` 中断退出。日志确认：
+没有 `disaster-survey`、雷达、RealSense、Cartographer 或 TF tmux 会话。本次未执行端口探测、设备枚举、START/STOP、解锁、起飞、移动、降落或任何硬件功能验证。
 
-- 导航停止；
-- 电磁铁输出关闭；
-- 下视相机释放；
-- 没有执行解锁或起飞。
+### 5.3 部署仓库状态
 
-ROS 四个后台会话是本次停止任务前由 `2026_disaster_survey.py` 中的 `RosManager` 创建的遗留运行实例，不是独立桌面自启动文件。本次没有擅自停止这些 ROS 会话，也没有启动新任务。
-
-### 5.3 日志观察
-
-配置更新后的协调锁验证记录为：
+只读核验结果：
 
 ```text
-2026-07-27 10:53:03 启动协调器已有实例运行，跳过重复调用
+路径：/home/fc/桌面/DDDDDrone_Cloned_v2
+分支：main
+提交：1c53dee7f3850e330afa29d129a844e970e1f71e
+工作树：干净
 ```
 
-T265 直接枚举验证记录为：
-
-```text
-2026-07-27 10:52:22 T265 一次性初始化开始，DISPLAY=:0
-2026-07-27 10:52:22 开机已识别为 T265，等待 5 秒稳定且 viewer 退出
-2026-07-27 10:52:27 T265 已稳定，无需运行 viewer
-```
-
-该验证期间 viewer 启动前后进程数均为 0，没有打开 viewer 或启动任务。
-
-本次配置修改前，2026-07-27 10:30 的旧持续监控日志再次出现 `RS2_USB_STATUS_BUSY`，与旧 viewer 和 ROS RealSense 并发争用一致。新配置通过停用独立桌面项并串行调用一次性初始化脚本消除了正常开机链路中的该并发入口。
+本次没有在远端部署仓库中创建、修改、删除或移动文件。
 
 ## 6. shell 登录与终端初始化
 
@@ -603,17 +569,17 @@ snap-snapd-27591.mount
 
 ## 10. 当前主要风险和边界
 
-### 10.1 高风险：完整飞行任务被纳入开机自启动
+### 10.1 已停用入口的历史高风险：完整飞行任务
 
-`tmux-test.desktop` 已明确标注为串行启动协调器。它会在服务器和 T265 USB 门禁通过后自动运行 `2026_disaster_survey.py`。
+`tmux-test.desktop.disabled` 原先会在服务器和 T265 USB 门禁通过后自动运行 `2026_disaster_survey.py`。它现在不会在下次 GNOME 登录时被加载。
 
 该任务虽然等待地面站 `START` 才进入飞行，但在等待阶段已经访问真实相机、雷达、RealSense 和 ROS，并开始录像。一旦收到有效 `START`，会进入真实起飞、导航和降落流程。
 
 VPU 未完成重新插拔或 viewer 尚未退出时，任务不会启动；但这不改变任务一旦启动后属于真实硬件高风险进程的事实。
 
-### 10.2 高风险：watchdog 在 USB 变化时强制终止任务
+### 10.2 已停用入口的历史高风险：watchdog 强制终止任务
 
-watchdog 不调用任务的正常 STOP 接口，而是直接杀掉两个 tmux 会话。真实飞行中这样处理可能绕过任务层的正常停止、悬停、降落和资源清理流程。
+`fc-server-watchdog.desktop.disabled` 原先启动的 watchdog 不调用任务的正常 STOP 接口，而是直接杀掉两个 tmux 会话。真实飞行中这样处理可能绕过任务层的正常停止、悬停、降落和资源清理流程。入口虽已停用，但当前开机已启动的 PID `1400` 仍在运行，直到人工安全停止或会话/系统结束。
 
 ### 10.3 T265 串行门禁的能力边界
 
@@ -654,54 +620,55 @@ watchdog 不调用任务的正常 STOP 接口，而是直接杀掉两个 tmux �
 - 验证真实飞行安全；
 - 验证突然断电后的完整恢复流程。
 
-已停止旧 T265 持续监控器，并在用户确认未进入飞行后正常中断等待 START 的任务。日志确认任务执行了现有清理路径。
+因此目前只证明自启动目录中没有有效的项目 `.desktop` 入口，尚未通过受控重启或重新登录验证“不会再次启动”。当前进程也未停止。
 
 ### 10.6 备份与回退
 
-修改前备份：
+2026-07-29 本次停用前备份：
 
 ```text
-/home/fc/.local/state/codex-backups/t265-serial-start-20260727-105023
+/home/fc/.local/state/codex-backups/autostart-disable-20260729-103943
 ```
 
 其中保留原始：
 
-- `/home/fc/start_tmux_test.sh`；
-- `/home/fc/.local/bin/t265-auto-init.sh`；
 - `tmux-test.desktop`；
-- `t265-auto-init.desktop`。
+- `fc-server-watchdog.desktop`。
 
-回退时恢复前三个文件，并将：
+回退只需在确认设备未处于真实飞行、任务未运行且允许恢复自启动后，将：
 
 ```text
-/home/fc/.config/autostart/t265-auto-init.desktop.disabled
+/home/fc/.config/autostart/tmux-test.desktop.disabled
+/home/fc/.config/autostart/fc-server-watchdog.desktop.disabled
 ```
 
 改回：
 
 ```text
-/home/fc/.config/autostart/t265-auto-init.desktop
+/home/fc/.config/autostart/tmux-test.desktop
+/home/fc/.config/autostart/fc-server-watchdog.desktop
 ```
 
-回退配置同样必须在确认没有真实飞行任务运行后执行。
+也可从上述备份目录恢复。备份目录权限为 `0700`，文件权限、属主、时间戳和 SHA-256 与停用前一致。2026-07-27 的旧串行启动备份仍保留在 `/home/fc/.local/state/codex-backups/t265-serial-start-20260727-105023`，本次未修改。
 
 ## 11. 静态验证结果
 
-以下检查已通过：
+2026-07-29 以下检查已通过：
 
 ```text
-bash -n /home/fc/start_tmux_test.sh
-bash -n /home/fc/.local/bin/t265-auto-init.sh
-desktop-file-validate /home/fc/.config/autostart/tmux-test.desktop
-协调锁重复调用：通过，未创建 disaster-survey
-当前直接枚举为 T265：连续稳定 5 秒通过，viewer 启动前后进程数均为 0
-隔离模拟持续 VPU 且无重新插拔：保持阻塞，未调用 viewer，未放行任务
-启用桌面入口检查：只有 tmux-test.desktop 与 fc-server-watchdog.desktop
-备份文件 SHA-256 与修改前盘点值一致
-远端部署仓库：main / 55bc63a9588127800730b96b9065aba16b7ba3c8，工作树干净
+find /home/fc/.config/autostart -name '*.desktop'：无输出
+五个项目自启动文件均以 .desktop.disabled 结尾
+desktop-file-validate 两个本次备份的原始 .desktop 文件：通过
+停用后的两个文件与备份 SHA-256 一致
+用户级和系统级 systemd：未发现项目相关入口
+fc/root crontab：均不存在
+atq：无待执行任务
+/etc/rc.local：0 字节、0644、rc-local.service static/inactive
+登录 shell 文件：未发现项目启动引用
+远端部署仓库：main / 1c53dee7f3850e330afa29d129a844e970e1f71e，工作树干净
 ```
 
-远端没有安装 ShellCheck，因此未执行 ShellCheck。上述检查不代表受控重启、真实拔插、viewer 初始化或飞行验证通过。
+本次只修改文件名，没有修改 shell 脚本或 Python 代码，因此未重复执行脚本语法检查。上述检查不代表受控重启、真实拔插、viewer 初始化或飞行验证通过。
 
 ## 12. 自定义配置校验和
 
@@ -709,9 +676,9 @@ desktop-file-validate /home/fc/.config/autostart/tmux-test.desktop
 
 | 文件 | SHA-256 |
 |---|---|
-| `fc-server-watchdog.desktop` | `5570a40fef43d9f15f445ac9a8bf91a5fffe650ad64a7170bc2c70d81ee1118f` |
+| `fc-server-watchdog.desktop.disabled` | `5570a40fef43d9f15f445ac9a8bf91a5fffe650ad64a7170bc2c70d81ee1118f` |
 | `t265-auto-init.desktop.disabled` | `bb28c41fd12f68b35080a0aa1c5c467d1c592dcb91a60f8a2618bc7501f33e50` |
-| `tmux-test.desktop` | `15719630a9a939a2e3dd5204e6850bc572c07f4d4bb2c973cef93a30773d8a07` |
+| `tmux-test.desktop.disabled` | `15719630a9a939a2e3dd5204e6850bc572c07f4d4bb2c973cef93a30773d8a07` |
 | `realsense-viewer-boot-once.desktop.disabled` | `cef217ec46c36ffdaf265d30a786d72c0b71bbf28d4f89d566edf871777d3ed3` |
 | `start.sh.desktop.disabled` | `50ff8618a6ce2f8b894943ec691d89b25ccfc228eb52d34234481ea609510013` |
 | `/home/fc/start_tmux_test.sh` | `079d5f9f80c28a65ed1afe361b1b040bab4977335e23b95c840445c5e1fc66d1` |
