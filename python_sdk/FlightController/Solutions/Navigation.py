@@ -1185,6 +1185,224 @@ class Navigation(object):
                 return False
         return True
 
+    def moving_landing(
+        self,
+        horizontal_speed: float,
+        direction_deg: float = 0,
+        lock_after_landing: bool = True,
+        descent_speed: float = 15,
+        touchdown_alt_thres: float = 8,
+        touchdown_confirm_time: float = 0.3,
+        touchdown_timeout: float = 15,
+        lock_timeout: float = 4,
+    ) -> bool:
+        """
+        保持水平速度指令的同时下降，并可选择落地后是否锁桨。
+
+        horizontal_speed: 水平速度指令 / cm/s，取绝对值
+        direction_deg: 导航坐标系中的水平运动方向 / deg；
+            0 度为 x 正方向，逆时针为正（90 度为 y 正方向）
+        lock_after_landing: True 表示确认落地后锁桨；False 表示保持解锁
+        descent_speed: 下降速度指令的绝对值 / cm/s
+        touchdown_alt_thres: 落地高度阈值 / cm，实际值不小于 3 cm
+        touchdown_confirm_time: 高度持续低于阈值的确认时间 / s
+        touchdown_timeout: 下降阶段超时 / s
+        lock_timeout: 发出锁桨命令后的确认超时 / s
+
+        水平速度采用 navigation_to_waypoint 相同的导航坐标系，并根据当前
+        偏航转换为机体系速度。函数暂停现有水平导航和定高 PID，以约 20 Hz
+        刷新实时控制帧。异常时立即清零；仅确认低高度后才可能锁桨。
+        lock_after_landing=False 时保持解锁，调用者负责后续处置。
+        """
+        values = np.asarray(
+            [
+                horizontal_speed,
+                direction_deg,
+                descent_speed,
+                touchdown_alt_thres,
+                touchdown_confirm_time,
+                touchdown_timeout,
+                lock_timeout,
+            ],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("moving_landing parameters must be finite")
+        if not isinstance(lock_after_landing, bool):
+            raise ValueError("lock_after_landing must be bool")
+        horizontal_speed = abs(float(horizontal_speed))
+        direction_deg = float(direction_deg)
+        descent_speed = abs(float(descent_speed))
+        alt_thres = max(3.0, float(touchdown_alt_thres))
+        confirm_time = float(touchdown_confirm_time)
+        timeout = float(touchdown_timeout)
+        lock_timeout = float(lock_timeout)
+        if min(descent_speed, confirm_time, timeout, lock_timeout) <= 0:
+            raise ValueError(
+                "descent_speed, touchdown_confirm_time, touchdown_timeout "
+                "and lock_timeout must be greater than 0"
+            )
+
+        state_is_fresh = lambda: bool(
+            getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
+        )
+
+        if not self.running:
+            logger.error("[NAVI] Moving landing requires navigation to be running")
+            return False
+        if self.stop_event is not None and self.stop_event.is_set():
+            logger.error("[NAVI] Moving landing refused: external stop event is set")
+            return False
+        if not state_is_fresh():
+            logger.error("[NAVI] Moving landing refused: FC telemetry is stale")
+            return False
+        if not self.fc.state.unlock.value:
+            logger.error("[NAVI] Moving landing requires an unlocked aircraft")
+            return False
+        if not self.pose_is_fresh():
+            logger.error("[NAVI] Moving landing refused: navigation pose is stale")
+            return False
+
+        if self.fc.state.mode.value != self.fc.HOLD_POS_MODE:
+            self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
+            mode_deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < mode_deadline:
+                if (
+                    state_is_fresh()
+                    and self.fc.state.mode.value == self.fc.HOLD_POS_MODE
+                ):
+                    break
+                time.sleep(0.05)
+            else:
+                logger.error("[NAVI] Moving landing refused: HOLD_POS not confirmed")
+                return False
+
+        # 先停止已有轨迹，再暂停导航和定高线程，避免它们覆盖本函数的速度。
+        self.navigation_stop_here()
+        self.navigation_flag = False
+        self.keep_height_flag = False
+        self.update_realtime_control(vel_x=0, vel_y=0, vel_z=0, yaw=0)
+
+        direction_rad = np.deg2rad(direction_deg)
+        vel_x_world = horizontal_speed * float(np.cos(direction_rad))
+        vel_y_world = horizontal_speed * float(np.sin(direction_rad))
+        vel_z = -descent_speed
+        logger.info(
+            f"[NAVI] Moving landing started: speed={horizontal_speed}cm/s, "
+            f"direction={direction_deg}deg, descent={descent_speed}cm/s, "
+            f"lock={lock_after_landing}"
+        )
+
+        start_time = time.perf_counter()
+        touchdown_since = None
+        landed = False
+        abort_reason = None
+        restore_hover = False
+        try:
+            while True:
+                now = time.perf_counter()
+                if self.stop_event is not None and self.stop_event.is_set():
+                    abort_reason = "external stop event is set"
+                    break
+                if not self.running:
+                    abort_reason = "navigation stopped"
+                    break
+                if not state_is_fresh():
+                    abort_reason = "flight-controller telemetry became stale"
+                    break
+                if not self.fc.state.unlock.value:
+                    landed = True
+                    break
+                if not self.pose_is_fresh():
+                    abort_reason = "navigation pose became stale"
+                    break
+                if self.fc.state.mode.value != self.fc.HOLD_POS_MODE:
+                    abort_reason = "flight mode left HOLD_POS"
+                    break
+
+                alt_now = float(self.fc.state.alt_add.value)
+                if alt_now <= alt_thres:
+                    if touchdown_since is None:
+                        touchdown_since = now
+                    elif now - touchdown_since >= confirm_time:
+                        landed = True
+                        break
+                else:
+                    touchdown_since = None
+
+                if now - start_time > timeout:
+                    abort_reason = "touchdown timeout"
+                    restore_hover = True
+                    break
+
+                vel_x_body, vel_y_body = _world_to_body_velocity(
+                    vel_x_world,
+                    vel_y_world,
+                    self.current_yaw,
+                )
+                self.update_realtime_control(
+                    vel_x=round(vel_x_body),
+                    vel_y=round(vel_y_body),
+                    vel_z=round(vel_z),
+                    yaw=0,
+                )
+                time.sleep(0.05)
+        except Exception:
+            logger.exception("[NAVI] Moving landing control error")
+            abort_reason = "control exception"
+        finally:
+            self.navigation_flag = False
+            self.keep_height_flag = False
+            try:
+                self.update_realtime_control(vel_x=0, vel_y=0, vel_z=0, yaw=0)
+            except Exception:
+                logger.exception("[NAVI] Failed to clear moving-landing control")
+
+        if abort_reason is not None:
+            logger.error(f"[NAVI] Moving landing aborted: {abort_reason}")
+            if (
+                restore_hover
+                and self.running
+                and self.fc.state.unlock.value
+                and state_is_fresh()
+                and self.pose_is_fresh()
+                and self.fc.state.mode.value == self.fc.HOLD_POS_MODE
+            ):
+                self.direct_set_waypoint([self.current_x, self.current_y])
+                self.set_height(float(self.fc.state.alt_add.value))
+                self.switch_pid("hover")
+                self.navigation_flag = True
+                self.keep_height_flag = True
+                logger.warning("[NAVI] Moving landing timeout; holding current position")
+            return False
+        if not landed:
+            return False
+
+        logger.info("[NAVI] Moving landing touchdown confirmed")
+        if not lock_after_landing:
+            logger.warning("[NAVI] Moving landing finished without locking motors")
+            return True
+        if not self.fc.state.unlock.value:
+            logger.info("[NAVI] Motors already locked after touchdown")
+            return True
+        if not state_is_fresh():
+            logger.error("[NAVI] Refuse lock because touchdown telemetry is stale")
+            return False
+        if float(self.fc.state.alt_add.value) > alt_thres:
+            logger.error("[NAVI] Refuse lock because touchdown altitude is not confirmed")
+            return False
+
+        self.fc.lock()
+        try:
+            locked = self.fc.wait_for_lock(timeout_s=lock_timeout)
+        except TypeError:
+            locked = self.fc.wait_for_lock(lock_timeout)
+        if not locked:
+            logger.error("[NAVI] Moving landing lock was not confirmed")
+            return False
+        logger.info("[NAVI] Moving landing finished and motors locked")
+        return True
+
     def _waypoint_param_switch(self):
         tuning = self.pid_tunings["hover"]
         self.navi_x_pid.tunings = tuning
