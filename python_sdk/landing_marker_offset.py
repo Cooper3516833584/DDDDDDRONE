@@ -1523,6 +1523,7 @@ def _cross_core_is_dark(
     gray: _np.ndarray,
     center: tuple[float, float],
     diameter: float,
+    require_bright_background: bool,
 ) -> bool:
     """Reject thin-line intersections that are not the marker's broad cross."""
     height, width = gray.shape
@@ -1565,7 +1566,27 @@ def _cross_core_is_dark(
         _cv2.THRESH_BINARY | _cv2.THRESH_OTSU,
     )
     dark_fraction = float(_np.mean(core <= threshold))
-    return dark_fraction >= 0.50
+    if dark_fraction < 0.50:
+        return False
+    if not require_bright_background:
+        return True
+
+    local_center_u = center[0] - outer_x0
+    local_center_v = center[1] - outer_y0
+    local_y, local_x = _np.ogrid[:outer.shape[0], :outer.shape[1]]
+    local_radius = _np.hypot(
+        local_x - local_center_u,
+        local_y - local_center_v,
+    )
+    annulus = outer[
+        (local_radius >= 1.6 * core_radius)
+        & (local_radius <= outer_radius)
+    ]
+    if annulus.size < 32:
+        return False
+    bright_background = float(_np.percentile(annulus, 75))
+    dark_cross = float(_np.percentile(core, 25))
+    return bright_background - dark_cross >= 90.0
 
 
 def _skeletonize_mask(binary: _np.ndarray) -> _np.ndarray:
@@ -1696,6 +1717,7 @@ def _find_skeleton_cross(
                 gray,
                 (center_u, center_v),
                 search_diameter,
+                previous is None,
             ):
                 continue
             angle_score = float(
