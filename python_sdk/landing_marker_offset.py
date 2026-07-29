@@ -1519,34 +1519,108 @@ def _find_marker_candidate(
     return max(detections, key=lambda detection: detection.score)
 
 
+def _cross_core_is_dark(
+    gray: _np.ndarray,
+    center: tuple[float, float],
+    diameter: float,
+) -> bool:
+    """Reject thin-line intersections that are not the marker's broad cross."""
+    height, width = gray.shape
+    center_u = int(round(center[0]))
+    center_v = int(round(center[1]))
+    outer_radius = max(18, int(round(0.12 * diameter)))
+    core_radius = max(6, int(round(0.035 * diameter)))
+    outer_roi = _clip_roi(
+        (
+            center_u - outer_radius,
+            center_v - outer_radius,
+            center_u + outer_radius + 1,
+            center_v + outer_radius + 1,
+        ),
+        width,
+        height,
+    )
+    core_roi = _clip_roi(
+        (
+            center_u - core_radius,
+            center_v - core_radius,
+            center_u + core_radius + 1,
+            center_v + core_radius + 1,
+        ),
+        width,
+        height,
+    )
+    outer_x0, outer_y0, outer_x1, outer_y1 = outer_roi
+    core_x0, core_y0, core_x1, core_y1 = core_roi
+    if outer_x1 - outer_x0 < 12 or outer_y1 - outer_y0 < 12:
+        return False
+    if core_x1 - core_x0 < 8 or core_y1 - core_y0 < 8:
+        return False
+    outer = gray[outer_y0:outer_y1, outer_x0:outer_x1]
+    core = gray[core_y0:core_y1, core_x0:core_x1]
+    threshold, _ = _cv2.threshold(
+        outer,
+        0,
+        255,
+        _cv2.THRESH_BINARY | _cv2.THRESH_OTSU,
+    )
+    dark_fraction = float(_np.mean(core <= threshold))
+    return dark_fraction >= 0.50
+
+
 def _find_near_cross(
     gray: _np.ndarray,
     masks: list[_np.ndarray],
     previous: _Detection | None,
     resources: _VisionResources,
 ) -> _Detection | None:
-    """Track the marker cross after both circular borders leave the frame."""
-    if previous is None or not masks:
+    """Find a close marker from a consensus of thick-cross measurements."""
+    if not masks:
         return None
 
     height, width = gray.shape
     frame_diagonal = _math.hypot(width, height)
     search_diameter = min(
         1.35 * frame_diagonal,
-        max(0.90 * frame_diagonal, 1.20 * previous.diameter_px),
+        max(
+            0.90 * frame_diagonal,
+            (
+                1.20 * previous.diameter_px
+                if previous is not None
+                else 0.0
+            ),
+        ),
     )
-    search_centers = [
-        (previous.center_u, previous.center_v),
-        ((width - 1) / 2.0, (height - 1) / 2.0),
-    ]
+    if previous is None:
+        search_centers = [
+            ((width - 1) * u, (height - 1) * v)
+            for u, v in (
+                (0.50, 0.50),
+                (0.20, 0.20),
+                (0.80, 0.20),
+                (0.20, 0.80),
+                (0.80, 0.80),
+                (0.50, 0.20),
+                (0.20, 0.50),
+                (0.80, 0.50),
+                (0.50, 0.80),
+            )
+        ]
+    else:
+        search_centers = [
+            (previous.center_u, previous.center_v),
+            ((width - 1) / 2.0, (height - 1) / 2.0),
+        ]
 
-    best: tuple[float, float, float, int] | None = None
-    for search_center in search_centers:
+    hits: list[tuple[float, float, float, int, int]] = []
+    cluster_radius = max(8.0, 0.035 * search_diameter)
+    for search_index, search_center in enumerate(search_centers):
         search_ellipse: _Ellipse = (
             search_center,
             (search_diameter, search_diameter),
             0.0,
         )
+        search_hits: list[tuple[float, float, float, int, int]] = []
         for mask_index, mask in enumerate(masks):
             refined = _refine_center_from_cross(
                 gray,
@@ -1559,33 +1633,135 @@ def _find_near_cross(
             center_u, center_v, cross_score = refined
             if cross_score < 0.40:
                 continue
-            displacement = _math.hypot(
-                center_u - previous.center_u,
-                center_v - previous.center_v,
-            )
-            if displacement > max(28.0, 0.18 * search_diameter):
-                continue
-            temporal = _math.exp(
-                -displacement / max(1.0, 0.12 * search_diameter)
-            )
-            score = float(
-                _np.clip(
-                    0.46 + 0.40 * cross_score + 0.14 * temporal,
-                    0.0,
-                    0.86,
+            if previous is not None:
+                displacement = _math.hypot(
+                    center_u - previous.center_u,
+                    center_v - previous.center_v,
+                )
+                if displacement > max(28.0, 0.18 * search_diameter):
+                    continue
+            search_hits.append(
+                (
+                    float(center_u),
+                    float(center_v),
+                    float(cross_score),
+                    mask_index,
+                    search_index,
                 )
             )
-            if best is None or score > best[2]:
-                best = (center_u, center_v, score, mask_index)
+        hits.extend(search_hits)
+        if len(search_hits) == len(masks):
+            center_u = float(_np.mean([hit[0] for hit in search_hits]))
+            center_v = float(_np.mean([hit[1] for hit in search_hits]))
+            spread = max(
+                _math.hypot(hit[0] - center_u, hit[1] - center_v)
+                for hit in search_hits
+            )
+            mean_score = float(_np.mean([hit[2] for hit in search_hits]))
+            if spread <= cluster_radius and mean_score >= 0.55:
+                break
 
-    if best is None:
+    if not hits:
         return None
-    center_u, center_v, score, mask_index = best
-    (_, _), axes, angle = previous.ellipse
+
+    best_cluster: list[tuple[float, float, float, int, int]] | None = None
+    best_cluster_rank = -_math.inf
+    for anchor in hits:
+        cluster = [
+            hit
+            for hit in hits
+            if _math.hypot(hit[0] - anchor[0], hit[1] - anchor[1])
+            <= cluster_radius
+        ]
+        mask_count = len({hit[3] for hit in cluster})
+        search_count = len({hit[4] for hit in cluster})
+        if mask_count < 2:
+            if previous is None:
+                continue
+            mean_cross_score = float(
+                _np.mean([hit[2] for hit in cluster])
+            )
+            if mean_cross_score < 0.55:
+                continue
+        if previous is None and search_count < 2:
+            mean_cross_score = float(
+                _np.mean([hit[2] for hit in cluster])
+            )
+            if mask_count < len(masks) or mean_cross_score < 0.55:
+                continue
+        rank = (
+            float(_np.mean([hit[2] for hit in cluster]))
+            + 0.04 * mask_count
+            + 0.02 * search_count
+        )
+        if rank > best_cluster_rank:
+            best_cluster_rank = rank
+            best_cluster = cluster
+
+    if best_cluster is None:
+        return None
+
+    weights = _np.asarray(
+        [hit[2] ** 2 for hit in best_cluster],
+        dtype=_np.float64,
+    )
+    weight_sum = float(_np.sum(weights))
+    if weight_sum <= 0.0:
+        return None
+    centers = _np.asarray(
+        [(hit[0], hit[1]) for hit in best_cluster],
+        dtype=_np.float64,
+    )
+    center_u, center_v = _np.sum(
+        centers * weights[:, None],
+        axis=0,
+    ) / weight_sum
+    if not _cross_core_is_dark(
+        gray,
+        (float(center_u), float(center_v)),
+        search_diameter,
+    ):
+        return None
+    cross_score = float(
+        _np.average(
+            [hit[2] for hit in best_cluster],
+            weights=weights,
+        )
+    )
+    mask_count = len({hit[3] for hit in best_cluster})
+    search_count = len({hit[4] for hit in best_cluster})
+    temporal = 0.5
+    if previous is not None:
+        displacement = _math.hypot(
+            center_u - previous.center_u,
+            center_v - previous.center_v,
+        )
+        temporal = _math.exp(
+            -displacement / max(1.0, 0.12 * search_diameter)
+        )
+    score = float(
+        _np.clip(
+            0.48
+            + 0.32 * cross_score
+            + 0.06 * min(1.0, mask_count / 3.0)
+            + 0.06 * min(1.0, search_count / 3.0)
+            + 0.08 * temporal,
+            0.0,
+            0.88,
+        )
+    )
+    mask_index = max(best_cluster, key=lambda hit: hit[2])[3]
+    if previous is None:
+        axes = (search_diameter, search_diameter)
+        angle = 0.0
+        diameter_px = search_diameter
+    else:
+        (_, _), axes, angle = previous.ellipse
+        diameter_px = previous.diameter_px
     return _Detection(
         center_u=float(center_u),
         center_v=float(center_v),
-        diameter_px=float(previous.diameter_px),
+        diameter_px=float(diameter_px),
         score=float(score),
         ellipse=((float(center_u), float(center_v)), axes, angle),
         mask_index=mask_index,
@@ -1884,9 +2060,14 @@ class _MarkerTracker:
             previous,
             self._resources,
         )
+        near_cross_threshold = (
+            _TRACK_SCORE_THRESHOLD
+            if previous is not None
+            else _SEARCH_SCORE_THRESHOLD
+        )
         if (
             near_cross is not None
-            and near_cross.score >= _TRACK_SCORE_THRESHOLD
+            and near_cross.score >= near_cross_threshold
         ):
             return near_cross, near_cross.score
         if raw is None:
