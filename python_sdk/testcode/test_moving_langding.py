@@ -174,7 +174,12 @@ class Mission:
         if not self.navi.wait_for_yaw():
             raise RuntimeError("yaw stabilization was not confirmed")
         
-        self.navi.moving_landing(CRUISE_HEIGHT, 0) # 起飞后先降落到 150cm 高度，再降落到 0cm 高度
+        if not self.navi.moving_landing(
+            horizontal_speed=CRUISE_SPEED,
+            direction_deg=0,
+            lock_after_landing=True,
+        ):
+            raise RuntimeError("moving landing or motor lock was not confirmed")
 
     def stop(self) -> None:
         self.stop_event.set()

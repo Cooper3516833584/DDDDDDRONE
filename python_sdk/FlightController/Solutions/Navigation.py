@@ -21,6 +21,11 @@ FUSION_ROS_CALIBRATION_INTERVAL = 1.0
 FUSION_ROS_MAX_POSITION_CORRECTION_CM = 2.0
 FUSION_ROS_MAX_YAW_CORRECTION_DEG = 1.0
 NAVIGATION_CONTROL_STALE_TIMEOUT = 0.30
+VELOCITY_OVERRIDE_ZERO_FLUSH_FRAMES = 3
+VELOCITY_OVERRIDE_ZERO_FLUSH_INTERVAL = 0.05
+MOVING_DESCENT_MAX_HORIZONTAL_SPEED = 50.0
+MOVING_DESCENT_MAX_VERTICAL_SPEED = 30.0
+TOUCHDOWN_MAX_VERTICAL_SPEED_THRESHOLD = 10.0
 
 def _shortest_yaw_error(
     target_yaw: float,
@@ -130,6 +135,11 @@ class Navigation(object):
         self._control_lock = threading.Lock()
         self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
         self._navigation_control_updated_at = 0.0
+        self._velocity_override_active = False
+        self._velocity_override_keep_height = False
+        self._velocity_override_updated_at = 0.0
+        self._velocity_override_faulted = False
+        self._velocity_override_horizontal_cancelled = False
         self._last_pose_update = 0.0
         self._last_ros_calibration = 0.0
         self._thread_list: List[threading.Thread] = []
@@ -176,6 +186,11 @@ class Navigation(object):
         停止导航
         """
         self.running = False
+        with self._control_lock:
+            self._velocity_override_active = False
+            self._velocity_override_keep_height = False
+            self._velocity_override_faulted = False
+            self._velocity_override_horizontal_cancelled = False
         try:
             self.update_realtime_control(vel_x=0, vel_y=0, vel_z=0, yaw=0)
         except Exception:
@@ -206,6 +221,11 @@ class Navigation(object):
             self.mapper.trans_event_skip = PARAMS.MAP_SKIP
         self._fusion_cnt = 0
         self._t265_trans_args = None
+        self._velocity_override_active = False
+        self._velocity_override_keep_height = False
+        self._velocity_override_updated_at = 0.0
+        self._velocity_override_faulted = False
+        self._velocity_override_horizontal_cancelled = False
         self.switch_navigation_mode(mode)  # type: ignore
         self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
         self.update_realtime_control(vel_x=0, vel_y=0, vel_z=0, yaw=0)
@@ -213,6 +233,10 @@ class Navigation(object):
         self._thread_list.append(threading.Thread(target=self._keep_height_task, daemon=True))
         self._thread_list[-1].start()
         self._thread_list.append(threading.Thread(target=self._navigation_task, daemon=True))
+        self._thread_list[-1].start()
+        self._thread_list.append(
+            threading.Thread(target=self._velocity_override_watchdog_task, daemon=True)
+        )
         self._thread_list[-1].start()
         logger.info("[NAVI] Navigation started")
 
@@ -222,24 +246,57 @@ class Navigation(object):
         vel_y: Optional[int] = None,
         vel_z: Optional[int] = None,
         yaw: Optional[int] = None,
+        _source: Literal["external", "navigation", "height"] = "external",
     ) -> None:
         """
         更新实时控制帧
         """
+        if _source not in ("external", "navigation", "height"):
+            raise ValueError("invalid realtime-control source")
         with self._control_lock:
             now = time.monotonic()
             if not self.running:
                 self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
-            else:
-                if vel_x is not None:
-                    self._realtime_control_data_in_xyzYaw[0] = vel_x
-                if vel_y is not None:
-                    self._realtime_control_data_in_xyzYaw[1] = vel_y
-                if vel_z is not None:
+            elif self._velocity_override_active:
+                if _source == "external":
+                    full_zero = bool(
+                        vel_x == 0
+                        and vel_y == 0
+                        and vel_z == 0
+                        and yaw == 0
+                    )
+                    if not full_zero:
+                        raise RuntimeError(
+                            "external realtime control is blocked by velocity override"
+                        )
+                    self._velocity_override_faulted = True
+                    self._velocity_override_keep_height = False
+                    self.keep_height_flag = False
+                    self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
+                elif (
+                    self._velocity_override_keep_height
+                    and _source == "height"
+                    and vel_z is not None
+                ):
                     self._realtime_control_data_in_xyzYaw[2] = vel_z
-                if yaw is not None:
+            else:
+                allow_navigation = not (
+                    _source == "navigation" and not self.navigation_flag
+                )
+                allow_height = not (
+                    _source == "height" and not self.keep_height_flag
+                )
+                if allow_navigation and vel_x is not None:
+                    self._realtime_control_data_in_xyzYaw[0] = vel_x
+                if allow_navigation and vel_y is not None:
+                    self._realtime_control_data_in_xyzYaw[1] = vel_y
+                if allow_height and vel_z is not None:
+                    self._realtime_control_data_in_xyzYaw[2] = vel_z
+                if allow_navigation and yaw is not None:
                     self._realtime_control_data_in_xyzYaw[3] = yaw
-                if vel_x is not None or vel_y is not None or yaw is not None:
+                if allow_navigation and (
+                    vel_x is not None or vel_y is not None or yaw is not None
+                ):
                     self._navigation_control_updated_at = now
             control = list(self._realtime_control_data_in_xyzYaw)
             if (
@@ -250,7 +307,57 @@ class Navigation(object):
                 control[0] = 0
                 control[1] = 0
                 control[3] = 0
+            if (
+                self.running
+                and self._velocity_override_active
+                and now - self._velocity_override_updated_at
+                > NAVIGATION_CONTROL_STALE_TIMEOUT
+            ):
+                if not self._velocity_override_faulted:
+                    logger.error(
+                        "[NAVI] Velocity override timed out; "
+                        "control revoked and zeroed"
+                    )
+                self._velocity_override_faulted = True
+                self._realtime_control_data_in_xyzYaw[0] = 0
+                self._realtime_control_data_in_xyzYaw[1] = 0
+                self._realtime_control_data_in_xyzYaw[3] = 0
+                if not self._velocity_override_keep_height:
+                    self._realtime_control_data_in_xyzYaw[2] = 0
+                control = list(self._realtime_control_data_in_xyzYaw)
             self.fc.send_realtime_control_data(*control)
+
+    def _velocity_override_watchdog_task(self):
+        """接管租约失效后撤销控制，并持续发送零速度帧直到退出。"""
+        while self.running:
+            try:
+                with self._control_lock:
+                    stale_now = bool(
+                        self._velocity_override_active
+                        and time.monotonic() - self._velocity_override_updated_at
+                        > NAVIGATION_CONTROL_STALE_TIMEOUT
+                    )
+                    if self._velocity_override_active and (
+                        stale_now or self._velocity_override_faulted
+                    ):
+                        first_fault = not self._velocity_override_faulted
+                        self._velocity_override_faulted = True
+                        self._realtime_control_data_in_xyzYaw[0] = 0
+                        self._realtime_control_data_in_xyzYaw[1] = 0
+                        self._realtime_control_data_in_xyzYaw[3] = 0
+                        if not self._velocity_override_keep_height:
+                            self._realtime_control_data_in_xyzYaw[2] = 0
+                        self.fc.send_realtime_control_data(
+                            *self._realtime_control_data_in_xyzYaw
+                        )
+                        if first_fault:
+                            logger.error(
+                                "[NAVI] Velocity override timed out; "
+                                "control revoked and zeroed"
+                            )
+            except Exception:
+                logger.exception("[NAVI] Velocity override watchdog error")
+            time.sleep(0.05)
 
     def switch_navigation_mode(self, mode: Literal["radar", "rs", "fusion", "fusion-ros"]):
         """
@@ -321,7 +428,7 @@ class Navigation(object):
                 if not self.keep_height_by_rs:
                     if not self.fc.state.update_event.wait(1):
                         logger.warning("[NAVI] FC state update timeout")
-                        self.update_realtime_control(vel_z=0)
+                        self.update_realtime_control(vel_z=0, _source="height")
                         continue
                     self.fc.state.update_event.clear()
                     self.current_height = self.fc.state.alt_add.value
@@ -329,7 +436,7 @@ class Navigation(object):
                 else:
                     if not self.rs.update_event.wait(1):
                         logger.warning("[NAVI] RealSense height timeout")
-                        self.update_realtime_control(vel_z=0)
+                        self.update_realtime_control(vel_z=0, _source="height")
                         continue
                     height = self.current_height_rs
                 logger_dbg.debug(f"[NAVI] Current height: {height}")
@@ -341,7 +448,7 @@ class Navigation(object):
                     if not paused:
                         paused = True
                         self.height_pid.set_auto_mode(False)
-                        self.update_realtime_control(vel_z=0)
+                        self.update_realtime_control(vel_z=0, _source="height")
                         logger.info("[NAVI] Keep height paused")
                     continue
                 if paused:
@@ -349,11 +456,11 @@ class Navigation(object):
                     self.height_pid.set_auto_mode(True, last_output=0)
                     logger.info("[NAVI] Keep Height resumed")
                 out_hei = round(self.height_pid(height))  # type: ignore
-                self.update_realtime_control(vel_z=out_hei)
+                self.update_realtime_control(vel_z=out_hei, _source="height")
                 logger_dbg.info(f"[NAVI] Height PID output: {out_hei}")
             except Exception as e:
                 logger.exception("[NAVI] Keep height task error")
-                self.update_realtime_control(vel_z=0)
+                self.update_realtime_control(vel_z=0, _source="height")
 
     def _get_t265_pose(self, wait=True) -> Optional[Tuple[float, float, float, bool]]:
         if wait and not self.rs.update_event.wait(POSE_STALE_TIMEOUT):
@@ -431,7 +538,9 @@ class Navigation(object):
         while self.running:
             try:
                 if self.stop_event is not None and self.stop_event.is_set():
-                    self.update_realtime_control(vel_x=0, vel_y=0, yaw=0)
+                    self.update_realtime_control(
+                        vel_x=0, vel_y=0, yaw=0, _source="navigation"
+                    )
                     time.sleep(0.05)
                     continue
                 if self._navigation_mode == "radar":
@@ -445,7 +554,9 @@ class Navigation(object):
                 else:
                     raise ValueError(f"Unknown navigation mode: {self._navigation_mode}")
                 if pose is None:
-                    self.update_realtime_control(vel_x=0, vel_y=0, yaw=0)
+                    self.update_realtime_control(
+                        vel_x=0, vel_y=0, yaw=0, _source="navigation"
+                    )
                     logger.warning("[NAVI] Navigation pose not available")
                     continue
                 self.current_x, self.current_y, self.current_yaw, available = (
@@ -465,7 +576,9 @@ class Navigation(object):
                         self.navi_x_pid.set_auto_mode(False)
                         self.navi_y_pid.set_auto_mode(False)
                         self.yaw_pid.set_auto_mode(False)
-                        self.update_realtime_control(vel_x=0, vel_y=0, yaw=0)
+                        self.update_realtime_control(
+                            vel_x=0, vel_y=0, yaw=0, _source="navigation"
+                        )
                         logger.info("[NAVI] Navigation paused")
                     continue
                 if paused:
@@ -476,7 +589,9 @@ class Navigation(object):
                     logger.info("[NAVI] Navigation resumed")
                 if not available:
                     logger.warning("[NAVI] Pose not available")
-                    self.update_realtime_control(vel_x=0, vel_y=0, yaw=0)
+                    self.update_realtime_control(
+                        vel_x=0, vel_y=0, yaw=0, _source="navigation"
+                    )
                     time.sleep(0.1)
                     continue
                 # self.fc.send_general_position(x=self.current_x, y=self.current_y)
@@ -494,14 +609,21 @@ class Navigation(object):
                 out_x_body = round(out_x_body)
                 out_y_body = round(out_y_body)
                 out_yaw = round(out_yaw)
-                self.update_realtime_control(vel_x=out_x_body, vel_y=out_y_body, yaw=out_yaw)
+                self.update_realtime_control(
+                    vel_x=out_x_body,
+                    vel_y=out_y_body,
+                    yaw=out_yaw,
+                    _source="navigation",
+                )
                 logger_dbg.info(
                     f"[NAVI] Pose PID output: world=({out_x_world}, {out_y_world}), "
                     f"body=({out_x_body}, {out_y_body}), yaw={out_yaw}"
                 )
             except Exception as e:
                 logger.exception(f"[NAVI] Navigation task error")
-                self.update_realtime_control(vel_x=0, vel_y=0, yaw=0)
+                self.update_realtime_control(
+                    vel_x=0, vel_y=0, yaw=0, _source="navigation"
+                )
 
     def calibrate_realsense(self, wait=True):
         """
@@ -1185,34 +1307,411 @@ class Navigation(object):
                 return False
         return True
 
+    def _flight_state_is_fresh(self, max_age: float = 0.5) -> bool:
+        return bool(
+            getattr(self.fc.state, "is_fresh", lambda _age: False)(max_age)
+        )
+
+    @staticmethod
+    def _validate_moving_descent_speeds(
+        horizontal_speed: float,
+        descent_speed: float,
+    ) -> None:
+        if horizontal_speed > MOVING_DESCENT_MAX_HORIZONTAL_SPEED:
+            raise ValueError(
+                "horizontal_speed must not exceed "
+                f"{MOVING_DESCENT_MAX_HORIZONTAL_SPEED}cm/s"
+            )
+        if descent_speed > MOVING_DESCENT_MAX_VERTICAL_SPEED:
+            raise ValueError(
+                "descent_speed must not exceed "
+                f"{MOVING_DESCENT_MAX_VERTICAL_SPEED}cm/s"
+            )
+
+    def _start_velocity_override(
+        self,
+        keep_height: bool = False,
+        require_pose: bool = True,
+    ) -> bool:
+        """暂停导航 PID，并由调用方持续刷新实时速度控制量。"""
+        if not self.running:
+            logger.error("[NAVI] Velocity override requires navigation to be running")
+            return False
+        if self.stop_event is not None and self.stop_event.is_set():
+            logger.error("[NAVI] Velocity override refused: external stop event is set")
+            return False
+        if not self._flight_state_is_fresh():
+            logger.error("[NAVI] Velocity override refused: FC telemetry is stale")
+            return False
+        if not self.fc.state.unlock.value:
+            logger.error("[NAVI] Velocity override requires an unlocked aircraft")
+            return False
+        if require_pose and not self.pose_is_fresh():
+            logger.error("[NAVI] Velocity override refused: navigation pose is stale")
+            return False
+        with self._control_lock:
+            if self._velocity_override_active:
+                logger.error("[NAVI] Another velocity override is already active")
+                return False
+
+        if self.fc.state.mode.value != self.fc.HOLD_POS_MODE:
+            self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
+            mode_deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < mode_deadline:
+                if (
+                    self._flight_state_is_fresh()
+                    and self.fc.state.mode.value == self.fc.HOLD_POS_MODE
+                ):
+                    break
+                time.sleep(0.05)
+            else:
+                logger.error("[NAVI] Velocity override refused: HOLD_POS not confirmed")
+                return False
+
+        self.navigation_stop_here()
+        with self._control_lock:
+            if self._velocity_override_active:
+                logger.error("[NAVI] Another velocity override is already active")
+                return False
+            self.navigation_flag = False
+            self.keep_height_flag = bool(keep_height)
+            self._velocity_override_active = True
+            self._velocity_override_keep_height = bool(keep_height)
+            self._velocity_override_updated_at = time.monotonic()
+            self._velocity_override_faulted = False
+            self._velocity_override_horizontal_cancelled = False
+            self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
+            try:
+                self.fc.send_realtime_control_data(0, 0, 0, 0)
+            except Exception:
+                self._velocity_override_faulted = True
+                self._velocity_override_horizontal_cancelled = True
+                self.navigation_flag = False
+                self.keep_height_flag = False
+                logger.exception("[NAVI] Failed to start velocity override")
+                return False
+        logger.info(
+            f"[NAVI] Velocity override started, keep_height={bool(keep_height)}"
+        )
+        return True
+
+    def _update_velocity_override(
+        self,
+        vel_x: float,
+        vel_y: float,
+        vel_z: Optional[float] = None,
+        yaw: float = 0,
+        frame: Literal["world", "body"] = "world",
+    ) -> None:
+        """更新速度接管指令；调用方必须以高于失效频率持续刷新。"""
+        values = [vel_x, vel_y, yaw]
+        if vel_z is not None:
+            values.append(vel_z)
+        if not np.all(np.isfinite(np.asarray(values, dtype=float))):
+            raise ValueError("velocity override values must be finite")
+        if frame not in ("world", "body"):
+            raise ValueError("frame must be 'world' or 'body'")
+
+        if frame == "world":
+            vel_x, vel_y = _world_to_body_velocity(
+                vel_x,
+                vel_y,
+                self.current_yaw,
+            )
+        with self._control_lock:
+            if not self._velocity_override_active:
+                raise RuntimeError("velocity override is not active")
+            if self._velocity_override_faulted:
+                raise RuntimeError("velocity override lease has been revoked")
+            self._velocity_override_updated_at = time.monotonic()
+            if self._velocity_override_horizontal_cancelled:
+                vel_x = 0
+                vel_y = 0
+            self._realtime_control_data_in_xyzYaw[0] = round(vel_x)
+            self._realtime_control_data_in_xyzYaw[1] = round(vel_y)
+            if vel_z is not None:
+                self._realtime_control_data_in_xyzYaw[2] = round(vel_z)
+            self._realtime_control_data_in_xyzYaw[3] = round(yaw)
+            self.fc.send_realtime_control_data(
+                *self._realtime_control_data_in_xyzYaw
+            )
+
+    def _stop_velocity_override(
+        self,
+        restore_hover: bool = False,
+        hover_height: Optional[float] = None,
+        zero_flush_frames: int = VELOCITY_OVERRIDE_ZERO_FLUSH_FRAMES,
+    ) -> bool:
+        """退出速度接管并清零控制；可在条件允许时恢复当前位置悬停。"""
+        zero_flush_frames = int(zero_flush_frames)
+        if zero_flush_frames < 1:
+            raise ValueError("zero_flush_frames must be at least 1")
+        with self._control_lock:
+            self._velocity_override_active = True
+            self._velocity_override_faulted = True
+            self._velocity_override_horizontal_cancelled = True
+            self.navigation_flag = False
+            self.keep_height_flag = False
+            self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
+
+        for frame_index in range(zero_flush_frames):
+            with self._control_lock:
+                try:
+                    self.fc.send_realtime_control_data(0, 0, 0, 0)
+                except Exception:
+                    logger.exception("[NAVI] Failed to clear velocity override control")
+                    return False
+            if frame_index + 1 < zero_flush_frames:
+                time.sleep(VELOCITY_OVERRIDE_ZERO_FLUSH_INTERVAL)
+
+        with self._control_lock:
+            self._velocity_override_active = False
+            self._velocity_override_keep_height = False
+            self._velocity_override_faulted = False
+            self._velocity_override_horizontal_cancelled = False
+
+        if not restore_hover:
+            logger.info("[NAVI] Velocity override stopped")
+            return True
+        if not (
+            self.running
+            and self.fc.state.unlock.value
+            and self._flight_state_is_fresh()
+            and self.pose_is_fresh()
+            and self.fc.state.mode.value == self.fc.HOLD_POS_MODE
+        ):
+            logger.error("[NAVI] Cannot restore hover after velocity override")
+            return False
+
+        target_height = (
+            float(self.fc.state.alt_add.value)
+            if hover_height is None
+            else float(hover_height)
+        )
+        self.direct_set_waypoint([self.current_x, self.current_y])
+        self.set_height(target_height)
+        self.switch_pid("hover")
+        self.navigation_flag = True
+        self.keep_height_flag = True
+        logger.info(
+            f"[NAVI] Velocity override stopped; hovering at {target_height}cm"
+        )
+        return True
+
+    def moving_descent(
+        self,
+        horizontal_speed: float,
+        target_height: float,
+        direction_deg: float = 0,
+        descent_speed: float = 15,
+        height_confirm_time: float = 0.1,
+        timeout: float = 15,
+    ) -> bool:
+        """
+        保持水平移动并下降到指定激光高度，成功后恢复当前位置悬停。
+
+        horizontal_speed: 水平速度 / cm/s，取绝对值
+        target_height: 目标激光高度 / cm
+        direction_deg: 导航坐标系方向 / deg，0 度为 x 正方向，逆时针为正
+        descent_speed: 下降速度 / cm/s，取绝对值
+        height_confirm_time: 高度不高于目标值的持续确认时间 / s
+        timeout: 整个下降阶段超时 / s
+        """
+        return self._moving_descent(
+            horizontal_speed=horizontal_speed,
+            target_height=target_height,
+            direction_deg=direction_deg,
+            descent_speed=descent_speed,
+            height_confirm_time=height_confirm_time,
+            timeout=timeout,
+            hold_after_reaching=True,
+        )
+
+    def _moving_descent(
+        self,
+        horizontal_speed: float,
+        target_height: float,
+        direction_deg: float = 0,
+        descent_speed: float = 15,
+        height_confirm_time: float = 0.1,
+        timeout: float = 15,
+        hold_after_reaching: bool = True,
+    ) -> bool:
+        """
+        执行移动下降；可为 moving_landing 保持速度接管以连续进入接地阶段。
+
+        horizontal_speed: 水平速度 / cm/s，取绝对值
+        target_height: 目标激光高度 / cm
+        direction_deg: 导航坐标系方向 / deg，0 度为 x 正方向，逆时针为正
+        descent_speed: 下降速度 / cm/s，取绝对值
+        height_confirm_time: 高度不高于目标值的持续确认时间 / s
+        timeout: 整个下降阶段超时 / s
+        hold_after_reaching: 成功后是否恢复悬停；False 仅供内部连续控制
+        """
+        values = np.asarray(
+            [
+                horizontal_speed,
+                target_height,
+                direction_deg,
+                descent_speed,
+                height_confirm_time,
+                timeout,
+            ],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("moving_descent parameters must be finite")
+        if not isinstance(hold_after_reaching, bool):
+            raise ValueError("hold_after_reaching must be bool")
+        horizontal_speed = abs(float(horizontal_speed))
+        target_height = float(target_height)
+        direction_deg = float(direction_deg)
+        descent_speed = abs(float(descent_speed))
+        self._validate_moving_descent_speeds(
+            horizontal_speed=horizontal_speed,
+            descent_speed=descent_speed,
+        )
+        confirm_time = float(height_confirm_time)
+        timeout = float(timeout)
+        if target_height < 0:
+            raise ValueError("target_height must not be negative")
+        if min(descent_speed, confirm_time, timeout) <= 0:
+            raise ValueError(
+                "descent_speed, height_confirm_time and timeout must be greater than 0"
+            )
+        if not self._flight_state_is_fresh():
+            logger.error("[NAVI] Moving descent refused: FC telemetry is stale")
+            return False
+        if float(self.fc.state.alt_add.value) < target_height:
+            logger.error(
+                "[NAVI] Moving descent refused: target height is above current height"
+            )
+            return False
+        if not self._start_velocity_override(keep_height=False, require_pose=True):
+            return False
+
+        direction_rad = np.deg2rad(direction_deg)
+        vel_x_world = horizontal_speed * float(np.cos(direction_rad))
+        vel_y_world = horizontal_speed * float(np.sin(direction_rad))
+        start_time = time.perf_counter()
+        reached_since = None
+        reached = False
+        abort_reason = None
+        stop_ok = True
+        pose_lost_in_target_zone = False
+        logger.info(
+            f"[NAVI] Moving descent started: speed={horizontal_speed}cm/s, "
+            f"direction={direction_deg}deg, target={target_height}cm, "
+            f"descent={descent_speed}cm/s"
+        )
+        try:
+            while True:
+                now = time.perf_counter()
+                if self.stop_event is not None and self.stop_event.is_set():
+                    abort_reason = "external stop event is set"
+                    break
+                if not self.running:
+                    abort_reason = "navigation stopped"
+                    break
+                if not self._flight_state_is_fresh():
+                    abort_reason = "flight-controller telemetry became stale"
+                    break
+                if not self.fc.state.unlock.value:
+                    abort_reason = "aircraft became locked before target height"
+                    break
+                if self.fc.state.mode.value != self.fc.HOLD_POS_MODE:
+                    abort_reason = "flight mode left HOLD_POS"
+                    break
+                if now - start_time > timeout:
+                    abort_reason = "moving descent timeout"
+                    break
+
+                alt_now = float(self.fc.state.alt_add.value)
+                pose_fresh = self.pose_is_fresh()
+                if not pose_fresh:
+                    if hold_after_reaching or alt_now > target_height:
+                        abort_reason = "navigation pose became stale"
+                        break
+                    if not pose_lost_in_target_zone:
+                        pose_lost_in_target_zone = True
+                        with self._control_lock:
+                            self._velocity_override_horizontal_cancelled = True
+                        logger.warning(
+                            "[NAVI] Pose stale in target-height zone; "
+                            "cancel horizontal velocity and continue descent"
+                        )
+                if alt_now <= target_height:
+                    if reached_since is None:
+                        reached_since = now
+                    elif now - reached_since >= confirm_time:
+                        reached = True
+                        break
+                    vel_z = 0.0 if hold_after_reaching else -descent_speed
+                else:
+                    reached_since = None
+                    vel_z = -descent_speed
+                self._update_velocity_override(
+                    vel_x=(
+                        vel_x_world
+                        if pose_fresh and not pose_lost_in_target_zone
+                        else 0
+                    ),
+                    vel_y=(
+                        vel_y_world
+                        if pose_fresh and not pose_lost_in_target_zone
+                        else 0
+                    ),
+                    vel_z=vel_z,
+                    yaw=0,
+                    frame="world",
+                )
+                time.sleep(0.05)
+        except Exception:
+            logger.exception("[NAVI] Moving descent control error")
+            abort_reason = "control exception"
+        finally:
+            if not reached or hold_after_reaching:
+                stop_ok = self._stop_velocity_override(
+                    restore_hover=hold_after_reaching if reached else True,
+                    hover_height=target_height if reached else None,
+                )
+
+        if abort_reason is not None:
+            logger.error(f"[NAVI] Moving descent aborted: {abort_reason}")
+            return False
+        if not reached:
+            return False
+        if not stop_ok:
+            logger.error("[NAVI] Moving descent reached target but control was not cleared")
+            return False
+        logger.info(f"[NAVI] Moving descent reached {target_height}cm")
+        return True
+
     def moving_landing(
         self,
         horizontal_speed: float,
         direction_deg: float = 0,
         lock_after_landing: bool = True,
         descent_speed: float = 15,
-        touchdown_alt_thres: float = 8,
+        touchdown_alt_thres: float = 12,
         touchdown_confirm_time: float = 0.3,
         touchdown_timeout: float = 15,
         lock_timeout: float = 4,
+        touchdown_vertical_speed_thres: float = 5,
     ) -> bool:
         """
-        保持水平速度指令的同时下降，并可选择落地后是否锁桨。
+        保持水平移动下降至接地区域，组合确认接地后可选择是否锁桨。
 
-        horizontal_speed: 水平速度指令 / cm/s，取绝对值
-        direction_deg: 导航坐标系中的水平运动方向 / deg；
-            0 度为 x 正方向，逆时针为正（90 度为 y 正方向）
-        lock_after_landing: True 表示确认落地后锁桨；False 表示保持解锁
-        descent_speed: 下降速度指令的绝对值 / cm/s
-        touchdown_alt_thres: 落地高度阈值 / cm，实际值不小于 3 cm
-        touchdown_confirm_time: 高度持续低于阈值的确认时间 / s
-        touchdown_timeout: 下降阶段超时 / s
-        lock_timeout: 发出锁桨命令后的确认超时 / s
+        horizontal_speed: 水平速度 / cm/s，取绝对值
+        direction_deg: 导航坐标系方向 / deg，0 度为 x 正方向，逆时针为正
+        lock_after_landing: True 为确认接地后锁桨；False 为清零后保持解锁
+        descent_speed: 下降速度 / cm/s，取绝对值
+        touchdown_alt_thres: 接地高度阈值 / cm，限制为不大于 30 cm
+        touchdown_vertical_speed_thres: 接地垂直速度绝对值阈值 / cm/s
 
-        水平速度采用 navigation_to_waypoint 相同的导航坐标系，并根据当前
-        偏航转换为机体系速度。函数暂停现有水平导航和定高 PID，以约 20 Hz
-        刷新实时控制帧。异常时立即清零；仅确认低高度后才可能锁桨。
-        lock_after_landing=False 时保持解锁，调用者负责后续处置。
+        接地条件为激光高度不高于 touchdown_alt_thres，且垂直速度绝对值
+        不高于 touchdown_vertical_speed_thres，并持续 touchdown_confirm_time。
+        touchdown_timeout 覆盖移动下降和最终接地两个阶段。
         """
         values = np.asarray(
             [
@@ -1223,6 +1722,7 @@ class Navigation(object):
                 touchdown_confirm_time,
                 touchdown_timeout,
                 lock_timeout,
+                touchdown_vertical_speed_thres,
             ],
             dtype=float,
         )
@@ -1233,71 +1733,86 @@ class Navigation(object):
         horizontal_speed = abs(float(horizontal_speed))
         direction_deg = float(direction_deg)
         descent_speed = abs(float(descent_speed))
-        alt_thres = max(3.0, float(touchdown_alt_thres))
+        self._validate_moving_descent_speeds(
+            horizontal_speed=horizontal_speed,
+            descent_speed=descent_speed,
+        )
+        requested_alt_thres = float(touchdown_alt_thres)
+        if requested_alt_thres > 30:
+            raise ValueError("touchdown_alt_thres must not exceed 30cm")
+        alt_thres = max(3.0, requested_alt_thres)
         confirm_time = float(touchdown_confirm_time)
         timeout = float(touchdown_timeout)
         lock_timeout = float(lock_timeout)
-        if min(descent_speed, confirm_time, timeout, lock_timeout) <= 0:
+        vertical_speed_thres = abs(float(touchdown_vertical_speed_thres))
+        if vertical_speed_thres > TOUCHDOWN_MAX_VERTICAL_SPEED_THRESHOLD:
             raise ValueError(
-                "descent_speed, touchdown_confirm_time, touchdown_timeout "
-                "and lock_timeout must be greater than 0"
+                "touchdown_vertical_speed_thres must not exceed "
+                f"{TOUCHDOWN_MAX_VERTICAL_SPEED_THRESHOLD}cm/s"
             )
+        if min(descent_speed, confirm_time, timeout, vertical_speed_thres) <= 0:
+            raise ValueError(
+                "descent_speed, touchdown_confirm_time, touchdown_timeout, "
+                "and touchdown_vertical_speed_thres must be greater than 0"
+            )
+        if lock_after_landing and lock_timeout <= 0:
+            raise ValueError("lock_timeout must be greater than 0 when locking")
 
-        state_is_fresh = lambda: bool(
-            getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
+        deadline = time.perf_counter() + timeout
+        already_in_touchdown_zone = bool(
+            self._flight_state_is_fresh()
+            and float(self.fc.state.alt_add.value) <= alt_thres
         )
-
-        if not self.running:
-            logger.error("[NAVI] Moving landing requires navigation to be running")
-            return False
-        if self.stop_event is not None and self.stop_event.is_set():
-            logger.error("[NAVI] Moving landing refused: external stop event is set")
-            return False
-        if not state_is_fresh():
-            logger.error("[NAVI] Moving landing refused: FC telemetry is stale")
-            return False
-        if not self.fc.state.unlock.value:
-            logger.error("[NAVI] Moving landing requires an unlocked aircraft")
-            return False
-        if not self.pose_is_fresh():
-            logger.error("[NAVI] Moving landing refused: navigation pose is stale")
-            return False
-
-        if self.fc.state.mode.value != self.fc.HOLD_POS_MODE:
-            self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
-            mode_deadline = time.perf_counter() + 1.0
-            while time.perf_counter() < mode_deadline:
-                if (
-                    state_is_fresh()
-                    and self.fc.state.mode.value == self.fc.HOLD_POS_MODE
-                ):
-                    break
-                time.sleep(0.05)
-            else:
-                logger.error("[NAVI] Moving landing refused: HOLD_POS not confirmed")
+        if already_in_touchdown_zone:
+            if not self._start_velocity_override(
+                keep_height=False,
+                require_pose=False,
+            ):
                 return False
+            if not self.pose_is_fresh():
+                with self._control_lock:
+                    self._velocity_override_horizontal_cancelled = True
+                logger.warning(
+                    "[NAVI] Starting in touchdown zone without fresh pose; "
+                    "horizontal velocity is cancelled"
+                )
+        elif not self._moving_descent(
+            horizontal_speed=horizontal_speed,
+            target_height=alt_thres,
+            direction_deg=direction_deg,
+            descent_speed=descent_speed,
+            height_confirm_time=0.1,
+            timeout=timeout,
+            hold_after_reaching=False,
+        ):
+            return False
 
-        # 先停止已有轨迹，再暂停导航和定高线程，避免它们覆盖本函数的速度。
-        self.navigation_stop_here()
-        self.navigation_flag = False
-        self.keep_height_flag = False
-        self.update_realtime_control(vel_x=0, vel_y=0, vel_z=0, yaw=0)
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            logger.error("[NAVI] Moving landing aborted: touchdown timeout")
+            self._stop_velocity_override(restore_hover=True)
+            return False
+        with self._control_lock:
+            override_active = self._velocity_override_active
+        if not override_active:
+            logger.error("[NAVI] Moving landing lost velocity override after approach")
+            return False
 
         direction_rad = np.deg2rad(direction_deg)
         vel_x_world = horizontal_speed * float(np.cos(direction_rad))
         vel_y_world = horizontal_speed * float(np.sin(direction_rad))
-        vel_z = -descent_speed
-        logger.info(
-            f"[NAVI] Moving landing started: speed={horizontal_speed}cm/s, "
-            f"direction={direction_deg}deg, descent={descent_speed}cm/s, "
-            f"lock={lock_after_landing}"
-        )
-
-        start_time = time.perf_counter()
         touchdown_since = None
         landed = False
         abort_reason = None
-        restore_hover = False
+        control_cleared = False
+        with self._control_lock:
+            pose_lost_in_touchdown_zone = (
+                self._velocity_override_horizontal_cancelled
+            )
+        logger.info(
+            f"[NAVI] Moving landing final descent: altitude<={alt_thres}cm, "
+            f"|vel_z|<={vertical_speed_thres}cm/s, lock={lock_after_landing}"
+        )
         try:
             while True:
                 now = time.perf_counter()
@@ -1307,21 +1822,39 @@ class Navigation(object):
                 if not self.running:
                     abort_reason = "navigation stopped"
                     break
-                if not state_is_fresh():
+                if not self._flight_state_is_fresh():
                     abort_reason = "flight-controller telemetry became stale"
                     break
                 if not self.fc.state.unlock.value:
                     landed = True
                     break
-                if not self.pose_is_fresh():
-                    abort_reason = "navigation pose became stale"
-                    break
                 if self.fc.state.mode.value != self.fc.HOLD_POS_MODE:
                     abort_reason = "flight mode left HOLD_POS"
                     break
+                if now >= deadline:
+                    abort_reason = "touchdown timeout"
+                    break
 
                 alt_now = float(self.fc.state.alt_add.value)
-                if alt_now <= alt_thres:
+                vertical_speed_now = abs(float(self.fc.state.vel_z.value))
+                pose_fresh = self.pose_is_fresh()
+                if not pose_fresh:
+                    if alt_now > alt_thres:
+                        abort_reason = "navigation pose became stale"
+                        break
+                    if not pose_lost_in_touchdown_zone:
+                        pose_lost_in_touchdown_zone = True
+                        with self._control_lock:
+                            self._velocity_override_horizontal_cancelled = True
+                        logger.warning(
+                            "[NAVI] Pose stale in touchdown zone; "
+                            "cancel horizontal velocity and continue vertical landing"
+                        )
+                touchdown_candidate = bool(
+                    alt_now <= alt_thres
+                    and vertical_speed_now <= vertical_speed_thres
+                )
+                if touchdown_candidate:
                     if touchdown_since is None:
                         touchdown_since = now
                     elif now - touchdown_since >= confirm_time:
@@ -1330,66 +1863,75 @@ class Navigation(object):
                 else:
                     touchdown_since = None
 
-                if now - start_time > timeout:
-                    abort_reason = "touchdown timeout"
-                    restore_hover = True
-                    break
-
-                vel_x_body, vel_y_body = _world_to_body_velocity(
-                    vel_x_world,
-                    vel_y_world,
-                    self.current_yaw,
-                )
-                self.update_realtime_control(
-                    vel_x=round(vel_x_body),
-                    vel_y=round(vel_y_body),
-                    vel_z=round(vel_z),
+                self._update_velocity_override(
+                    vel_x=(
+                        vel_x_world
+                        if (
+                            pose_fresh
+                            and not pose_lost_in_touchdown_zone
+                            and not touchdown_candidate
+                        )
+                        else 0
+                    ),
+                    vel_y=(
+                        vel_y_world
+                        if (
+                            pose_fresh
+                            and not pose_lost_in_touchdown_zone
+                            and not touchdown_candidate
+                        )
+                        else 0
+                    ),
+                    vel_z=-descent_speed,
                     yaw=0,
+                    frame="world",
                 )
                 time.sleep(0.05)
         except Exception:
             logger.exception("[NAVI] Moving landing control error")
             abort_reason = "control exception"
         finally:
-            self.navigation_flag = False
-            self.keep_height_flag = False
-            try:
-                self.update_realtime_control(vel_x=0, vel_y=0, vel_z=0, yaw=0)
-            except Exception:
-                logger.exception("[NAVI] Failed to clear moving-landing control")
+            control_cleared = self._stop_velocity_override(
+                restore_hover=abort_reason is not None,
+                zero_flush_frames=(
+                    1
+                    if landed and lock_after_landing
+                    else VELOCITY_OVERRIDE_ZERO_FLUSH_FRAMES
+                ),
+            )
 
         if abort_reason is not None:
             logger.error(f"[NAVI] Moving landing aborted: {abort_reason}")
-            if (
-                restore_hover
-                and self.running
-                and self.fc.state.unlock.value
-                and state_is_fresh()
-                and self.pose_is_fresh()
-                and self.fc.state.mode.value == self.fc.HOLD_POS_MODE
-            ):
-                self.direct_set_waypoint([self.current_x, self.current_y])
-                self.set_height(float(self.fc.state.alt_add.value))
-                self.switch_pid("hover")
-                self.navigation_flag = True
-                self.keep_height_flag = True
-                logger.warning("[NAVI] Moving landing timeout; holding current position")
             return False
         if not landed:
             return False
 
         logger.info("[NAVI] Moving landing touchdown confirmed")
         if not lock_after_landing:
+            if not control_cleared:
+                logger.error(
+                    "[NAVI] Moving landing cannot finish unlocked because "
+                    "zero control was not confirmed"
+                )
+                return False
             logger.warning("[NAVI] Moving landing finished without locking motors")
             return True
         if not self.fc.state.unlock.value:
+            if not control_cleared and not self._stop_velocity_override():
+                logger.error(
+                    "[NAVI] Motors locked but velocity override cleanup failed"
+                )
+                return False
             logger.info("[NAVI] Motors already locked after touchdown")
             return True
-        if not state_is_fresh():
+        if not self._flight_state_is_fresh():
             logger.error("[NAVI] Refuse lock because touchdown telemetry is stale")
             return False
-        if float(self.fc.state.alt_add.value) > alt_thres:
-            logger.error("[NAVI] Refuse lock because touchdown altitude is not confirmed")
+        if (
+            float(self.fc.state.alt_add.value) > alt_thres
+            or abs(float(self.fc.state.vel_z.value)) > vertical_speed_thres
+        ):
+            logger.error("[NAVI] Refuse lock because touchdown is not confirmed")
             return False
 
         self.fc.lock()
@@ -1399,6 +1941,9 @@ class Navigation(object):
             locked = self.fc.wait_for_lock(lock_timeout)
         if not locked:
             logger.error("[NAVI] Moving landing lock was not confirmed")
+            return False
+        if not control_cleared and not self._stop_velocity_override():
+            logger.error("[NAVI] Motors locked but velocity override cleanup failed")
             return False
         logger.info("[NAVI] Moving landing finished and motors locked")
         return True
