@@ -1586,7 +1586,19 @@ def _cross_core_is_dark(
         return False
     bright_background = float(_np.percentile(annulus, 75))
     dark_cross = float(_np.percentile(core, 25))
-    return bright_background - dark_cross >= 90.0
+    if bright_background - dark_cross < 120.0:
+        return False
+    bright_regions = _np.where(
+        outer >= dark_cross + 100.0,
+        255,
+        0,
+    ).astype(_np.uint8)
+    bright_regions = _cv2.morphologyEx(
+        bright_regions,
+        _cv2.MORPH_OPEN,
+        _np.ones((5, 5), dtype=_np.uint8),
+    )
+    return float(_np.mean(bright_regions > 0)) >= 0.10
 
 
 def _skeletonize_mask(binary: _np.ndarray) -> _np.ndarray:
@@ -1646,7 +1658,7 @@ def _find_skeleton_cross(
     binary: _np.ndarray,
     search_diameter: float,
     previous: _Detection | None,
-) -> tuple[float, float, float] | None:
+) -> list[tuple[float, float, float]]:
     height, width = binary.shape
     short_side = min(width, height)
     skeleton = _skeletonize_mask(binary)
@@ -1659,7 +1671,7 @@ def _find_skeleton_cross(
         maxLineGap=max(8, int(round(0.08 * short_side))),
     )
     if raw_lines is None:
-        return None
+        return []
 
     segments: list[_LineSegment] = []
     for raw_line in raw_lines.reshape(-1, 4):
@@ -1687,8 +1699,7 @@ def _find_skeleton_cross(
     segments.sort(key=lambda segment: segment.length, reverse=True)
     segments = segments[:20]
 
-    best: tuple[float, float, float] | None = None
-    best_score = -_math.inf
+    candidates: list[tuple[float, float, float]] = []
     for first_index, first in enumerate(segments):
         for second in segments[first_index + 1:]:
             angle = _line_angle_difference(first.angle, second.angle)
@@ -1713,13 +1724,6 @@ def _find_skeleton_cross(
                 )
             else:
                 temporal = 0.5
-            if not _cross_core_is_dark(
-                gray,
-                (center_u, center_v),
-                search_diameter,
-                previous is None,
-            ):
-                continue
             angle_score = float(
                 _np.clip(
                     1.0 - abs(angle_degrees - 90.0) / 35.0,
@@ -1752,10 +1756,38 @@ def _find_skeleton_cross(
                     + 0.14 * extension_score
                     + 0.26 * temporal
                 )
-            if score > best_score:
-                best_score = score
-                best = (float(center_u), float(center_v), float(score))
-    return best
+            candidates.append(
+                (float(center_u), float(center_v), float(score))
+            )
+
+    candidates.sort(key=lambda candidate: candidate[2], reverse=True)
+    distinct: list[tuple[float, float, float]] = []
+    checked_centers: list[tuple[float, float]] = []
+    minimum_separation = max(7.0, 0.03 * short_side)
+    for candidate in candidates:
+        if any(
+            _math.hypot(
+                candidate[0] - center[0],
+                candidate[1] - center[1],
+            )
+            < minimum_separation
+            for center in checked_centers
+        ):
+            continue
+        checked_centers.append((candidate[0], candidate[1]))
+        if len(checked_centers) > 12:
+            break
+        if not _cross_core_is_dark(
+            gray,
+            (candidate[0], candidate[1]),
+            search_diameter,
+            previous is None,
+        ):
+            continue
+        distinct.append(candidate)
+        if len(distinct) >= 8:
+            break
+    return distinct
 
 
 def _find_near_cross(
@@ -1770,26 +1802,27 @@ def _find_near_cross(
 
     height, width = gray.shape
     frame_diagonal = _math.hypot(width, height)
+    previous_search_diameter = 0.0
+    if previous is not None:
+        previous_search_diameter = previous.diameter_px
+        if not previous.near_cross:
+            previous_search_diameter *= 1.20
     search_diameter = min(
         1.35 * frame_diagonal,
         max(
             0.90 * frame_diagonal,
-            (
-                1.20 * previous.diameter_px
-                if previous is not None
-                else 0.0
-            ),
+            previous_search_diameter,
         ),
     )
     hits: list[tuple[float, float, float, int]] = []
     for mask_index, mask in enumerate(masks):
-        hit = _find_skeleton_cross(
+        mask_hits = _find_skeleton_cross(
             gray,
             mask,
             search_diameter,
             previous,
         )
-        if hit is not None:
+        for hit in mask_hits:
             hits.append((hit[0], hit[1], hit[2], mask_index))
     if not hits:
         return None
@@ -1798,12 +1831,21 @@ def _find_near_cross(
     best_cluster: list[tuple[float, float, float, int]] | None = None
     best_rank = -_math.inf
     for anchor in hits:
-        cluster = [
+        nearby = [
             hit
             for hit in hits
             if _math.hypot(hit[0] - anchor[0], hit[1] - anchor[1])
             <= cluster_radius
         ]
+        cluster_by_mask: dict[
+            int,
+            tuple[float, float, float, int],
+        ] = {}
+        for hit in nearby:
+            current = cluster_by_mask.get(hit[3])
+            if current is None or hit[2] > current[2]:
+                cluster_by_mask[hit[3]] = hit
+        cluster = list(cluster_by_mask.values())
         if previous is None and len(cluster) < 2:
             continue
         rank = float(_np.mean([hit[2] for hit in cluster]))
