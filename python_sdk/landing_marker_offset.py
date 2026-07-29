@@ -9,6 +9,7 @@ import sys as _sys
 import threading as _threading
 import time as _time
 from dataclasses import dataclass as _dataclass
+from typing import Tuple as _Tuple
 
 import cv2 as _cv2
 import numpy as _np
@@ -30,11 +31,17 @@ _DEBUG = False
 _DEBUG_WINDOW = "Landing marker offset"
 _DEBUG_FPS: float | None = None
 
-_Ellipse = tuple[tuple[float, float], tuple[float, float], float]
-_Roi = tuple[int, int, int, int]
+try:
+    _dataclass_slots = _dataclass(slots=True)
+except TypeError:
+    # Python 3.8 on the flight computer has dataclasses but not slots=True.
+    _dataclass_slots = _dataclass
+
+_Ellipse = _Tuple[_Tuple[float, float], _Tuple[float, float], float]
+_Roi = _Tuple[int, int, int, int]
 
 
-@_dataclass(slots=True)
+@_dataclass_slots
 class _Detection:
     center_u: float
     center_v: float
@@ -44,7 +51,7 @@ class _Detection:
     mask_index: int
 
 
-@_dataclass(slots=True)
+@_dataclass_slots
 class _HoleAnalysis:
     score: float
     centers: _np.ndarray
@@ -52,7 +59,7 @@ class _HoleAnalysis:
     weighted_center: tuple[float, float]
 
 
-@_dataclass(slots=True)
+@_dataclass_slots
 class _Candidate:
     ellipse: _Ellipse
     diameter_px: float
@@ -66,7 +73,7 @@ class _Candidate:
     pre_score: float
 
 
-@_dataclass(slots=True)
+@_dataclass_slots
 class _LineSegment:
     x1: float
     y1: float
@@ -76,7 +83,7 @@ class _LineSegment:
     angle: float
 
 
-@_dataclass(slots=True)
+@_dataclass_slots
 class _CrossLine:
     normal_x: float
     normal_y: float
@@ -85,7 +92,7 @@ class _CrossLine:
     support_score: float
 
 
-@_dataclass(slots=True)
+@_dataclass_slots
 class _OpticalResult:
     detection: _Detection
     points: _np.ndarray
