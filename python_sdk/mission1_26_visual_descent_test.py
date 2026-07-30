@@ -9,7 +9,7 @@
 5. 在 40 cm 高度继续视觉校准并悬停 2 s；
 6. 回升至 150 cm，返回起飞点并定点降落。
 
-坐标与单位沿用 mission1_26.py：水平位置、高度和速度使用 cm，
+坐标与单位沿用 mission1_26_base.py：水平位置、高度和速度使用 cm，
 x 向前为正、y 向左为正；视觉 x_px 向前为正、y_px 向左为正。
 
 本文件会连接真实飞控、雷达和相机并执行飞行，不能用于无保护条件的
@@ -34,7 +34,7 @@ from loguru import logger
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
-import mission1_26 as mission1
+import mission1_26_base as mission1
 from visual_target_descent import VisualTargetDescentController
 
 

@@ -26,10 +26,15 @@ BaseVelocityProvider = Callable[
     [float, float, float],
     Tuple[float, float],
 ]
+PreDescentGate = Callable[[], bool]
 RecordCallback = Callable[
     [float, str, Optional[float], Optional[float], int, int],
     None,
 ]
+
+
+class PreDescentTimeoutError(RuntimeError):
+    """Raised when stable visual follow or its external gate times out."""
 
 
 class VisualTargetDescentController:
@@ -159,10 +164,13 @@ class VisualTargetDescentController:
         desired = self._limit_horizontal_velocity(desired)
         filtered += self.filter_alpha * (desired - filtered)
         filtered = self._limit_horizontal_velocity(filtered)
+        command = np.rint(filtered).astype(int)
+        if float(np.linalg.norm(command)) > self.horizontal_speed_limit:
+            command = np.trunc(filtered).astype(int)
         return (
             filtered,
-            int(round(float(filtered[0]))),
-            int(round(float(filtered[1]))),
+            int(command[0]),
+            int(command[1]),
         )
 
     def _record(
@@ -233,6 +241,8 @@ class VisualTargetDescentController:
         pre_descent_follow_seconds: float = 0.0,
         pre_descent_follow_timeout: float = 20.0,
         on_descent_start: Optional[Callable[[], None]] = None,
+        pre_descent_gate: Optional[PreDescentGate] = None,
+        pre_descent_max_error_px: Optional[float] = None,
     ) -> None:
         """视觉伴飞后下降到指定激光高度，并继续悬停指定时间。"""
         values = np.asarray(
@@ -275,6 +285,17 @@ class VisualTargetDescentController:
             raise ValueError("base_velocity_provider must be callable")
         if on_descent_start is not None and not callable(on_descent_start):
             raise ValueError("on_descent_start must be callable")
+        if pre_descent_gate is not None and not callable(pre_descent_gate):
+            raise ValueError("pre_descent_gate must be callable")
+        if pre_descent_max_error_px is not None:
+            pre_descent_max_error_px = float(pre_descent_max_error_px)
+            if (
+                not np.isfinite(pre_descent_max_error_px)
+                or pre_descent_max_error_px <= 0
+            ):
+                raise ValueError(
+                    "pre_descent_max_error_px must be finite and positive"
+                )
 
         base = self._validate_base_velocity(base_velocity)
         current_base = base.copy()
@@ -289,7 +310,13 @@ class VisualTargetDescentController:
         hover_elapsed = 0.0
         last_provider_sequence: Optional[int] = None
         last_provider_captured_at: Optional[float] = None
-        pre_descent_complete = pre_descent_follow_seconds <= 0
+        pre_descent_complete = bool(
+            pre_descent_follow_seconds <= 0
+            and (
+                pre_descent_gate is None
+                or bool(pre_descent_gate())
+            )
+        )
 
         self._start_override(keep_height=True)
         if pre_descent_complete:
@@ -317,7 +344,7 @@ class VisualTargetDescentController:
                     not pre_descent_complete
                     and now - started_at > pre_descent_follow_timeout
                 ):
-                    raise RuntimeError(
+                    raise PreDescentTimeoutError(
                         "Continuous visual follow was not stable before timeout"
                     )
                 if (
@@ -408,11 +435,24 @@ class VisualTargetDescentController:
                 self._update_override(vel_x, vel_y)
 
                 if not pre_descent_complete:
-                    if pre_descent_valid_since is None:
+                    error_in_range = bool(
+                        pre_descent_max_error_px is None
+                        or np.hypot(x_px, y_px)
+                        <= pre_descent_max_error_px
+                    )
+                    if not error_in_range:
+                        pre_descent_valid_since = None
+                    elif pre_descent_valid_since is None:
                         pre_descent_valid_since = now
+                    gate_open = bool(
+                        pre_descent_gate is None
+                        or pre_descent_gate()
+                    )
                     if (
-                        now - pre_descent_valid_since
+                        pre_descent_valid_since is not None
+                        and now - pre_descent_valid_since
                         >= pre_descent_follow_seconds
+                        and gate_open
                     ):
                         if on_descent_start is not None:
                             on_descent_start()
@@ -427,7 +467,11 @@ class VisualTargetDescentController:
                         )
                     self._record(
                         started_at,
-                        "pre_descent_follow",
+                        (
+                            "pre_descent_follow"
+                            if error_in_range
+                            else "pre_descent_follow_unstable"
+                        ),
                         offset,
                         vel_x,
                         vel_y,

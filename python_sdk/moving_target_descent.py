@@ -36,7 +36,7 @@ class MovingTargetDescentConfig:
 
     correction_gain: float = 0.15
     correction_deadband_px: float = 3.0
-    horizontal_command_limit: float = 12.0
+    horizontal_command_limit: float = 15.0
     command_filter_alpha: float = 0.25
 
     control_period: float = 0.05
@@ -250,6 +250,8 @@ class MovingTargetDescentController:
         descent_timeout: float = 15.0,
         on_descent_start: Optional[Callable[[], None]] = None,
         on_height_reached: Optional[Callable[[], None]] = None,
+        pre_descent_gate: Optional[Callable[[], bool]] = None,
+        pre_descent_max_error_px: Optional[float] = None,
     ) -> Tuple[float, float]:
         """阻塞执行连续伴飞、同步下降和目标高度伴飞。"""
         self._estimator.reset(initial_target_velocity)
@@ -265,6 +267,8 @@ class MovingTargetDescentController:
             pre_descent_follow_seconds=stabilize_seconds,
             pre_descent_follow_timeout=stabilize_timeout,
             on_descent_start=on_descent_start,
+            pre_descent_gate=pre_descent_gate,
+            pre_descent_max_error_px=pre_descent_max_error_px,
         )
         return self._estimator.velocity
 

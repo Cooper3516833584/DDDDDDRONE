@@ -37,6 +37,7 @@ def _new_estimator() -> TargetVelocityEstimator:
 
 
 def test_estimator() -> None:
+    assert MovingTargetDescentConfig().horizontal_command_limit == 15.0
     estimator = _new_estimator()
     estimator.reset((7.2, 0.0))
     assert estimator.velocity == (7.2, 0.0)
@@ -188,7 +189,7 @@ def _new_visual_controller(latest_sample, navi):
         raise_if_vision_failed=lambda: None,
         correction_gain=0.15,
         correction_deadband_px=3.0,
-        horizontal_speed_limit=12.0,
+        horizontal_speed_limit=15.0,
         filter_alpha=0.25,
         control_period=0.05,
         vision_sample_stale_seconds=0.35,
@@ -228,8 +229,17 @@ def test_provider_once_per_sequence_and_command_limit() -> None:
         for command in navi.commands
     ]
     assert horizontal_speeds
-    assert max(horizontal_speeds) <= 12.1
+    assert max(horizontal_speeds) <= 15.0
     assert navi.override_stopped
+
+    filtered, vel_x, vel_y = controller._next_horizontal_velocity(
+        np.zeros(2, dtype=float),
+        np.array([10.6, 10.6], dtype=float),
+        1000.0,
+        1000.0,
+    )
+    assert math.hypot(*filtered) <= 15.0
+    assert math.hypot(vel_x, vel_y) <= 15.0
 
 
 def test_loss_resets_continuous_follow_timer() -> None:
@@ -299,11 +309,80 @@ def test_continuous_follow_total_timeout() -> None:
     assert navi.override_stopped
 
 
+def test_stability_error_limit_and_external_gate() -> None:
+    _FakeTime.now = 0.0
+    navi = _Navigation()
+    descent_started_at = []
+
+    def latest_sample():
+        now = _FakeTime.now
+        x_px = 31.0 if 0.1 <= now < 0.2 else 0.0
+        return int(now * 1000) + 1, now, x_px, 0.0
+
+    controller = _new_visual_controller(latest_sample, navi)
+    original_time = visual_target_descent.time
+    visual_target_descent.time = _FakeTime
+    try:
+        controller.descend_to_height(
+            target_height=100.0,
+            hover_seconds=0.0,
+            height_confirm_time=0.05,
+            timeout=1.0,
+            pre_descent_follow_seconds=0.2,
+            pre_descent_follow_timeout=1.0,
+            pre_descent_gate=lambda: _FakeTime.now >= 0.25,
+            pre_descent_max_error_px=30.0,
+            on_descent_start=lambda: descent_started_at.append(
+                _FakeTime.now
+            ),
+        )
+    finally:
+        visual_target_descent.time = original_time
+
+    assert descent_started_at
+    assert descent_started_at[0] >= 0.4
+    assert navi.override_stopped
+
+
+def test_external_gate_total_timeout() -> None:
+    _FakeTime.now = 0.0
+    navi = _Navigation()
+
+    def latest_sample():
+        now = _FakeTime.now
+        return int(now * 1000) + 1, now, 0.0, 0.0
+
+    controller = _new_visual_controller(latest_sample, navi)
+    original_time = visual_target_descent.time
+    visual_target_descent.time = _FakeTime
+    try:
+        try:
+            controller.descend_to_height(
+                target_height=100.0,
+                hover_seconds=0.0,
+                height_confirm_time=0.05,
+                timeout=1.0,
+                pre_descent_follow_seconds=0.1,
+                pre_descent_follow_timeout=0.3,
+                pre_descent_gate=lambda: False,
+                pre_descent_max_error_px=30.0,
+            )
+        except visual_target_descent.PreDescentTimeoutError:
+            pass
+        else:
+            raise AssertionError("External-gate timeout was not enforced")
+    finally:
+        visual_target_descent.time = original_time
+    assert navi.override_stopped
+
+
 def main() -> None:
     test_estimator()
     test_provider_once_per_sequence_and_command_limit()
     test_loss_resets_continuous_follow_timer()
     test_continuous_follow_total_timeout()
+    test_stability_error_limit_and_external_gate()
+    test_external_gate_total_timeout()
     print("moving-target descent logic tests passed")
 
 
