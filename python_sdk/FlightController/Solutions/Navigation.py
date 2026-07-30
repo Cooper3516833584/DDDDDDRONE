@@ -2071,6 +2071,7 @@ class Navigation(object):
         A takeoff command is sent only once and only after fresh mode/unlock
         feedback.  Ambiguous feedback is treated as a failure, not as a reason
         to issue another takeoff command while the aircraft may already be airborne.
+
         """
         logger.info(f"[NAVI] Takeoff at {point}")
 

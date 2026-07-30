@@ -31,7 +31,7 @@ from landing_marker_offset import track_landing_marker
 
 
 FC_SERIAL_DEV = "/dev/ttyACM0"
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 
 TAKEOFF_POINT = np.array([0.0, 0.0])
 ENTRY_POINT = np.array([87.5, -37.5])
@@ -501,6 +501,7 @@ class Mission:
         # 以起飞位置建立任务坐标原点；必须先获得雷达位姿更新。
         navi.calibrate_basepoint()
         logger.info("[MISSION] Radar basepoint calibrated: {}", navi.basepoint)
+        time.sleep(1)
 
         # 起飞前确认相机和视觉生成器能够持续给出结果，失败时拒绝起飞。
         self._start_vision_tracker()
@@ -513,7 +514,10 @@ class Mission:
             CRUISE_HEIGHT,
             TAKEOFF_POINT,
         )
-        navi.pointing_takeoff(TAKEOFF_POINT, CRUISE_HEIGHT)
+        navi.pointing_takeoff(
+            TAKEOFF_POINT,
+            CRUISE_HEIGHT,
+        )
 
         logger.info("[MISSION] Navigate to entry point {}", ENTRY_POINT)
         if not navi.navigation_to_waypoint(ENTRY_POINT, wait=True):
