@@ -2054,117 +2054,155 @@ class Navigation(object):
     def radar_find_target(self,TARGET_NUM):
         self.radar.get_target_points(TARGET_NUM)
 
-    def pointing_takeoff(
-        self,
-        point,
-        target_height=140,
-        first_lift=60,
-        lock_pos_thres=15,
-        lock_pos_time=1.0,
-        lock_timeout=12,
-        hover_timeout=12,
-        height_timeout=15,
-    ):
+    def pointing_takeoff(self, point, target_height=140):
         """
-        Take off and then enter closed-loop hold/navigation.
+        定点起飞
 
-        A takeoff command is sent only once and only after fresh mode/unlock
-        feedback.  Ambiguous feedback is treated as a failure, not as a reason
-        to issue another takeoff command while the aircraft may already be airborne.
-
+        point: (x, y) 坐标 / cm / 匿名(ROS)坐标系 / 基地点
+        target_height: 起飞高度 / cm
         """
         logger.info(f"[NAVI] Takeoff at {point}")
-
-        # 1) Keep navigation loops disabled during raw FC takeoff stage.
         self.navigation_flag = False
         self.keep_height_flag = False
-
-        # 2) PROGRAM mode + unlock.
         self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
-        if not self.fc.state.unlock.value:
-            self.fc.unlock()
-
-        # Wait for fresh unlock feedback before sending the one-key takeoff.
-        t0 = time.perf_counter()
-        while time.perf_counter() - t0 < 3.0:
-            state_fresh = bool(
-                getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
-            )
-            if (
-                state_fresh
-                and self.fc.state.mode.value == self.fc.PROGRAM_MODE
-                and self.fc.state.unlock.value
-            ):
-                break
-            time.sleep(0.05)
-        else:
-            raise RuntimeError("[NAVI] Fresh PROGRAM/unlock feedback not confirmed")
-
-        time.sleep(0.8)  # Buffer for motor/state updates.
-        lift = int(max(40, first_lift))
-
-        try:
-            alt_before = float(self.fc.state.alt_add.value)
-        except Exception:
-            alt_before = 0.0
-
-        def _wait_takeoff_done(timeout_s: float) -> bool:
-            try:
-                return bool(self.fc.wait_for_takeoff_done(timeout_s=timeout_s))
-            except TypeError:
-                # Backward compatibility for older signatures.
-                return bool(self.fc.wait_for_takeoff_done(4, timeout_s))
-
-        def _current_alt() -> float:
-            try:
-                return float(self.fc.state.alt_add.value)
-            except Exception:
-                return 0.0
-
-        self.fc.take_off(lift)
-        time.sleep(0.8)  # Give command_now / vel_z time to update.
-        ok = _wait_takeoff_done(timeout_s=8)
-        alt_now = _current_alt()
-        state_fresh = bool(
-            getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
-        )
-        takeoff_started = bool(
-            state_fresh and (ok or alt_now >= 10 or (alt_now - alt_before) >= 5)
-        )
-        if not takeoff_started:
-            raise RuntimeError(
-                "[NAVI] Takeoff was not confirmed by fresh telemetry; command will not be retried"
-            )
-
-        # Ensure FC reports hovering before enabling closed-loop hold.
-        if not self.fc.wait_for_hovering(hover_timeout):
-            raise RuntimeError("[NAVI] Hovering was not confirmed after takeoff")
-
-        # 3) Switch to HOLD_POS and enable closed-loop control.
+        self.fc.unlock()
+        # inital_yaw = self.fc.state.yaw.value
+        time.sleep(2)  # 等待电机启动
+        self.fc.take_off(30)
+        self.fc.wait_for_takeoff_done(timeout_s=5)
+        # self.fc.set_yaw(inital_yaw, 25)
+        # self.fc.wait_for_hovering(2)
+        ######## 闭环定高
         self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
-        time.sleep(0.1)
-
-        try:
-            h_now = float(self.fc.state.alt_add.value)
-        except Exception:
-            h_now = float(lift)
-        self.set_height(max(h_now, float(lift)))
+        self.set_height(70)
         self.keep_height_flag = True
-
+        self.wait_for_height()
+        self.navigation_flag = True
+        self.navigation_to_waypoint(point, wait=True)  # 初始化路径点
+        time.sleep(0.5)
+        self.set_height(target_height)
+        self.wait_for_height()
+        self.navigation_to_waypoint(point, wait=True)  # 初始化路径点
         self.switch_pid("hover")
-        self.direct_set_waypoint([float(point[0]), float(point[1])])
+        time.sleep(0.1)
         self.navigation_flag = True
 
-        if not self.wait_for_waypoint(
-            time_thres=lock_pos_time,
-            pos_thres=lock_pos_thres,
-            timeout=lock_timeout,
-        ):
-            raise RuntimeError("[NAVI] Position hold was not confirmed after takeoff")
-
-        self.set_height(float(target_height))
-        if not self.wait_for_height(timeout=height_timeout):
-            raise RuntimeError("[NAVI] Cruise height was not confirmed after takeoff")
+        # 原 pointing_takeoff 实现保留如下，仅注释停用：
+        # def pointing_takeoff(
+        #     self,
+        #     point,
+        #     target_height=140,
+        #     first_lift=60,
+        #     lock_pos_thres=15,
+        #     lock_pos_time=1.0,
+        #     lock_timeout=12,
+        #     hover_timeout=12,
+        #     height_timeout=15,
+        # ):
+        #     """
+        #     Take off and then enter closed-loop hold/navigation.
+        #
+        #     A takeoff command is sent only once and only after fresh mode/unlock
+        #     feedback.  Ambiguous feedback is treated as a failure, not as a reason
+        #     to issue another takeoff command while the aircraft may already be airborne.
+        #     """
+        #     logger.info(f"[NAVI] Takeoff at {point}")
+        #
+        #     # 1) Keep navigation loops disabled during raw FC takeoff stage.
+        #     self.navigation_flag = False
+        #     self.keep_height_flag = False
+        #
+        #     # 2) PROGRAM mode + unlock.
+        #     self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
+        #     if not self.fc.state.unlock.value:
+        #         self.fc.unlock()
+        #
+        #     # Wait for fresh unlock feedback before sending the one-key takeoff.
+        #     t0 = time.perf_counter()
+        #     while time.perf_counter() - t0 < 3.0:
+        #         state_fresh = bool(
+        #             getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
+        #         )
+        #         if (
+        #             state_fresh
+        #             and self.fc.state.mode.value == self.fc.PROGRAM_MODE
+        #             and self.fc.state.unlock.value
+        #         ):
+        #             break
+        #         time.sleep(0.05)
+        #     else:
+        #         raise RuntimeError("[NAVI] Fresh PROGRAM/unlock feedback not confirmed")
+        #
+        #     time.sleep(0.8)  # Buffer for motor/state updates.
+        #     lift = int(max(40, first_lift))
+        #
+        #     try:
+        #         alt_before = float(self.fc.state.alt_add.value)
+        #     except Exception:
+        #         alt_before = 0.0
+        #
+        #     def _wait_takeoff_done(timeout_s: float) -> bool:
+        #         try:
+        #             return bool(self.fc.wait_for_takeoff_done(timeout_s=timeout_s))
+        #         except TypeError:
+        #             # Backward compatibility for older signatures.
+        #             return bool(self.fc.wait_for_takeoff_done(4, timeout_s))
+        #
+        #     def _current_alt() -> float:
+        #         try:
+        #             return float(self.fc.state.alt_add.value)
+        #         except Exception:
+        #             return 0.0
+        #
+        #     self.fc.take_off(lift)
+        #     time.sleep(0.8)  # Give command_now / vel_z time to update.
+        #     ok = _wait_takeoff_done(timeout_s=8)
+        #     alt_now = _current_alt()
+        #     state_fresh = bool(
+        #         getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
+        #     )
+        #     takeoff_started = bool(
+        #         state_fresh and (ok or alt_now >= 10 or (alt_now - alt_before) >= 5)
+        #     )
+        #     if not takeoff_started:
+        #         raise RuntimeError(
+        #             "[NAVI] Takeoff was not confirmed by fresh telemetry; "
+        #             "command will not be retried"
+        #         )
+        #
+        #     # Ensure FC reports hovering before enabling closed-loop hold.
+        #     if not self.fc.wait_for_hovering(hover_timeout):
+        #         raise RuntimeError("[NAVI] Hovering was not confirmed after takeoff")
+        #
+        #     # 3) Switch to HOLD_POS and enable closed-loop control.
+        #     self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
+        #     time.sleep(0.1)
+        #
+        #     try:
+        #         h_now = float(self.fc.state.alt_add.value)
+        #     except Exception:
+        #         h_now = float(lift)
+        #     self.set_height(max(h_now, float(lift)))
+        #     self.keep_height_flag = True
+        #
+        #     self.switch_pid("hover")
+        #     self.direct_set_waypoint([float(point[0]), float(point[1])])
+        #     self.navigation_flag = True
+        #
+        #     if not self.wait_for_waypoint(
+        #         time_thres=lock_pos_time,
+        #         pos_thres=lock_pos_thres,
+        #         timeout=lock_timeout,
+        #     ):
+        #         raise RuntimeError(
+        #             "[NAVI] Position hold was not confirmed after takeoff"
+        #         )
+        #
+        #     self.set_height(float(target_height))
+        #     if not self.wait_for_height(timeout=height_timeout):
+        #         raise RuntimeError(
+        #             "[NAVI] Cruise height was not confirmed after takeoff"
+        #         )
 
     def move_by_direction(self, speed: float = 5, direction_deg: float = 0):
         """
