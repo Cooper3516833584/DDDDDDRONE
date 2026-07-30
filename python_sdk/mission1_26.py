@@ -501,6 +501,7 @@ class Mission:
         # 以起飞位置建立任务坐标原点；必须先获得雷达位姿更新。
         navi.calibrate_basepoint()
         logger.info("[MISSION] Radar basepoint calibrated: {}", navi.basepoint)
+        time.sleep(1)
 
         # 起飞前确认相机和视觉生成器能够持续给出结果，失败时拒绝起飞。
         self._start_vision_tracker()
