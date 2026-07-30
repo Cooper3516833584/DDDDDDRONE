@@ -31,7 +31,7 @@ from landing_marker_offset import track_landing_marker
 
 
 FC_SERIAL_DEV = "/dev/ttyACM0"
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 
 TAKEOFF_POINT = np.array([0.0, 0.0])
 ENTRY_POINT = np.array([87.5, -37.5])
