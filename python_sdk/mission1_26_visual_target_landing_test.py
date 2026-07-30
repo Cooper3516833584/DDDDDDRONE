@@ -8,7 +8,7 @@
 2. 停止视觉控制，调用飞控一键降落并确认锁桨；
 3. 在目标平面锁桨停留 5 s；
 4. 由定点起飞流程重新解锁并起飞至 150 cm；
-5. 返回起飞点并执行一键降落。
+5. 返回起飞点并执行定点降落。
 
 该程序会执行真实飞行。运行前必须确认 server_ros.py 及其他 FC_Server
 程序已关闭，并确保人员、桨叶和目标平台周围已经清空。
@@ -109,20 +109,15 @@ class StaticTargetVisualLandingMission(
         )
 
     def _finish_at_takeoff_point(self) -> None:
-        """返航后使用飞控一键降落，不调用 pointing_landing。"""
-        self.navi.navigation_stop_here()
-        self.navi.navigation_flag = False
-        self.navi.keep_height_flag = False
-        self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
-        time.sleep(0.1)
-        self.fc.stablize()
-        self.fc.land()
-        if not self.fc.wait_for_lock(timeout_s=20):
-            self.fc.land()
+        """返航后沿用原有定点降落。"""
+        if not self.navi.pointing_landing(
+            mission1.TAKEOFF_POINT,
+            height_timeout=descent_test.LANDING_HEIGHT_TIMEOUT_SECONDS,
+        ):
             raise RuntimeError(
-                "One-key landing at takeoff point did not confirm motor lock"
+                "Failed to land at takeoff point"
             )
-        logger.info("[TEST] One-key landing at takeoff point completed")
+        logger.info("[TEST] Pointing landing at takeoff point completed")
 
 
 def main() -> None:
