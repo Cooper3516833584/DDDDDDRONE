@@ -32,6 +32,7 @@ FC_SERIAL_DEV = "/dev/ttyACM0"
 CRUISE_SPEED = 15.0
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 22.0
+LANDING_HEIGHT_TIMEOUT = 8.0
 TAKEOFF_POINT = (0.0, 0.0)
 LANDING_POINT = (150.0, 0.0)
 TEST_WAYPOINTS = (
@@ -171,6 +172,7 @@ class Mission:
         self.navi.pointing_takeoff(
             TAKEOFF_POINT,
             target_height=CRUISE_HEIGHT,
+            takeoff_alt_thres=13,
         )
 
         self.navi.set_yaw(0)
@@ -185,7 +187,10 @@ class Mission:
                 raise RuntimeError("failed to reach waypoint {}".format(waypoint))
 
         logger.info("[TEST] Pointing landing at {}", LANDING_POINT)
-        if not self.navi.pointing_landing(LANDING_POINT):
+        if not self.navi.pointing_landing(
+            LANDING_POINT,
+            height_timeout=LANDING_HEIGHT_TIMEOUT,
+        ):
             raise RuntimeError("pointing landing was not confirmed")
         logger.info("[TEST] Single-radar navigation flight completed")
 

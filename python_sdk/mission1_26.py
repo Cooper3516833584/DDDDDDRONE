@@ -513,7 +513,11 @@ class Mission:
             CRUISE_HEIGHT,
             TAKEOFF_POINT,
         )
-        navi.pointing_takeoff(TAKEOFF_POINT, CRUISE_HEIGHT)
+        navi.pointing_takeoff(
+            TAKEOFF_POINT,
+            CRUISE_HEIGHT,
+            takeoff_alt_thres=13,
+        )
 
         logger.info("[MISSION] Navigate to entry point {}", ENTRY_POINT)
         if not navi.navigation_to_waypoint(ENTRY_POINT, wait=True):

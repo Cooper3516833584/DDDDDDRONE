@@ -2064,6 +2064,7 @@ class Navigation(object):
         lock_timeout=12,
         hover_timeout=12,
         height_timeout=15,
+        takeoff_alt_thres=10,
     ):
         """
         Take off and then enter closed-loop hold/navigation.
@@ -2071,8 +2072,13 @@ class Navigation(object):
         A takeoff command is sent only once and only after fresh mode/unlock
         feedback.  Ambiguous feedback is treated as a failure, not as a reason
         to issue another takeoff command while the aircraft may already be airborne.
+
+        takeoff_alt_thres: 一键起飞阶段可确认已离地的激光高度阈值 / cm。
         """
         logger.info(f"[NAVI] Takeoff at {point}")
+        takeoff_alt_thres = float(takeoff_alt_thres)
+        if not np.isfinite(takeoff_alt_thres) or takeoff_alt_thres < 0:
+            raise ValueError("takeoff_alt_thres must be finite and non-negative")
 
         # 1) Keep navigation loops disabled during raw FC takeoff stage.
         self.navigation_flag = False
@@ -2128,7 +2134,12 @@ class Navigation(object):
             getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
         )
         takeoff_started = bool(
-            state_fresh and (ok or alt_now >= 10 or (alt_now - alt_before) >= 5)
+            state_fresh
+            and (
+                ok
+                or alt_now >= takeoff_alt_thres
+                or (alt_now - alt_before) >= 5
+            )
         )
         if not takeoff_started:
             raise RuntimeError(
