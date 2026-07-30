@@ -302,10 +302,12 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         logger.info("[TEST] Radar basepoint calibrated: {}", navi.basepoint)
 
         self._start_vision_tracker()
+        self.set_fleet_status(mission1.MissionOperationState.READY)
         self.wait_for_takeoff_signal()
         if self.stop_event.is_set():
             return
 
+        self.set_fleet_status(mission1.MissionOperationState.TAKEOFF)
         navi.pointing_takeoff(
             mission1.TAKEOFF_POINT,
             target_height=mission1.CRUISE_HEIGHT,
@@ -314,6 +316,7 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         if not navi.wait_for_yaw():
             raise RuntimeError("Yaw stabilization was not confirmed")
 
+        self.set_fleet_status(mission1.MissionOperationState.HOVERING)
         logger.info("[TEST] Navigate to entry point {}", mission1.ENTRY_POINT)
         if not navi.navigation_to_waypoint(mission1.ENTRY_POINT, wait=True):
             raise RuntimeError("Failed to reach entry point")
@@ -334,9 +337,12 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         self._perform_target_action()
 
         navi.set_navigation_speed(mission1.PURSUIT_SPEED)
+        self.set_fleet_status(mission1.MissionOperationState.RETURNING_HOME)
         if not navi.navigation_to_waypoint(mission1.TAKEOFF_POINT, wait=True):
             raise RuntimeError("Failed to return to takeoff point")
+        self.set_fleet_status(mission1.MissionOperationState.LANDING_HOME)
         self._finish_at_takeoff_point()
+        self.set_fleet_status(mission1.MissionOperationState.COMPLETED)
         logger.info("[TEST] Visual descent flight completed")
 
 
@@ -360,6 +366,7 @@ def main() -> None:
     stop_event = threading.Event()
     navi: Optional[Navigation] = None
     mission: Optional[StaticTargetVisualDescentMission] = None
+    fleet_node = None
     digital_output_enabled = False
 
     try:
@@ -397,10 +404,22 @@ def main() -> None:
             navi=navi,
             stop_event=stop_event,
         )
+        fleet_node = mission1.attach_air_fleet_node(
+            fc,
+            navi,
+            stop_event,
+            readonly=True,
+            state_provider=mission1.MissionFleetStateProvider(fc, navi, mission),
+        )
         mission.run()
     except KeyboardInterrupt:
         logger.warning("[TEST] Interrupted by user")
     except Exception:
+        if mission is not None:
+            mission.set_fleet_status(
+                mission1.MissionOperationState.FAULT,
+                error_code=1,
+            )
         logger.exception("[TEST] Static-target visual descent test failed")
     finally:
         if mission is not None:
@@ -437,6 +456,8 @@ def main() -> None:
         except Exception:
             logger.exception("[TEST] Failed to stop radar")
 
+        if fleet_node is not None:
+            fleet_node.close()
         try:
             fc.close()
         except Exception:
