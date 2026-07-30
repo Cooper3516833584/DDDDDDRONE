@@ -64,11 +64,34 @@ VISION_STARTUP_TIMEOUT_SECONDS = 8.0
 
 VISION_SAMPLE_BUFFER_SIZE = 8
 MAX_ESCORT_RECORDS = 2000
+RADAR_POSE_READY_TIMEOUT_SECONDS = 15.0
 
 # 仅用作持续沿 +x 飞行的 PID 引导目标，不代表任务要求到达该点。
 # 若到达该边界仍未发现目标，任务进入异常降落兜底，避免无界前飞。
 FORWARD_GUIDANCE_DISTANCE = 150.0
 FORWARD_BOUNDARY_MARGIN = 10.0
+
+
+def wait_for_radar_initialization(
+    radar: LD_Radar,
+    timeout: float = RADAR_POSE_READY_TIMEOUT_SECONDS,
+) -> None:
+    """等待雷达连接且 x、y、yaw 三轴位姿均完成初始化。"""
+    deadline = time.monotonic() + float(timeout)
+    while time.monotonic() < deadline:
+        pose_inited = getattr(radar, "_rt_pose_inited", [False, False, False])
+        if radar.connected and all(pose_inited):
+            x, y, yaw = radar.rt_pose
+            logger.info(
+                "[MISSION] Radar initialized: ({:.1f}, {:.1f})cm, "
+                "yaw={:.1f}deg",
+                x,
+                y,
+                yaw,
+            )
+            return
+        time.sleep(0.1)
+    raise RuntimeError("Single-radar initialization timed out")
 
 
 class Mission:
@@ -498,7 +521,8 @@ class Mission:
         navi.start(mode="radar")
         logger.info("[MISSION] Single-radar navigation started")
 
-        # 以起飞位置建立任务坐标原点；必须先获得雷达位姿更新。
+        # 三轴全部初始化后，才允许建立任务坐标原点。
+        wait_for_radar_initialization(self.radar)
         navi.calibrate_basepoint()
         logger.info("[MISSION] Radar basepoint calibrated: {}", navi.basepoint)
         time.sleep(1)
