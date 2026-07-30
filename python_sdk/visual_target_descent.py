@@ -22,6 +22,10 @@ from loguru import logger
 
 VisionSample = Tuple[int, float, Optional[float], Optional[float]]
 LatestVisionSample = Callable[[], Optional[VisionSample]]
+BaseVelocityProvider = Callable[
+    [float, float, float],
+    Tuple[float, float],
+]
 RecordCallback = Callable[
     [float, str, Optional[float], Optional[float], int, int],
     None,
@@ -105,10 +109,10 @@ class VisualTargetDescentController:
             raise ValueError("base_velocity must contain two finite values")
         return self._limit_horizontal_velocity(base)
 
-    def _fresh_offset(
+    def _fresh_sample(
         self,
         now: float,
-    ) -> Optional[Tuple[float, float]]:
+    ) -> Optional[VisionSample]:
         self._raise_if_vision_failed()
         sample = self._latest_vision_sample()
         if (
@@ -118,11 +122,27 @@ class VisualTargetDescentController:
             or sample[3] is None
         ):
             return None
+        sequence_value = float(sample[0])
+        captured_at = float(sample[1])
         x_px = float(sample[2])
         y_px = float(sample[3])
-        if not np.all(np.isfinite(np.asarray([x_px, y_px], dtype=float))):
+        values = np.asarray(
+            [sequence_value, captured_at, x_px, y_px],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(values)):
             return None
-        return x_px, y_px
+        sequence = int(sequence_value)
+        return sequence, captured_at, x_px, y_px
+
+    def _fresh_offset(
+        self,
+        now: float,
+    ) -> Optional[Tuple[float, float]]:
+        sample = self._fresh_sample(now)
+        if sample is None:
+            return None
+        return sample[2], sample[3]
 
     def _next_horizontal_velocity(
         self,
@@ -209,8 +229,12 @@ class VisualTargetDescentController:
         height_confirm_time: float = 0.4,
         timeout: float = 15.0,
         on_height_reached: Optional[Callable[[], None]] = None,
+        base_velocity_provider: Optional[BaseVelocityProvider] = None,
+        pre_descent_follow_seconds: float = 0.0,
+        pre_descent_follow_timeout: float = 20.0,
+        on_descent_start: Optional[Callable[[], None]] = None,
     ) -> None:
-        """伴随视觉水平修正下降到指定激光高度，并继续悬停指定时间。"""
+        """视觉伴飞后下降到指定激光高度，并继续悬停指定时间。"""
         values = np.asarray(
             [
                 target_height,
@@ -218,6 +242,8 @@ class VisualTargetDescentController:
                 height_tolerance,
                 height_confirm_time,
                 timeout,
+                pre_descent_follow_seconds,
+                pre_descent_follow_timeout,
             ],
             dtype=float,
         )
@@ -228,27 +254,56 @@ class VisualTargetDescentController:
         height_tolerance = float(height_tolerance)
         height_confirm_time = float(height_confirm_time)
         timeout = float(timeout)
+        pre_descent_follow_seconds = float(pre_descent_follow_seconds)
+        pre_descent_follow_timeout = float(pre_descent_follow_timeout)
         if target_height < 0 or hover_seconds < 0:
             raise ValueError("Target height and hover time must be non-negative")
-        if min(height_tolerance, height_confirm_time, timeout) <= 0:
+        if pre_descent_follow_seconds < 0:
+            raise ValueError("Pre-descent follow time must be non-negative")
+        if min(
+            height_tolerance,
+            height_confirm_time,
+            timeout,
+            pre_descent_follow_timeout,
+        ) <= 0:
             raise ValueError(
-                "Height tolerance, confirmation time and timeout must be positive"
+                "Height tolerance, confirmation time and timeouts must be positive"
             )
+        if base_velocity_provider is not None and not callable(
+            base_velocity_provider
+        ):
+            raise ValueError("base_velocity_provider must be callable")
+        if on_descent_start is not None and not callable(on_descent_start):
+            raise ValueError("on_descent_start must be callable")
 
         base = self._validate_base_velocity(base_velocity)
+        current_base = base.copy()
         filtered = base.copy()
         started_at = time.monotonic()
         last_loop_at = started_at
+        descent_started_at: Optional[float] = None
         lost_started_at: Optional[float] = None
+        pre_descent_valid_since: Optional[float] = None
         height_reached_since: Optional[float] = None
         reached = False
         hover_elapsed = 0.0
+        last_provider_sequence: Optional[int] = None
+        last_provider_captured_at: Optional[float] = None
+        pre_descent_complete = pre_descent_follow_seconds <= 0
 
         self._start_override(keep_height=True)
-        self.navi.set_height(target_height)
+        if pre_descent_complete:
+            if on_descent_start is not None:
+                on_descent_start()
+            self.navi.set_height(target_height)
+            descent_started_at = started_at
+        else:
+            self.navi.set_height(float(self.navi.current_height))
         logger.info(
-            "[VISUAL-DESCENT] Descend to {}cm, base=({:.1f}, {:.1f})cm/s",
+            "[VISUAL-DESCENT] Target={}cm, pre-follow={:.1f}s, "
+            "base=({:.1f}, {:.1f})cm/s",
             target_height,
+            pre_descent_follow_seconds,
             base[0],
             base[1],
         )
@@ -258,19 +313,43 @@ class VisualTargetDescentController:
                 dt = min(max(now - last_loop_at, 0.0), 0.2)
                 last_loop_at = now
                 self._validate_flight_state()
-                if not reached and now - started_at > timeout:
+                if (
+                    not pre_descent_complete
+                    and now - started_at > pre_descent_follow_timeout
+                ):
+                    raise RuntimeError(
+                        "Continuous visual follow was not stable before timeout"
+                    )
+                if (
+                    pre_descent_complete
+                    and not reached
+                    and descent_started_at is not None
+                    and now - descent_started_at > timeout
+                ):
                     raise RuntimeError("Visual height descent timeout")
 
-                offset = self._fresh_offset(now)
-                if offset is None:
+                sample = self._fresh_sample(now)
+                if sample is None:
                     if lost_started_at is None:
                         lost_started_at = now
                         self.navi.set_height(float(self.navi.current_height))
                         logger.warning(
                             "[VISUAL-DESCENT] Marker lost; pause descent"
                         )
+                    if not pre_descent_complete:
+                        pre_descent_valid_since = None
                     self._update_override(0, 0)
-                    self._record(started_at, "vision_lost", None, 0, 0)
+                    self._record(
+                        started_at,
+                        (
+                            "pre_follow_vision_lost"
+                            if not pre_descent_complete
+                            else "vision_lost"
+                        ),
+                        None,
+                        0,
+                        0,
+                    )
                     if now - lost_started_at > self.vision_loss_timeout:
                         raise RuntimeError(
                             "Marker was not reacquired during height descent"
@@ -280,17 +359,81 @@ class VisualTargetDescentController:
 
                 if lost_started_at is not None:
                     lost_started_at = None
-                    self.navi.set_height(target_height)
-                    logger.info(
-                        "[VISUAL-DESCENT] Marker reacquired; resume descent"
+                    if pre_descent_complete:
+                        self.navi.set_height(target_height)
+                        logger.info(
+                            "[VISUAL-DESCENT] Marker reacquired; resume descent"
+                        )
+                    else:
+                        self.navi.set_height(float(self.navi.current_height))
+                        logger.info(
+                            "[VISUAL-DESCENT] Marker reacquired; "
+                            "restart continuous follow timer"
+                        )
+
+                sequence, captured_at, x_px, y_px = sample
+                offset = (x_px, y_px)
+                if (
+                    base_velocity_provider is not None
+                    and sequence != last_provider_sequence
+                ):
+                    if last_provider_captured_at is None:
+                        sample_dt = self.control_period
+                    else:
+                        sample_dt = min(
+                            max(
+                                captured_at - last_provider_captured_at,
+                                0.0,
+                            ),
+                            0.2,
+                        )
+                    current_base = self._validate_base_velocity(
+                        base_velocity_provider(
+                            x_px,
+                            y_px,
+                            sample_dt,
+                        )
                     )
+                    last_provider_sequence = sequence
+                    last_provider_captured_at = captured_at
+                elif base_velocity_provider is None:
+                    current_base = base
+
                 filtered, vel_x, vel_y = self._next_horizontal_velocity(
-                    base,
+                    current_base,
                     filtered,
-                    offset[0],
-                    offset[1],
+                    x_px,
+                    y_px,
                 )
                 self._update_override(vel_x, vel_y)
+
+                if not pre_descent_complete:
+                    if pre_descent_valid_since is None:
+                        pre_descent_valid_since = now
+                    if (
+                        now - pre_descent_valid_since
+                        >= pre_descent_follow_seconds
+                    ):
+                        if on_descent_start is not None:
+                            on_descent_start()
+                        pre_descent_complete = True
+                        descent_started_at = now
+                        height_reached_since = None
+                        self.navi.set_height(target_height)
+                        logger.info(
+                            "[VISUAL-DESCENT] Continuous follow confirmed; "
+                            "descend to {}cm",
+                            target_height,
+                        )
+                    self._record(
+                        started_at,
+                        "pre_descent_follow",
+                        offset,
+                        vel_x,
+                        vel_y,
+                    )
+                    self.stop_event.wait(self.control_period)
+                    continue
 
                 height_in_range = bool(
                     abs(float(self.navi.current_height) - target_height)

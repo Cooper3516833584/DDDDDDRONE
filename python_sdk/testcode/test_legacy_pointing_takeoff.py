@@ -31,7 +31,7 @@ from FlightController import FC_Controller  # noqa: E402
 from FlightController.Components import LD_Radar  # noqa: E402
 from loguru import logger  # noqa: E402
 
-from base_test_tadar import (  # noqa: E402
+from base_test_radar import (  # noqa: E402
     SingleRadarNavigation,
     emergency_land,
     wait_for_radar_pose,
@@ -97,7 +97,7 @@ class LegacyTakeoffMission:
         self.stop_event = stop_event
 
     def prepare_navigation(self) -> None:
-        """沿用 base_test_tadar.py 的单雷达定位初始化框架。"""
+        """沿用 base_test_radar.py 的单雷达定位初始化框架。"""
         self.navi.set_navigation_speed(NAVIGATION_SPEED)
         self.navi.set_vertical_speed(VERTICAL_SPEED)
         self.navi.start(mode="radar")
