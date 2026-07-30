@@ -1,15 +1,14 @@
 """
-静止目标视觉接地、不锁桨停留和再次起飞测试。
+静止目标视觉下降、一键降落锁桨和再次起飞测试。
 
 前半段复用 mission1_26_visual_descent_test.py 的单雷达起飞、入口点、
 沿 +x 追及和目标发现流程。发现目标后：
 
-1. 视觉修正下降到 20 cm；
-2. 以 6 cm/s 继续视觉修正下降；
-3. 用低高度、低垂直速度和高度稳定持续时间组合确认接地；
-4. 清零控制但不锁桨，在目标平面停留 5 s；
-5. 从目标平面再次起飞至 150 cm；
-6. 返回起飞点并执行原有定点降落。
+1. 视觉修正下降并稳定在目标平面上方 25 cm；
+2. 停止视觉控制，调用飞控一键降落并确认锁桨；
+3. 在目标平面锁桨停留 5 s；
+4. 由定点起飞流程重新解锁并起飞至 150 cm；
+5. 返回起飞点并执行一键降落。
 
 该程序会执行真实飞行。运行前必须确认 server_ros.py 及其他 FC_Server
 程序已关闭，并确保人员、桨叶和目标平台周围已经清空。
@@ -28,20 +27,16 @@ import mission1_26 as mission1
 import mission1_26_visual_descent_test as descent_test
 
 
-FINAL_APPROACH_HEIGHT = 20.0
-FINAL_DESCENT_SPEED = 6.0
-TOUCHDOWN_ALT_THRESHOLD = 12.0
-TOUCHDOWN_VERTICAL_SPEED_THRESHOLD = 2.5
-TOUCHDOWN_CONFIRM_SECONDS = 0.4
-TOUCHDOWN_HEIGHT_RANGE = 1.5
-FINAL_DESCENT_TIMEOUT_SECONDS = 8.0
-UNLOCKED_DWELL_SECONDS = 5.0
+TARGET_LANDING_HEIGHT = 25.0
+TARGET_LANDING_TIMEOUT_SECONDS = 15.0
+TARGET_LANDING_LOCK_TIMEOUT_SECONDS = 20.0
+LOCKED_DWELL_SECONDS = 5.0
 
 
 class StaticTargetVisualLandingMission(
     descent_test.StaticTargetVisualDescentMission
 ):
-    """把共用视觉下降控制用于静止目标的不锁桨接地和复飞。"""
+    """在静止目标上方完成视觉下降、一键降落锁桨和复飞。"""
 
     LOG_PREFIX = "mission1_26_visual_target_landing_"
 
@@ -51,26 +46,56 @@ class StaticTargetVisualLandingMission(
         self._digital_output_enabled = False
 
     def _perform_target_action(self) -> None:
-        self.visual_descent.land_without_lock(
+        self.visual_descent.descend_to_height(
+            target_height=TARGET_LANDING_HEIGHT,
+            hover_seconds=0.0,
             base_velocity=(0.0, 0.0),
-            approach_height=FINAL_APPROACH_HEIGHT,
-            final_descent_speed=FINAL_DESCENT_SPEED,
-            touchdown_alt_thres=TOUCHDOWN_ALT_THRESHOLD,
-            touchdown_vertical_speed_thres=(
-                TOUCHDOWN_VERTICAL_SPEED_THRESHOLD
-            ),
-            touchdown_confirm_time=TOUCHDOWN_CONFIRM_SECONDS,
-            touchdown_height_range=TOUCHDOWN_HEIGHT_RANGE,
-            final_descent_timeout=FINAL_DESCENT_TIMEOUT_SECONDS,
-            dwell_seconds=UNLOCKED_DWELL_SECONDS,
+            height_tolerance=descent_test.HEIGHT_TOLERANCE,
+            height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
+            timeout=TARGET_LANDING_TIMEOUT_SECONDS,
         )
 
         target_point = self.navi.current_point.copy()
         self._stop_vision_tracker()
+        self.navi.navigation_stop_here()
+        self.navi.navigation_flag = False
+        self.navi.keep_height_flag = False
+        self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
+        time.sleep(0.1)
+        self.fc.stablize()
+        self.fc.land()
+        if not self.fc.wait_for_lock(
+            timeout_s=TARGET_LANDING_LOCK_TIMEOUT_SECONDS
+        ):
+            self.fc.land()
+            raise RuntimeError(
+                "One-key landing on target did not confirm motor lock"
+            )
+        if not self.fc.state.is_fresh(0.5):
+            raise RuntimeError(
+                "Flight-controller telemetry became stale after target landing"
+            )
+        logger.info("[TEST] One-key landing on target confirmed motor lock")
+
         logger.warning(
-            "[TEST] Unlocked target dwell completed; take off again at {}",
+            "[TEST] Locked on target; take off again in {:.1f}s at {}",
+            LOCKED_DWELL_SECONDS,
             target_point,
         )
+        dwell_deadline = time.monotonic() + LOCKED_DWELL_SECONDS
+        while time.monotonic() < dwell_deadline:
+            if self.stop_event.is_set():
+                raise RuntimeError("External stop requested during locked dwell")
+            if not self.fc.state.is_fresh(0.5):
+                raise RuntimeError("Flight-controller telemetry became stale")
+            if self.fc.state.unlock.value:
+                raise RuntimeError(
+                    "Aircraft unexpectedly unlocked during target dwell"
+                )
+            self.stop_event.wait(0.1)
+
+        # pointing_takeoff() starts with PROGRAM mode and fc.unlock(); the
+        # confirmed locked state above makes this a real re-arm before takeoff.
         self.navi.pointing_takeoff(
             target_point,
             target_height=mission1.CRUISE_HEIGHT,

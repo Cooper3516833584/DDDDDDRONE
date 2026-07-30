@@ -2068,8 +2068,16 @@ class Navigation(object):
         self.fc.unlock()
         # inital_yaw = self.fc.state.yaw.value
         time.sleep(2)  # 等待电机启动
+        if not self.fc.state.is_fresh(0.5):
+            raise RuntimeError(
+                "Flight-controller telemetry became stale while unlocking"
+            )
         self.fc.take_off(30)
-        self.fc.wait_for_takeoff_done(timeout_s=5)
+        if not self.fc.wait_for_takeoff_done(timeout_s=5):
+            raise RuntimeError(
+                "Flight controller did not confirm takeoff; "
+                "closed-loop navigation remains disabled"
+            )
         # self.fc.set_yaw(inital_yaw, 25)
         # self.fc.wait_for_hovering(2)
         ######## 闭环定高
