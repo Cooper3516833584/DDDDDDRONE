@@ -17,6 +17,7 @@ import math
 import threading
 import time
 from collections import deque
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Deque, Dict, Iterator, List, Optional, Tuple
@@ -27,6 +28,9 @@ from loguru import logger
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
+from fleet_bus.air_node import attach_air_fleet_node
+from fleet_bus.models import AirFleetState, NodeFlags
+from fleet_bus.pose_provider import NavigationAirStateProvider
 from landing_marker_offset import track_landing_marker
 
 
@@ -94,6 +98,55 @@ def wait_for_radar_initialization(
     raise RuntimeError("Single-radar initialization timed out")
 
 
+class MissionOperationState:
+    """FleetBus D-task operation-state values rendered by the ground station."""
+
+    IDLE = 0
+    READY = 1
+    TAKEOFF = 3
+    HOVERING = 4
+    ESCORTING = 5
+    RETURNING_HOME = 9
+    LANDING_HOME = 10
+    COMPLETED = 11
+    STOPPED = 12
+    FAULT = 13
+
+
+class MissionFleetStateProvider:
+    """Publish the mission phase and launch-point-relative navigation pose."""
+
+    def __init__(self, fc: FC_Controller, navi: Navigation, mission: "Mission"):
+        self._mission = mission
+        self._navigation_state = NavigationAirStateProvider(
+            fc,
+            navi,
+            position_transform=lambda x_cm, y_cm: (
+                x_cm - float(TAKEOFF_POINT[0]),
+                y_cm - float(TAKEOFF_POINT[1]),
+            ),
+        )
+
+    def __call__(self) -> AirFleetState:
+        state = self._navigation_state()
+        operation_state, error_code = self._mission.fleet_status()
+        node_flags = state.node_flags
+        if operation_state in (
+            MissionOperationState.TAKEOFF,
+            MissionOperationState.HOVERING,
+            MissionOperationState.ESCORTING,
+            MissionOperationState.RETURNING_HOME,
+            MissionOperationState.LANDING_HOME,
+        ):
+            node_flags |= int(NodeFlags.BUSY)
+        return replace(
+            state,
+            node_flags=node_flags,
+            operation_state=operation_state,
+            error_code=error_code,
+        )
+
+
 class Mission:
     def __init__(
         self,
@@ -107,6 +160,9 @@ class Mission:
         self.navi = navi
         self.stop_event = stop_event
         self.takeoff_signal = threading.Event()
+        self._fleet_status_lock = threading.Lock()
+        self._fleet_operation_state = MissionOperationState.IDLE
+        self._fleet_error_code = 0
 
         self._vision_stop_event = threading.Event()
         self._vision_ready_event = threading.Event()
@@ -134,9 +190,24 @@ class Mission:
 
     def stop(self):
         self.stop_event.set()
+        with self._fleet_status_lock:
+            if self._fleet_operation_state not in (
+                MissionOperationState.COMPLETED,
+                MissionOperationState.FAULT,
+            ):
+                self._fleet_operation_state = MissionOperationState.STOPPED
         self._stop_vision_tracker()
         self.navi.stop()
         logger.info("[MISSION] Mission stopped")
+
+    def set_fleet_status(self, operation_state: int, error_code: int = 0):
+        with self._fleet_status_lock:
+            self._fleet_operation_state = operation_state
+            self._fleet_error_code = error_code
+
+    def fleet_status(self) -> Tuple[int, int]:
+        with self._fleet_status_lock:
+            return self._fleet_operation_state, self._fleet_error_code
 
     def notify_takeoff_signal(self):
         """供后续无线、按键或其他信号回调通知起飞。"""
@@ -529,6 +600,7 @@ class Mission:
 
         # 起飞前确认相机和视觉生成器能够持续给出结果，失败时拒绝起飞。
         self._start_vision_tracker()
+        self.set_fleet_status(MissionOperationState.READY)
         self.wait_for_takeoff_signal()
         if self.stop_event.is_set():
             return
@@ -538,11 +610,13 @@ class Mission:
             CRUISE_HEIGHT,
             TAKEOFF_POINT,
         )
+        self.set_fleet_status(MissionOperationState.TAKEOFF)
         navi.pointing_takeoff(
             TAKEOFF_POINT,
             CRUISE_HEIGHT,
         )
 
+        self.set_fleet_status(MissionOperationState.HOVERING)
         logger.info("[MISSION] Navigate to entry point {}", ENTRY_POINT)
         if not navi.navigation_to_waypoint(ENTRY_POINT, wait=True):
             raise RuntimeError("Failed to reach entry point")
@@ -560,17 +634,21 @@ class Mission:
         )
 
         initial_offset = self._wait_until_target_detected(forward_target[0])
+        self.set_fleet_status(MissionOperationState.ESCORTING)
         self._escort_target(initial_offset)
 
         # 视觉任务到此结束，先释放相机，再返航并定点降落。
         self._stop_vision_tracker()
         navi.set_navigation_speed(ESCORT_SPEED_MIDPOINT)
+        self.set_fleet_status(MissionOperationState.RETURNING_HOME)
         logger.info("[MISSION] Returning to takeoff point {}", TAKEOFF_POINT)
         if not navi.navigation_to_waypoint(TAKEOFF_POINT, wait=True):
             raise RuntimeError("Failed to return to takeoff point")
         logger.info("[MISSION] Returned to takeoff point; starting landing")
+        self.set_fleet_status(MissionOperationState.LANDING_HOME)
         if not navi.pointing_landing(TAKEOFF_POINT):
             raise RuntimeError("Failed to land at takeoff point")
+        self.set_fleet_status(MissionOperationState.COMPLETED)
         logger.info("[MISSION] Landed at takeoff point")
 
 
@@ -580,6 +658,7 @@ def main():
     stop_event = threading.Event()
     navi = None
     mission = None
+    fleet_node = None
     digital_output_enabled = False
 
     try:
@@ -605,10 +684,19 @@ def main():
             navi=navi,
             stop_event=stop_event,
         )
+        fleet_node = attach_air_fleet_node(
+            fc,
+            navi,
+            stop_event,
+            readonly=True,
+            state_provider=MissionFleetStateProvider(fc, navi, mission),
+        )
         mission.run()
     except KeyboardInterrupt:
         logger.warning("[MANAGER] Mission interrupted by user")
     except Exception:
+        if mission is not None:
+            mission.set_fleet_status(MissionOperationState.FAULT, error_code=1)
         logger.exception("[MANAGER] Mission failed")
     finally:
         if mission is not None:
@@ -648,6 +736,8 @@ def main():
         except Exception:
             logger.exception("[MANAGER] Failed to stop radar")
 
+        if fleet_node is not None:
+            fleet_node.close()
         fc.close()
         logger.info("[MANAGER] Mission finished")
 

@@ -304,8 +304,13 @@ def attach_air_fleet_node(
     survey_provider: Optional[Callable[[], SurveyState]] = None,
     position_transform: Optional[Callable] = None,
     heading_offset_deg: float = 0.0,
+    state_provider: Optional[Callable[[], object]] = None,
 ) -> AirFleetNode:
-    """Create the one FCWirelessTransport callback owner for FleetBus mode."""
+    """Create the one FCWirelessTransport callback owner for FleetBus mode.
+
+    ``state_provider`` lets a task add task-defined report fields without
+    changing the navigation pose conversion shared by other missions.
+    """
     from FlightController.Components.GroundStationLink.transport import (
         FCWirelessTransport,
     )
@@ -317,14 +322,15 @@ def attach_air_fleet_node(
         fc, on_bytes=lambda data: holder["node"].feed_bytes(data)
     )
     commands = AirCommandQueue()
+    default_state_provider = NavigationAirStateProvider(
+        fc,
+        navigation,
+        position_transform=position_transform,
+        heading_offset_deg=heading_offset_deg,
+    )
     node = AirFleetNode(
         transport,
-        NavigationAirStateProvider(
-            fc,
-            navigation,
-            position_transform=position_transform,
-            heading_offset_deg=heading_offset_deg,
-        ),
+        default_state_provider if state_provider is None else state_provider,
         commands,
         stop_event,
         readonly=readonly,

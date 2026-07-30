@@ -104,6 +104,12 @@ GroundStationLink 不转发飞控姿态或控制原始帧。地面站 HC-14 和�
 C:\Users\TZDEZACR\Desktop\DDDDDrone_Cloned\python_sdk\FlightController\Components\GroundStationLink
 ```
 
+机载上位机部署副本（2026-07-30 只读核验）：
+
+```text
+/home/fc/桌面/DDDDrone_Cloned
+```
+
 地面站端：
 
 ```text
