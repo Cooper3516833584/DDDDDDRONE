@@ -37,49 +37,59 @@ DESCENT_TIMEOUT_SECONDS = 15.0
 INITIAL_TARGET_VELOCITY = (mission1.ESCORT_SPEED_MIDPOINT, 0.0)
 
 
-class MissionSignalPlaceholders:
-    """任务通信占位；发送函数只写日志，不进行网络或串口通信。"""
+class MissionGroundStationSignals:
+    """Publish moving-target mission phases through the existing FleetBus link."""
 
-    @staticmethod
-    def _send(name: str, purpose: str) -> None:
-        logger.info("[SIGNAL-PLACEHOLDER] send {}: {}", name, purpose)
+    TAKEOFF_SIGNAL_RECEIVED = 2
+    DROP_STARTED = 6
+    DROP_COMPLETED = 7
+
+    def __init__(self, mission: "MovingTargetVisualDescentMission") -> None:
+        self._mission = mission
+
+    def _send(self, name: str, operation_state: int) -> None:
+        self._mission.set_fleet_status(operation_state)
+        logger.info("[GROUND] Mission signal sent: {}", name)
 
     def send_initialization_success(self) -> None:
-        self._send("initialization_success", "aircraft is ready for takeoff")
+        self._send("initialization_success", mission1.MissionOperationState.READY)
 
-    @staticmethod
-    def wait_for_takeoff_signal() -> None:
-        logger.info(
-            "[SIGNAL-PLACEHOLDER] wait takeoff_signal: terminal input is active"
-        )
+    def wait_for_takeoff_signal(self) -> None:
+        logger.info("[GROUND] Waiting for terminal takeoff signal")
         descent_test.wait_for_terminal_start_command()
+        self._send("takeoff_signal_received", self.TAKEOFF_SIGNAL_RECEIVED)
 
     def send_takeoff_started(self) -> None:
-        self._send("takeoff_started", "takeoff stage started")
+        self._send("takeoff_started", mission1.MissionOperationState.TAKEOFF)
 
     def send_takeoff_succeeded(self) -> None:
         self._send(
-            "takeoff_succeeded",
-            "cruise height reached; moving target may start",
+            "takeoff_succeeded", mission1.MissionOperationState.HOVERING
         )
 
     def send_escort_started(self) -> None:
-        self._send("escort_started", "visual escort started")
+        self._send("escort_started", mission1.MissionOperationState.ESCORTING)
 
     def send_drop_started(self) -> None:
-        self._send("drop_started", "synchronized descent started")
+        self._send("drop_started", self.DROP_STARTED)
 
     def send_drop_completed(self) -> None:
-        self._send("drop_completed", "digital output 0 was disabled")
+        self._send("drop_completed", self.DROP_COMPLETED)
 
     def send_return_started(self) -> None:
-        self._send("return_started", "return-to-home stage started")
+        self._send(
+            "return_started", mission1.MissionOperationState.RETURNING_HOME
+        )
 
     def send_landing_started(self) -> None:
-        self._send("landing_started", "pointing landing started")
+        self._send(
+            "landing_started", mission1.MissionOperationState.LANDING_HOME
+        )
 
     def send_mission_completed(self) -> None:
-        self._send("mission_completed", "landing and motor lock confirmed")
+        self._send(
+            "mission_completed", mission1.MissionOperationState.COMPLETED
+        )
 
 
 class MovingTargetVisualDescentMission(
@@ -91,7 +101,7 @@ class MovingTargetVisualDescentMission(
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.signals = MissionSignalPlaceholders()
+        self.signals = MissionGroundStationSignals(self)
         self._digital_output_enabled = False
         self.moving_target_descent = MovingTargetDescentController(
             fc=self.fc,
@@ -311,6 +321,7 @@ def main() -> None:
     stop_event = threading.Event()
     navi: Optional[Navigation] = None
     mission: Optional[MovingTargetVisualDescentMission] = None
+    fleet_node = None
 
     try:
         fc.start_listen_serial(
@@ -342,10 +353,22 @@ def main() -> None:
             navi=navi,
             stop_event=stop_event,
         )
+        fleet_node = mission1.attach_air_fleet_node(
+            fc,
+            navi,
+            stop_event,
+            readonly=True,
+            state_provider=mission1.MissionFleetStateProvider(fc, navi, mission),
+        )
         mission.run()
     except KeyboardInterrupt:
         logger.warning("[TEST] Interrupted by user")
     except Exception:
+        if mission is not None:
+            mission.set_fleet_status(
+                mission1.MissionOperationState.FAULT,
+                error_code=1,
+            )
         logger.exception("[TEST] Moving-target visual descent test failed")
     finally:
         if mission is not None:
@@ -387,6 +410,8 @@ def main() -> None:
         except Exception:
             logger.exception("[TEST] Failed to stop radar")
 
+        if fleet_node is not None:
+            fleet_node.close()
         try:
             fc.close()
         except Exception:
