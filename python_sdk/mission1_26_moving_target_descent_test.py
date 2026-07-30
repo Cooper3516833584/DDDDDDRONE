@@ -2,11 +2,11 @@
 移动目标视觉伴飞与同步下降测试。
 
 流程复用静止目标测试的单雷达定位、视觉线程、沿 +x 搜索、返航和
-定点降落框架。发现沿 +x 直线运动的目标后，连续有效伴飞 3 秒，
-在同一视觉速度接管内从 150 cm 下降到 100 cm，并继续伴飞 2 秒。
+定点降落框架。发现沿 +x 直线运动的目标后，连续有效伴飞 10 秒，
+在同一视觉速度接管内从 150 cm 下降到 40 cm，并继续伴飞 2 秒。
 
 本文件会连接真实飞控、雷达和相机并执行飞行。运行前必须确认
-server_ros.py 及其他 FC_Server 已关闭、现场安全，并且首次测试不挂货。
+server_ros.py 及其他 FC_Server 已关闭、现场和投放区域安全。
 通信尚未接入；除起飞信号使用终端输入 ``s`` 外，其余信号仅记录日志。
 """
 
@@ -29,12 +29,12 @@ import mission1_26_visual_descent_test as descent_test
 from moving_target_descent import MovingTargetDescentController
 
 
-DESCENT_TARGET_HEIGHT = 100.0
-STABILIZE_SECONDS = 3.0
+DESCENT_TARGET_HEIGHT = 40.0
+STABILIZE_SECONDS = 10.0
 STABILIZE_TIMEOUT_SECONDS = 20.0
 LOW_HOVER_SECONDS = 2.0
 DESCENT_TIMEOUT_SECONDS = 15.0
-INITIAL_TARGET_VELOCITY = (mission1.ESCORT_SPEED_MIDPOINT, 0.0)
+INITIAL_TARGET_VELOCITY = (3.6, 0.0)
 
 
 class MissionSignalPlaceholders:
@@ -189,7 +189,7 @@ class MovingTargetVisualDescentMission(
         self.fc.set_digital_output(0, False)
         self._digital_output_enabled = False
         logger.info(
-            "[TEST] Digital output 0 disabled at {}cm; no payload is attached",
+            "[TEST] Digital output 0 disabled at {}cm",
             DESCENT_TARGET_HEIGHT,
         )
         self.signals.send_drop_completed()
@@ -249,7 +249,7 @@ class MovingTargetVisualDescentMission(
         self.fc.set_digital_output(0, True)
         self._digital_output_enabled = True
         logger.warning(
-            "[TEST] Digital output 0 enabled; first moving test must not carry payload"
+            "[TEST] Digital output 0 enabled; confirm payload and drop-area safety"
         )
         self.signals.send_initialization_success()
 
