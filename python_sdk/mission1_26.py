@@ -7,7 +7,8 @@
 
 本文件会连接真实飞控、雷达和相机并执行飞行。运行前必须确认
 server_ros.py 及其他 FC_Server 已关闭、现场和投放区域安全。
-通信尚未接入；除起飞信号使用终端输入 ``s`` 外，其余信号仅记录日志。
+地面站通过 FleetBus 依次发送准备和起飞命令；准备命令开启电磁铁，
+起飞命令仅在地面站完成三端联调时序后放行定点起飞。
 """
 
 import csv
@@ -24,6 +25,7 @@ from loguru import logger
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
+from fleet_bus.models import CommandId
 import mission1_26_base as mission1
 import mission1_26_visual_descent_test as descent_test
 from moving_target_descent import MovingTargetDescentController
@@ -54,9 +56,7 @@ class MissionGroundStationSignals:
     def send_initialization_success(self) -> None:
         self._send("initialization_success", mission1.MissionOperationState.READY)
 
-    def wait_for_takeoff_signal(self) -> None:
-        logger.info("[GROUND] Waiting for terminal takeoff signal")
-        descent_test.wait_for_terminal_start_command()
+    def send_takeoff_signal_received(self) -> None:
         self._send("takeoff_signal_received", self.TAKEOFF_SIGNAL_RECEIVED)
 
     def send_takeoff_started(self) -> None:
@@ -102,6 +102,7 @@ class MovingTargetVisualDescentMission(
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.signals = MissionGroundStationSignals(self)
+        self._ground_commands = None
         self._digital_output_enabled = False
         self.moving_target_descent = MovingTargetDescentController(
             fc=self.fc,
@@ -111,6 +112,31 @@ class MovingTargetVisualDescentMission(
             raise_if_vision_failed=self._raise_if_vision_failed,
             record_callback=self._record_moving_descent,
         )
+
+    def bind_ground_commands(self, command_queue) -> None:
+        self._ground_commands = command_queue
+
+    def _wait_for_ground_command(self, expected: CommandId):
+        if self._ground_commands is None:
+            raise RuntimeError("FleetBus command queue is not attached")
+        logger.info("[GROUND] Waiting for {} command", expected.name)
+        while not self.stop_event.is_set():
+            command = self._ground_commands.receive(timeout=0.2)
+            if command is None:
+                continue
+            if command.command_id == int(CommandId.TARGETED_STOP):
+                self._ground_commands.complete(command)
+                raise RuntimeError("Mission stopped by ground station")
+            if command.command_id != int(expected):
+                self._ground_commands.fail(command, error_code=1)
+                logger.warning(
+                    "[GROUND] Rejected command {} while waiting for {}",
+                    command.command_id,
+                    expected.name,
+                )
+                continue
+            return command
+        raise RuntimeError("Mission stopped while waiting for ground command")
 
     def _record_moving_descent(
         self,
@@ -260,25 +286,43 @@ class MovingTargetVisualDescentMission(
         )
 
         self._start_vision_tracker()
-        self.fc.set_digital_output(0, True)
-        self._digital_output_enabled = True
+        self.fc.set_indicator_led(255, 0, 0)
+
+        prepare_command = self._wait_for_ground_command(
+            CommandId.DRONE_PREPARE_MISSION
+        )
+        try:
+            self.fc.set_digital_output(0, True)
+            self._digital_output_enabled = True
+            self.signals.send_initialization_success()
+            self._ground_commands.complete(prepare_command)
+        except Exception:
+            self._ground_commands.fail(prepare_command, error_code=1)
+            raise
         logger.warning(
             "[MISSION1] Digital output 0 enabled; "
             "confirm payload and drop-area safety"
         )
-        self.signals.send_initialization_success()
 
-        self.fc.set_indicator_led(255, 0, 0)
-        self.signals.wait_for_takeoff_signal()
+        takeoff_command = self._wait_for_ground_command(
+            CommandId.DRONE_START_MISSION
+        )
+        self.signals.send_takeoff_signal_received()
         if self.stop_event.is_set():
+            self._ground_commands.fail(takeoff_command, error_code=1)
             return
         self.fc.set_indicator_led(0, 255, 0)
         self.signals.send_takeoff_started()
 
-        navi.pointing_takeoff(
-            mission1.TAKEOFF_POINT,
-            target_height=mission1.CRUISE_HEIGHT,
-        )
+        try:
+            navi.pointing_takeoff(
+                mission1.TAKEOFF_POINT,
+                target_height=mission1.CRUISE_HEIGHT,
+            )
+            self._ground_commands.complete(takeoff_command)
+        except Exception:
+            self._ground_commands.fail(takeoff_command, error_code=1)
+            raise
         self.signals.send_takeoff_succeeded()
         self.fc.set_indicator_led(0, 0, 0)
 
@@ -369,8 +413,10 @@ def main() -> None:
             navi,
             stop_event,
             readonly=True,
+            allow_start_mission=True,
             state_provider=mission1.MissionFleetStateProvider(fc, navi, mission),
         )
+        mission.bind_ground_commands(fleet_node.command_queue)
         mission.run()
     except KeyboardInterrupt:
         logger.warning("[MISSION1] Interrupted by user")

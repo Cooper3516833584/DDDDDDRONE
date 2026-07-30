@@ -131,6 +131,16 @@ class MissionFleetStateProvider:
         state = self._navigation_state()
         operation_state, error_code = self._mission.fleet_status()
         node_flags = state.node_flags
+        if not self._mission.fleet_pose_ready():
+            node_flags &= ~int(NodeFlags.POSE_VALID)
+            state = replace(
+                state,
+                x_cm=0,
+                y_cm=0,
+                z_cm=0,
+                heading_cdeg=0,
+                pose_quality=0,
+            )
         if operation_state in (
             MissionOperationState.TAKEOFF,
             MissionOperationState.HOVERING,
@@ -163,6 +173,7 @@ class Mission:
         self._fleet_status_lock = threading.Lock()
         self._fleet_operation_state = MissionOperationState.IDLE
         self._fleet_error_code = 0
+        self._fleet_pose_ready = False
 
         self._vision_stop_event = threading.Event()
         self._vision_ready_event = threading.Event()
@@ -204,10 +215,16 @@ class Mission:
         with self._fleet_status_lock:
             self._fleet_operation_state = operation_state
             self._fleet_error_code = error_code
+            if operation_state == MissionOperationState.READY:
+                self._fleet_pose_ready = True
 
     def fleet_status(self) -> Tuple[int, int]:
         with self._fleet_status_lock:
             return self._fleet_operation_state, self._fleet_error_code
+
+    def fleet_pose_ready(self) -> bool:
+        with self._fleet_status_lock:
+            return self._fleet_pose_ready
 
     def notify_takeoff_signal(self):
         """供后续无线、按键或其他信号回调通知起飞。"""
