@@ -8,6 +8,7 @@ from typing import Callable, List, Optional, Tuple
 
 TAKEOFF_POINT = (0.0, 0.0)
 ENTRY_POINT = (87.5, -37.5)
+PURSUIT_SLOWDOWN_POINT = (207.5, -37.5)
 ARC_CENTER = (237.5, -112.5)
 ARC_RADIUS = 75.0
 ARC_START = (237.5, -37.5)
@@ -31,16 +32,74 @@ def build_pursuit_trajectory(
     points = [
         (TAKEOFF_POINT[0], TAKEOFF_POINT[1], altitude),
         (ENTRY_POINT[0], ENTRY_POINT[1], altitude),
+        (
+            PURSUIT_SLOWDOWN_POINT[0],
+            PURSUIT_SLOWDOWN_POINT[1],
+            altitude,
+        ),
     ]
     for angle_degrees in range(90, -91, -arc_step_degrees):
         angle = math.radians(float(angle_degrees))
         x = ARC_CENTER[0] + ARC_RADIUS * math.cos(angle)
         y = ARC_CENTER[1] + ARC_RADIUS * math.sin(angle)
         points.append((float(x), float(y), altitude))
-    points[2] = (ARC_START[0], ARC_START[1], altitude)
+    points[3] = (ARC_START[0], ARC_START[1], altitude)
     points[-1] = (ARC_END[0], ARC_END[1], altitude)
     points.append((ROUTE_END[0], ROUTE_END[1], altitude))
     return points
+
+
+@dataclass
+class PursuitSpeedSchedule:
+    """根据轨迹目标和实时位置锁存追及阶段，并给出需要切换的新速度。"""
+
+    initial_speed: float = 40.0
+    approach_speed: float = 25.0
+    after_slowdown_speed: float = 15.0
+    point_tolerance: float = 1e-3
+    stage: int = 0
+
+    @property
+    def current_speed(self) -> float:
+        if self.stage <= 0:
+            return float(self.initial_speed)
+        if self.stage == 1:
+            return float(self.approach_speed)
+        return float(self.after_slowdown_speed)
+
+    def update(
+        self,
+        target_x: float,
+        target_y: float,
+        current_x: float,
+        current_y: float,
+    ) -> Optional[float]:
+        target_x = float(target_x)
+        target_y = float(target_y)
+        current_x = float(current_x)
+        current_y = float(current_y)
+        if not all(
+            math.isfinite(value)
+            for value in (target_x, target_y, current_x, current_y)
+        ):
+            return None
+        at_slowdown_point = bool(
+            math.hypot(
+                target_x - PURSUIT_SLOWDOWN_POINT[0],
+                target_y - PURSUIT_SLOWDOWN_POINT[1],
+            )
+            <= float(self.point_tolerance)
+        )
+        if self.stage == 0 and at_slowdown_point:
+            self.stage = 1
+            return self.current_speed
+        if (
+            self.stage == 1
+            and current_x >= PURSUIT_SLOWDOWN_POINT[0]
+        ):
+            self.stage = 2
+            return self.current_speed
+        return None
 
 
 @dataclass
@@ -231,6 +290,8 @@ __all__ = [
     "ARC_RADIUS",
     "ARC_START",
     "ENTRY_POINT",
+    "PURSUIT_SLOWDOWN_POINT",
+    "PursuitSpeedSchedule",
     "ROUTE_END",
     "ROUTE_GATE_RADIUS",
     "RoutePassGate",

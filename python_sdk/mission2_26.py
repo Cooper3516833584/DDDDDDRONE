@@ -20,6 +20,8 @@ import mission1_26_base as mission_base
 import mission1_26_visual_descent_test as descent_test
 from mission2_26_logic import (
     ARC_END,
+    PURSUIT_SLOWDOWN_POINT,
+    PursuitSpeedSchedule,
     ROUTE_GATE_RADIUS,
     RoutePassGate,
     build_pursuit_trajectory,
@@ -33,6 +35,9 @@ from visual_target_descent import PreDescentTimeoutError
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 20.0
 PURSUIT_SPEED = 40.0
+PURSUIT_APPROACH_SPEED = 25.0
+PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
+RETURN_SPEED = 40.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
 
@@ -105,6 +110,11 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         self.signals = Mission2Signals(self)
         self._digital_output_enabled = False
         self._route_gate = RoutePassGate(radius=ROUTE_GATE_RADIUS)
+        self._pursuit_speed_schedule = PursuitSpeedSchedule(
+            initial_speed=PURSUIT_SPEED,
+            approach_speed=PURSUIT_APPROACH_SPEED,
+            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
+        )
         self._pursuit_trajectory = build_pursuit_trajectory(
             altitude=CRUISE_HEIGHT,
             arc_step_degrees=10,
@@ -140,11 +150,34 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         if self.navi.traj_running_event.is_set():
             raise RuntimeError("Pursuit trajectory did not stop in time")
 
+    def _update_pursuit_speed(self) -> None:
+        target_x, target_y = self.navi.navigation_target
+        new_speed = self._pursuit_speed_schedule.update(
+            target_x,
+            target_y,
+            self.navi.current_x,
+            self.navi.current_y,
+        )
+        if new_speed is None:
+            return
+        self.navi.set_navigation_speed(new_speed)
+        logger.info(
+            "[MISSION2] Pursuit speed changed to {:.1f}cm/s at "
+            "position ({:.1f}, {:.1f}); trajectory target "
+            "({:.1f}, {:.1f})",
+            new_speed,
+            self.navi.current_x,
+            self.navi.current_y,
+            target_x,
+            target_y,
+        )
+
     def _wait_until_target_detected_on_trajectory(
         self,
     ) -> Tuple[float, float]:
         last_sequence = -1
         while not self.stop_event.is_set():
+            self._update_pursuit_speed()
             self._route_gate_is_open()
             self._raise_if_vision_failed()
             sample = self._latest_vision_sample()
@@ -239,7 +272,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
 
     def _return_home_and_land(self) -> None:
         self.signals.send_return_started()
-        self.navi.set_navigation_speed(PURSUIT_SPEED)
+        self.navi.set_navigation_speed(RETURN_SPEED)
         if not self.navi.navigation_to_waypoint(
             mission_base.TAKEOFF_POINT,
             wait=True,
@@ -335,6 +368,11 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             raise RuntimeError("Yaw stabilization was not confirmed")
 
         self._clear_vision_samples()
+        self._pursuit_speed_schedule = PursuitSpeedSchedule(
+            initial_speed=PURSUIT_SPEED,
+            approach_speed=PURSUIT_APPROACH_SPEED,
+            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
+        )
         navi.set_navigation_speed(PURSUIT_SPEED)
         navi.switch_pid("navi")
         if not navi.navigation_follow_trajectory(
@@ -345,8 +383,13 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             raise RuntimeError("Failed to start task 2 pursuit trajectory")
         self.signals.send_pursuit_started()
         logger.info(
-            "[MISSION2] Pursuit trajectory started with {} points",
+            "[MISSION2] Pursuit trajectory started with {} points; "
+            "speed {}cm/s, then {}cm/s toward {}, then {}cm/s",
             len(self._pursuit_trajectory),
+            PURSUIT_SPEED,
+            PURSUIT_APPROACH_SPEED,
+            PURSUIT_SLOWDOWN_POINT,
+            PURSUIT_AFTER_SLOWDOWN_SPEED,
         )
 
         try:

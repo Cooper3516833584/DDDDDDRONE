@@ -15,6 +15,8 @@ from mission2_26_logic import (  # noqa: E402
     ARC_RADIUS,
     ARC_START,
     ENTRY_POINT,
+    PURSUIT_SLOWDOWN_POINT,
+    PursuitSpeedSchedule,
     ROUTE_END,
     RoutePassGate,
     TAKEOFF_POINT,
@@ -32,11 +34,16 @@ def test_pursuit_trajectory_geometry() -> None:
     )
     assert trajectory[0] == (TAKEOFF_POINT[0], TAKEOFF_POINT[1], 150.0)
     assert trajectory[1] == (ENTRY_POINT[0], ENTRY_POINT[1], 150.0)
-    assert trajectory[2] == (ARC_START[0], ARC_START[1], 150.0)
+    assert trajectory[2] == (
+        PURSUIT_SLOWDOWN_POINT[0],
+        PURSUIT_SLOWDOWN_POINT[1],
+        150.0,
+    )
+    assert trajectory[3] == (ARC_START[0], ARC_START[1], 150.0)
     assert trajectory[-2] == (ARC_END[0], ARC_END[1], 150.0)
     assert trajectory[-1] == (ROUTE_END[0], ROUTE_END[1], 150.0)
 
-    arc_points = trajectory[2:-1]
+    arc_points = trajectory[3:-1]
     assert len(arc_points) == 19
     for x, y, height in arc_points:
         assert height == 150.0
@@ -54,6 +61,40 @@ def test_pursuit_trajectory_geometry() -> None:
     assert arc_points[1][0] > arc_points[0][0]
     assert arc_points[1][1] < arc_points[0][1]
     assert trajectory[-1][0] < trajectory[-2][0]
+
+
+def test_pursuit_speed_schedule() -> None:
+    schedule = PursuitSpeedSchedule()
+    assert schedule.current_speed == 40.0
+    assert schedule.update(*ENTRY_POINT, *TAKEOFF_POINT) is None
+    assert (
+        schedule.update(
+            *PURSUIT_SLOWDOWN_POINT,
+            ENTRY_POINT[0],
+            ENTRY_POINT[1],
+        )
+        == 25.0
+    )
+    assert schedule.current_speed == 25.0
+    assert (
+        schedule.update(
+            *ARC_START,
+            PURSUIT_SLOWDOWN_POINT[0] - 0.1,
+            PURSUIT_SLOWDOWN_POINT[1],
+        )
+        is None
+    )
+    assert schedule.current_speed == 25.0
+    assert (
+        schedule.update(
+            *ARC_START,
+            PURSUIT_SLOWDOWN_POINT[0],
+            PURSUIT_SLOWDOWN_POINT[1],
+        )
+        == 15.0
+    )
+    assert schedule.current_speed == 15.0
+    assert schedule.update(*ARC_END, *ARC_START) is None
 
 
 def test_route_pass_gate() -> None:
@@ -270,6 +311,7 @@ def test_locked_red_led_dwell_and_cleanup() -> None:
 
 def main() -> None:
     test_pursuit_trajectory_geometry()
+    test_pursuit_speed_schedule()
     test_route_pass_gate()
     test_platform_retakeoff_uses_live_hold_point()
     test_target_landing_confirms_lock()
