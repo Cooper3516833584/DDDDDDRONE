@@ -126,6 +126,7 @@ def main() -> None:
     stop_event = threading.Event()
     navi: Optional[Navigation] = None
     mission: Optional[StaticTargetVisualLandingMission] = None
+    fleet_node = None
 
     try:
         fc.start_listen_serial(
@@ -161,10 +162,22 @@ def main() -> None:
             navi=navi,
             stop_event=stop_event,
         )
+        fleet_node = mission1.attach_air_fleet_node(
+            fc,
+            navi,
+            stop_event,
+            readonly=True,
+            state_provider=mission1.MissionFleetStateProvider(fc, navi, mission),
+        )
         mission.run()
     except KeyboardInterrupt:
         logger.warning("[TEST] Interrupted by user")
     except Exception:
+        if mission is not None:
+            mission.set_fleet_status(
+                mission1.MissionOperationState.FAULT,
+                error_code=1,
+            )
         logger.exception("[TEST] Static-target visual landing test failed")
     finally:
         if mission is not None:
@@ -194,6 +207,8 @@ def main() -> None:
         except Exception:
             logger.exception("[TEST] Failed to stop radar")
 
+        if fleet_node is not None:
+            fleet_node.close()
         try:
             fc.close()
         except Exception:
