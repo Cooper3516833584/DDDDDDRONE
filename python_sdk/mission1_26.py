@@ -517,7 +517,6 @@ class Mission:
         navi.pointing_takeoff(
             TAKEOFF_POINT,
             CRUISE_HEIGHT,
-            takeoff_alt_thres=13,
         )
 
         logger.info("[MISSION] Navigate to entry point {}", ENTRY_POINT)

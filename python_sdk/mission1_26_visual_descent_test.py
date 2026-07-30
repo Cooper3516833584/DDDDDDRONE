@@ -38,7 +38,6 @@ import mission1_26 as mission1
 from visual_target_descent import VisualTargetDescentController
 
 
-TAKEOFF_ALT_THRESHOLD = 13.0
 START_COMMAND = "s"
 DESCENT_TARGET_HEIGHT = 40.0
 LOW_HOVER_SECONDS = 2.0
@@ -310,7 +309,6 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         navi.pointing_takeoff(
             mission1.TAKEOFF_POINT,
             target_height=mission1.CRUISE_HEIGHT,
-            takeoff_alt_thres=TAKEOFF_ALT_THRESHOLD,
         )
         navi.set_yaw(0)
         if not navi.wait_for_yaw():

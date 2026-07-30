@@ -74,7 +74,6 @@ class StaticTargetVisualLandingMission(
         self.navi.pointing_takeoff(
             target_point,
             target_height=mission1.CRUISE_HEIGHT,
-            takeoff_alt_thres=descent_test.TAKEOFF_ALT_THRESHOLD,
         )
         self.navi.set_yaw(0)
         if not self.navi.wait_for_yaw():

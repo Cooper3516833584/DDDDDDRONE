@@ -172,7 +172,6 @@ class Mission:
         self.navi.pointing_takeoff(
             TAKEOFF_POINT,
             target_height=CRUISE_HEIGHT,
-            takeoff_alt_thres=13,
         )
 
         self.navi.set_yaw(0)
