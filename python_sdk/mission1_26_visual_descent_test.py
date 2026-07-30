@@ -35,6 +35,7 @@ from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
 import mission1_26 as mission1
+from visual_target_descent import VisualTargetDescentController
 
 
 TAKEOFF_ALT_THRESHOLD = 13.0
@@ -59,12 +60,20 @@ HEIGHT_CONFIRM_SECONDS = 0.4
 MAX_VISUAL_DESCENT_RECORDS = 3000
 
 
-def wait_for_terminal_start_command() -> None:
+def wait_for_terminal_start_command(
+    digital_output_enabled: bool = True,
+) -> None:
     """阻塞等待操作者在终端输入启动字符。"""
-    logger.warning(
-        "[TEST] Digital output 0 is enabled; enter '{}' to continue",
-        START_COMMAND,
-    )
+    if digital_output_enabled:
+        logger.warning(
+            "[TEST] Digital output 0 is enabled; enter '{}' to continue",
+            START_COMMAND,
+        )
+    else:
+        logger.warning(
+            "[TEST] Enter '{}' to continue",
+            START_COMMAND,
+        )
     while True:
         try:
             command = input(
@@ -131,6 +140,8 @@ class StaticTargetVisualDescentMission(mission1.Mission):
     后续移动目标伴飞下降时可传入伴飞速度估计，再叠加像素误差修正。
     """
 
+    LOG_PREFIX = "mission1_26_visual_descent_"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._visual_descent_records: Deque[Dict[str, object]] = deque(
@@ -138,21 +149,22 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         )
         self._visual_descent_records_dropped = 0
         self._digital_output_enabled = True
-
-    @staticmethod
-    def _limit_horizontal_velocity(vector: np.ndarray) -> np.ndarray:
-        speed = float(np.linalg.norm(vector))
-        if speed > VISUAL_HORIZONTAL_SPEED_LIMIT:
-            return vector * (VISUAL_HORIZONTAL_SPEED_LIMIT / speed)
-        return vector
-
-    @staticmethod
-    def _pixel_correction(x_px: float, y_px: float) -> np.ndarray:
-        error = np.array([x_px, y_px], dtype=float)
-        error[np.abs(error) <= VISUAL_CORRECTION_DEADBAND_PX] = 0.0
-        correction = error * VISUAL_CORRECTION_GAIN
-        return StaticTargetVisualDescentMission._limit_horizontal_velocity(
-            correction
+        self.visual_descent = VisualTargetDescentController(
+            fc=self.fc,
+            navi=self.navi,
+            stop_event=self.stop_event,
+            latest_vision_sample=self._latest_vision_sample,
+            raise_if_vision_failed=self._raise_if_vision_failed,
+            record_callback=self._record_visual_descent,
+            correction_gain=VISUAL_CORRECTION_GAIN,
+            correction_deadband_px=VISUAL_CORRECTION_DEADBAND_PX,
+            horizontal_speed_limit=VISUAL_HORIZONTAL_SPEED_LIMIT,
+            filter_alpha=VISUAL_FILTER_ALPHA,
+            control_period=VISUAL_CONTROL_PERIOD_SECONDS,
+            vision_sample_stale_seconds=(
+                mission1.VISION_SAMPLE_STALE_SECONDS
+            ),
+            vision_loss_timeout=VISION_LOSS_TIMEOUT_SECONDS,
         )
 
     def _record_visual_descent(
@@ -188,185 +200,27 @@ class StaticTargetVisualDescentMission(mission1.Mission):
             }
         )
 
-    def _set_visual_horizontal_command(self, vel_x: int, vel_y: int) -> None:
-        # track_landing_marker 与飞控实时控制均采用前/左为正的机体系。
-        self.navi.update_realtime_control(
-            vel_x=int(vel_x),
-            vel_y=int(vel_y),
-            yaw=0,
-        )
-
     def visual_descend_and_hover(
         self,
         target_height: float,
         hover_seconds: float,
         base_velocity: Tuple[float, float] = (0.0, 0.0),
     ) -> None:
-        """
-        下降过程中用视觉修正水平位置，并在目标高度继续视觉悬停。
+        """调用共用视觉下降控制器，并在到达高度时关闭数字输出。"""
 
-        base_velocity 是目标移动速度的估计值，单位 cm/s、前/左为正。
-        静止目标使用 (0, 0)。视觉丢失时不继续发送旧水平速度，并暂停
-        下降；在限定时间内未重新发现目标则中止测试并保持当前高度。
-        """
-        target_height = float(target_height)
-        hover_seconds = float(hover_seconds)
-        base = np.asarray(base_velocity, dtype=float)
-        if (
-            target_height < 0
-            or hover_seconds < 0
-            or base.shape != (2,)
-            or not np.all(np.isfinite(base))
-        ):
-            raise ValueError("Invalid visual descent parameters")
-        base = self._limit_horizontal_velocity(base)
+        def disable_digital_output() -> None:
+            self.fc.set_digital_output(0, False)
+            self._digital_output_enabled = False
+            logger.info("[TEST] Digital output 0 disabled")
 
-        navi = self.navi
-        navi.navigation_stop_here()
-        navi.navigation_flag = False
-        navi.keep_height_flag = True
-        navi.set_height(target_height)
-
-        filtered_velocity = base.copy()
-        started_at = time.monotonic()
-        lost_started_at: Optional[float] = None
-        height_reached_since: Optional[float] = None
-        low_hover_elapsed = 0.0
-        last_loop_at = started_at
-        descent_reached = False
-        logger.info(
-            "[TEST] Visual descent started: target={}cm, base=({:.1f}, {:.1f})cm/s",
-            target_height,
-            base[0],
-            base[1],
-        )
-
-        try:
-            while not self.stop_event.is_set():
-                now = time.monotonic()
-                dt = min(max(now - last_loop_at, 0.0), 0.2)
-                last_loop_at = now
-
-                state_fresh = bool(
-                    getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
-                )
-                if not state_fresh:
-                    raise RuntimeError("Flight-controller telemetry became stale")
-                if not self.fc.state.unlock.value:
-                    raise RuntimeError("Aircraft locked during visual descent")
-                if not navi.pose_is_fresh():
-                    raise RuntimeError("Radar navigation pose became stale")
-                if (
-                    not descent_reached
-                    and now - started_at > DESCENT_TIMEOUT_SECONDS
-                ):
-                    raise RuntimeError("Visual descent height timeout")
-
-                self._raise_if_vision_failed()
-                sample = self._latest_vision_sample()
-                sample_fresh = bool(
-                    sample is not None
-                    and now - sample[1] <= mission1.VISION_SAMPLE_STALE_SECONDS
-                    and sample[2] is not None
-                    and sample[3] is not None
-                )
-
-                if not sample_fresh:
-                    if lost_started_at is None:
-                        lost_started_at = now
-                        navi.set_height(float(navi.current_height))
-                        logger.warning(
-                            "[TEST] Marker lost; pause descent and clear horizontal speed"
-                        )
-                    self._set_visual_horizontal_command(0, 0)
-                    self._record_visual_descent(
-                        started_at,
-                        "vision_lost",
-                        None,
-                        None,
-                        0,
-                        0,
-                    )
-                    if now - lost_started_at > VISION_LOSS_TIMEOUT_SECONDS:
-                        raise RuntimeError(
-                            "Marker was not reacquired during visual descent"
-                        )
-                    self.stop_event.wait(VISUAL_CONTROL_PERIOD_SECONDS)
-                    continue
-
-                _, _, x_px_value, y_px_value = sample
-                x_px = float(x_px_value)
-                y_px = float(y_px_value)
-                if lost_started_at is not None:
-                    lost_started_at = None
-                    navi.set_height(target_height)
-                    logger.info("[TEST] Marker reacquired; resume descent")
-
-                desired_velocity = base + self._pixel_correction(x_px, y_px)
-                desired_velocity = self._limit_horizontal_velocity(
-                    desired_velocity
-                )
-                filtered_velocity += VISUAL_FILTER_ALPHA * (
-                    desired_velocity - filtered_velocity
-                )
-                filtered_velocity = self._limit_horizontal_velocity(
-                    filtered_velocity
-                )
-                vel_x = int(round(float(filtered_velocity[0])))
-                vel_y = int(round(float(filtered_velocity[1])))
-                self._set_visual_horizontal_command(vel_x, vel_y)
-
-                height_in_range = bool(
-                    abs(float(navi.current_height) - target_height)
-                    <= HEIGHT_TOLERANCE
-                )
-                if not descent_reached:
-                    if height_in_range:
-                        if height_reached_since is None:
-                            height_reached_since = now
-                        elif now - height_reached_since >= HEIGHT_CONFIRM_SECONDS:
-                            descent_reached = True
-                            low_hover_elapsed = 0.0
-                            self.fc.set_digital_output(0, False)
-                            self._digital_output_enabled = False
-                            logger.info(
-                                "[TEST] Reached {}cm; digital output 0 disabled; "
-                                "start {:.1f}s visual hover",
-                                target_height,
-                                hover_seconds,
-                            )
-                    else:
-                        height_reached_since = None
-                    phase = "height_confirm" if height_in_range else "descent"
-                else:
-                    phase = "low_hover"
-                    if height_in_range:
-                        low_hover_elapsed += dt
-                    else:
-                        low_hover_elapsed = 0.0
-                    if low_hover_elapsed >= hover_seconds:
-                        break
-
-                self._record_visual_descent(
-                    started_at,
-                    phase,
-                    x_px,
-                    y_px,
-                    vel_x,
-                    vel_y,
-                )
-                self.stop_event.wait(VISUAL_CONTROL_PERIOD_SECONDS)
-
-            if self.stop_event.is_set():
-                raise RuntimeError("Mission stopped during visual descent")
-        finally:
-            # 退出视觉接管后，以当前点恢复水平 PID；高度 PID 保持当前设定值。
-            self._set_visual_horizontal_command(0, 0)
-            navi.stop_move()
-
-        logger.info(
-            "[TEST] Visual descent and {:.1f}s low hover completed",
-            hover_seconds,
+        self.visual_descent.descend_to_height(
+            target_height=target_height,
+            hover_seconds=hover_seconds,
+            base_velocity=base_velocity,
+            height_tolerance=HEIGHT_TOLERANCE,
+            height_confirm_time=HEIGHT_CONFIRM_SECONDS,
+            timeout=DESCENT_TIMEOUT_SECONDS,
+            on_height_reached=disable_digital_output,
         )
 
     def write_visual_descent_log(self) -> Optional[Path]:
@@ -378,7 +232,7 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         log_dir = Path(__file__).resolve().parent / "fc_log"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / (
-            "mission1_26_visual_descent_"
+            self.LOG_PREFIX
             + datetime.now().strftime("%Y%m%d_%H%M%S")
             + ".csv"
         )
@@ -405,6 +259,35 @@ class StaticTargetVisualDescentMission(mission1.Mission):
             )
         logger.info("[TEST] Visual-descent log written to {}", log_path)
         return log_path
+
+    def _perform_target_action(self) -> None:
+        """指定高度下降、关闭数字输出、悬停两秒并回升巡航高度。"""
+        self.visual_descend_and_hover(
+            target_height=DESCENT_TARGET_HEIGHT,
+            hover_seconds=LOW_HOVER_SECONDS,
+            base_velocity=(0.0, 0.0),
+        )
+        self._stop_vision_tracker()
+
+        self.navi.set_height(float(mission1.CRUISE_HEIGHT))
+        self.navi.keep_height_flag = True
+        if not self.navi.wait_for_height(
+            height_thres=HEIGHT_TOLERANCE,
+            timeout=ASCENT_TIMEOUT_SECONDS,
+        ):
+            raise RuntimeError("Failed to return to cruise height")
+        logger.info(
+            "[TEST] Returned to {}cm cruise height",
+            mission1.CRUISE_HEIGHT,
+        )
+
+    def _finish_at_takeoff_point(self) -> None:
+        """指定高度测试返航后沿用原有定点降落。"""
+        if not self.navi.pointing_landing(
+            mission1.TAKEOFF_POINT,
+            height_timeout=LANDING_HEIGHT_TIMEOUT_SECONDS,
+        ):
+            raise RuntimeError("Failed to land at takeoff point")
 
     def run(self) -> None:
         navi = self.navi
@@ -450,30 +333,12 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         logger.info("[TEST] Pursuing stationary target along +x")
         self._wait_until_target_detected(forward_target[0])
 
-        self.visual_descend_and_hover(
-            target_height=DESCENT_TARGET_HEIGHT,
-            hover_seconds=LOW_HOVER_SECONDS,
-            base_velocity=(0.0, 0.0),
-        )
-        self._stop_vision_tracker()
-
-        navi.set_height(float(mission1.CRUISE_HEIGHT))
-        navi.keep_height_flag = True
-        if not navi.wait_for_height(
-            height_thres=HEIGHT_TOLERANCE,
-            timeout=ASCENT_TIMEOUT_SECONDS,
-        ):
-            raise RuntimeError("Failed to return to cruise height")
-        logger.info("[TEST] Returned to {}cm cruise height", mission1.CRUISE_HEIGHT)
+        self._perform_target_action()
 
         navi.set_navigation_speed(mission1.PURSUIT_SPEED)
         if not navi.navigation_to_waypoint(mission1.TAKEOFF_POINT, wait=True):
             raise RuntimeError("Failed to return to takeoff point")
-        if not navi.pointing_landing(
-            mission1.TAKEOFF_POINT,
-            height_timeout=LANDING_HEIGHT_TIMEOUT_SECONDS,
-        ):
-            raise RuntimeError("Failed to land at takeoff point")
+        self._finish_at_takeoff_point()
         logger.info("[TEST] Visual descent flight completed")
 
 
