@@ -173,7 +173,7 @@ class Mission:
         self.navi.set_yaw(0)
         if not self.navi.wait_for_yaw():
             raise RuntimeError("yaw stabilization was not confirmed")
-        
+
         if not self.navi.moving_landing(
             horizontal_speed=CRUISE_SPEED,
             direction_deg=0,
