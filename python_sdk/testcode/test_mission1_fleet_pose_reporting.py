@@ -52,6 +52,9 @@ sys.modules.update(stub_modules)
 
 from mission1_26_base import (
     FLEET_TRACE_DRAIN_TIMEOUT_SECONDS,
+    FLEET_TRACE_MIN_DISTANCE_CM,
+    FLEET_TRACE_SAMPLE_INTERVAL_SECONDS,
+    FLEET_TRACE_STATIONARY_KEEPALIVE_SECONDS,
     Mission,
     MissionFleetStateProvider,
     MissionOperationState,
@@ -109,6 +112,11 @@ class FakeMission:
 
 
 class MissionFleetPoseReportingTests(unittest.TestCase):
+    def test_mission_trace_density_matches_ground_batch_capacity(self):
+        self.assertEqual(0.25, FLEET_TRACE_SAMPLE_INTERVAL_SECONDS)
+        self.assertEqual(2.0, FLEET_TRACE_MIN_DISTANCE_CM)
+        self.assertEqual(1.0, FLEET_TRACE_STATIONARY_KEEPALIVE_SECONDS)
+
     def test_terminal_trace_drain_uses_bounded_timeout(self):
         class FleetNode:
             timeout = None

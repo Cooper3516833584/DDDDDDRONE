@@ -561,10 +561,12 @@ def main() -> None:
             ),
             trace_options=TraceSamplingOptions(
                 enabled=True,
-                sample_interval_s=0.50,
+                sample_interval_s=mission_base.FLEET_TRACE_SAMPLE_INTERVAL_SECONDS,
                 buffer_capacity=600,
-                min_distance_cm=5.0,
-                stationary_keepalive_s=2.0,
+                min_distance_cm=mission_base.FLEET_TRACE_MIN_DISTANCE_CM,
+                stationary_keepalive_s=(
+                    mission_base.FLEET_TRACE_STATIONARY_KEEPALIVE_SECONDS
+                ),
             ),
         )
         mission.bind_ground_commands(fleet_node.command_queue)
