@@ -442,21 +442,38 @@ def attach_air_fleet_node(
     state_provider: Optional[Callable[[], object]] = None,
     trace_options: TraceSamplingOptions = TraceSamplingOptions(),
     allowed_readonly_command_ids=frozenset(),
+    hc14_port: Optional[str] = None,
+    hc14_baudrate: Optional[int] = None,
+    transport_factory=None,
 ) -> AirFleetNode:
-    """Create the one FCWirelessTransport callback owner for FleetBus mode.
+    """Create the airborne FleetBus endpoint on its direct CH340/HC-14 link.
 
     ``state_provider`` lets a task add task-defined report fields without
     changing the navigation pose conversion shared by other missions.
     """
-    from FlightController.Components.GroundStationLink.transport import (
-        FCWirelessTransport,
+    from .hc14_transport import (
+        HC14FleetTransport,
+        resolve_hc14_settings,
     )
 
     from .pose_provider import NavigationAirStateProvider
 
     holder = {}
-    transport = FCWirelessTransport(
-        fc, on_bytes=lambda data: holder["node"].feed_bytes(data)
+    port, baudrate = resolve_hc14_settings(hc14_port, hc14_baudrate)
+    factory = HC14FleetTransport if transport_factory is None else transport_factory
+    transport = factory(
+        port=port,
+        baudrate=baudrate,
+        on_bytes=lambda data: holder["node"].feed_bytes(data),
+        on_connected=lambda: LOG.info(
+            "Airborne HC-14 connected directly on %s at %s baud",
+            port,
+            baudrate,
+        ),
+        on_disconnected=lambda error: LOG.warning(
+            "Airborne HC-14 direct link disconnected: %s",
+            error,
+        ),
     )
     commands = AirCommandQueue()
     default_state_provider = NavigationAirStateProvider(

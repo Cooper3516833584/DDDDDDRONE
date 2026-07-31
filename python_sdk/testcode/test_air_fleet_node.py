@@ -2,7 +2,7 @@ import threading
 import time
 import unittest
 
-from fleet_bus.air_node import AirFleetNode
+from fleet_bus.air_node import AirFleetNode, attach_air_fleet_node
 from fleet_bus.command_queue import AirCommandQueue
 from fleet_bus.models import (
     AckReason,
@@ -62,8 +62,17 @@ class FailOnceTransport(FakeTransport):
     def write(self, data):
         if self.failures_remaining:
             self.failures_remaining -= 1
-            raise RuntimeError("simulated FC ACK timeout")
+            raise RuntimeError("simulated serial write failure")
         super().write(data)
+
+
+class RecordingTransport(FakeTransport):
+    instance = None
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.kwargs = kwargs
+        RecordingTransport.instance = self
 
 
 def request(seq, command=None, session=10):
@@ -99,6 +108,31 @@ def trace_request(seq, value=None, session=10, payload=None):
 class AirFleetNodeTests(unittest.TestCase):
     def test_default_turnaround_supports_dense_pose_polling(self):
         self.assertAlmostEqual(0.10, NodeTiming().turnaround_s)
+
+    def test_attach_uses_direct_hc14_transport_without_fc_wireless_callback(self):
+        class FC:
+            state = None
+
+            def register_wireless_callback(self, *_args, **_kwargs):
+                raise AssertionError("direct HC-14 must not register an FC callback")
+
+        node = attach_air_fleet_node(
+            FC(),
+            navigation=object(),
+            stop_event=threading.Event(),
+            state_provider=lambda: self.state,
+            hc14_port="/dev/test-hc14",
+            hc14_baudrate=115200,
+            transport_factory=RecordingTransport,
+        )
+        try:
+            transport = RecordingTransport.instance
+            self.assertIsNotNone(transport)
+            self.assertTrue(transport.started)
+            self.assertEqual("/dev/test-hc14", transport.kwargs["port"])
+            self.assertEqual(115200, transport.kwargs["baudrate"])
+        finally:
+            node.close()
 
     def setUp(self):
         self.transport = FakeTransport()
