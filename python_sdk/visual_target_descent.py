@@ -26,6 +26,8 @@ BaseVelocityProvider = Callable[
     [float, float, float],
     Tuple[float, float],
 ]
+TargetOffsetProvider = Callable[[float], Tuple[float, float]]
+HorizontalCommandGuard = Callable[[int, int], Tuple[int, int]]
 PreDescentGate = Callable[[], bool]
 RecordCallback = Callable[
     [float, str, Optional[float], Optional[float], int, int],
@@ -243,6 +245,8 @@ class VisualTargetDescentController:
         on_descent_start: Optional[Callable[[], None]] = None,
         pre_descent_gate: Optional[PreDescentGate] = None,
         pre_descent_max_error_px: Optional[float] = None,
+        target_offset_provider: Optional[TargetOffsetProvider] = None,
+        horizontal_command_guard: Optional[HorizontalCommandGuard] = None,
     ) -> None:
         """视觉伴飞后下降到指定激光高度，并继续悬停指定时间。"""
         values = np.asarray(
@@ -287,6 +291,14 @@ class VisualTargetDescentController:
             raise ValueError("on_descent_start must be callable")
         if pre_descent_gate is not None and not callable(pre_descent_gate):
             raise ValueError("pre_descent_gate must be callable")
+        if target_offset_provider is not None and not callable(
+            target_offset_provider
+        ):
+            raise ValueError("target_offset_provider must be callable")
+        if horizontal_command_guard is not None and not callable(
+            horizontal_command_guard
+        ):
+            raise ValueError("horizontal_command_guard must be callable")
         if pre_descent_max_error_px is not None:
             pre_descent_max_error_px = float(pre_descent_max_error_px)
             if (
@@ -426,12 +438,54 @@ class VisualTargetDescentController:
                 elif base_velocity_provider is None:
                     current_base = base
 
+                control_x_px = x_px
+                control_y_px = y_px
+                if target_offset_provider is not None:
+                    target_offset = np.asarray(
+                        target_offset_provider(
+                            float(self.navi.current_height)
+                        ),
+                        dtype=float,
+                    )
+                    if (
+                        target_offset.shape != (2,)
+                        or not np.all(np.isfinite(target_offset))
+                    ):
+                        raise ValueError(
+                            "target_offset_provider must return "
+                            "two finite values"
+                        )
+                    control_x_px += float(target_offset[0])
+                    control_y_px += float(target_offset[1])
+
                 filtered, vel_x, vel_y = self._next_horizontal_velocity(
                     current_base,
                     filtered,
-                    x_px,
-                    y_px,
+                    control_x_px,
+                    control_y_px,
                 )
+                if horizontal_command_guard is not None:
+                    guarded_command = np.asarray(
+                        horizontal_command_guard(vel_x, vel_y),
+                        dtype=float,
+                    )
+                    if (
+                        guarded_command.shape != (2,)
+                        or not np.all(np.isfinite(guarded_command))
+                    ):
+                        raise ValueError(
+                            "horizontal_command_guard must return "
+                            "two finite values"
+                        )
+                    if float(np.linalg.norm(guarded_command)) > (
+                        self.horizontal_speed_limit
+                    ):
+                        raise ValueError(
+                            "horizontal_command_guard must not increase "
+                            "command above the horizontal speed limit"
+                        )
+                    vel_x = int(round(float(guarded_command[0])))
+                    vel_y = int(round(float(guarded_command[1])))
                 self._update_override(vel_x, vel_y)
 
                 if not pre_descent_complete:

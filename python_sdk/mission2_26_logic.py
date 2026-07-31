@@ -17,6 +17,123 @@ ROUTE_END = (87.5, -187.5)
 ROUTE_GATE_RADIUS = 7.5
 
 
+@dataclass(frozen=True)
+class ClockwiseArcVelocityPredictor:
+    """在已知顺时针圆弧内旋转上一帧目标速度估计。"""
+
+    center: Tuple[float, float] = ARC_CENTER
+    radius: float = ARC_RADIUS
+    start: Tuple[float, float] = ARC_START
+    end: Tuple[float, float] = ARC_END
+    position_tolerance: float = 20.0
+
+    def __post_init__(self) -> None:
+        values = (
+            self.center[0],
+            self.center[1],
+            self.radius,
+            self.start[0],
+            self.start[1],
+            self.end[0],
+            self.end[1],
+            self.position_tolerance,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("Arc predictor parameters must be finite")
+        if (
+            float(self.radius) <= 0
+            or float(self.position_tolerance) < 0
+        ):
+            raise ValueError(
+                "Arc radius must be positive and tolerance non-negative"
+            )
+
+    def is_on_arc(self, x: float, y: float) -> bool:
+        x = float(x)
+        y = float(y)
+        if not math.isfinite(x) or not math.isfinite(y):
+            return False
+        lower_y = min(float(self.start[1]), float(self.end[1]))
+        upper_y = max(float(self.start[1]), float(self.end[1]))
+        if not lower_y < y < upper_y:
+            return False
+        radial_distance = math.hypot(
+            x - float(self.center[0]),
+            y - float(self.center[1]),
+        )
+        return bool(
+            x >= float(self.center[0]) - float(self.position_tolerance)
+            and abs(radial_distance - float(self.radius))
+            <= float(self.position_tolerance)
+        )
+
+    def predict(
+        self,
+        velocity: Tuple[float, float],
+        sample_dt: float,
+        x: float,
+        y: float,
+    ) -> Tuple[float, float]:
+        vx = float(velocity[0])
+        vy = float(velocity[1])
+        dt = float(sample_dt)
+        if not all(math.isfinite(value) for value in (vx, vy, dt)):
+            raise ValueError("Arc predictor inputs must be finite")
+        if dt < 0:
+            raise ValueError("sample_dt must be non-negative")
+        if dt == 0 or not self.is_on_arc(x, y):
+            return vx, vy
+
+        speed = math.hypot(vx, vy)
+        if speed == 0:
+            return vx, vy
+        angle = speed * dt / float(self.radius)
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        return (
+            cosine * vx + sine * vy,
+            -sine * vx + cosine * vy,
+        )
+
+
+@dataclass(frozen=True)
+class LowAltitudeTargetOffset:
+    """从起始高度到最终高度线性加入视觉目标点偏置。"""
+
+    start_height: float = 50.0
+    final_height: float = 25.0
+    final_x_px: float = -30.0
+    final_y_px: float = 0.0
+
+    def __post_init__(self) -> None:
+        values = (
+            self.start_height,
+            self.final_height,
+            self.final_x_px,
+            self.final_y_px,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("Low-altitude target-offset parameters must be finite")
+        if float(self.start_height) <= float(self.final_height):
+            raise ValueError("start_height must be greater than final_height")
+
+    def offset(self, height: float) -> Tuple[float, float]:
+        height = float(height)
+        if not math.isfinite(height):
+            raise ValueError("height must be finite")
+        start_height = float(self.start_height)
+        final_height = float(self.final_height)
+        progress = (
+            (start_height - height)
+            / (start_height - final_height)
+        )
+        progress = min(max(progress, 0.0), 1.0)
+        return (
+            float(self.final_x_px) * progress,
+            float(self.final_y_px) * progress,
+        )
+
+
 def build_pursuit_trajectory(
     altitude: float = 150.0,
     arc_step_degrees: int = 10,
@@ -289,7 +406,9 @@ __all__ = [
     "ARC_END",
     "ARC_RADIUS",
     "ARC_START",
+    "ClockwiseArcVelocityPredictor",
     "ENTRY_POINT",
+    "LowAltitudeTargetOffset",
     "PURSUIT_SLOWDOWN_POINT",
     "PursuitSpeedSchedule",
     "ROUTE_END",

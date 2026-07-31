@@ -108,6 +108,39 @@ def test_estimator() -> None:
             raise AssertionError("Invalid moving-target config was accepted")
 
 
+def test_estimator_velocity_predictor() -> None:
+    estimator = _new_estimator()
+    estimator.reset((10.0, 0.0))
+    predictor_calls = []
+
+    def predictor(velocity, sample_dt):
+        predictor_calls.append((velocity, sample_dt))
+        return 0.0, -10.0
+
+    assert np.allclose(
+        estimator.update(
+            0.0,
+            0.0,
+            1.0,
+            velocity_predictor=predictor,
+        ),
+        (0.0, -10.0),
+    )
+    assert predictor_calls == [((10.0, 0.0), 0.2)]
+
+    try:
+        estimator.update(
+            0.0,
+            0.0,
+            0.1,
+            velocity_predictor=lambda _velocity, _dt: (math.nan, 0.0),
+        )
+    except ValueError as exc:
+        assert "two finite values" in str(exc)
+    else:
+        raise AssertionError("Invalid velocity prediction was accepted")
+
+
 class _Value:
     def __init__(self, value):
         self.value = value
@@ -240,6 +273,98 @@ def test_provider_once_per_sequence_and_command_limit() -> None:
     )
     assert math.hypot(*filtered) <= 15.0
     assert math.hypot(vel_x, vel_y) <= 15.0
+
+
+def test_low_altitude_target_offset_changes_only_control_error() -> None:
+    _FakeTime.now = 0.0
+    navi = _Navigation()
+    recorded_offsets = []
+    sample = (1, 0.0, 0.0, 0.0)
+    controller = visual_target_descent.VisualTargetDescentController(
+        fc=_FC(),
+        navi=navi,
+        stop_event=_StopEvent(),
+        latest_vision_sample=lambda: sample,
+        raise_if_vision_failed=lambda: None,
+        record_callback=(
+            lambda _started, _phase, x_px, y_px, _vx, _vy:
+            recorded_offsets.append((x_px, y_px))
+        ),
+        correction_gain=0.15,
+        correction_deadband_px=3.0,
+        horizontal_speed_limit=15.0,
+        filter_alpha=0.25,
+        control_period=0.05,
+        vision_sample_stale_seconds=0.35,
+        vision_loss_timeout=1.0,
+    )
+    original_time = visual_target_descent.time
+    visual_target_descent.time = _FakeTime
+    try:
+        controller.descend_to_height(
+            target_height=25.0,
+            hover_seconds=0.0,
+            height_confirm_time=0.05,
+            timeout=1.0,
+            target_offset_provider=lambda _height: (-30.0, 0.0),
+        )
+    finally:
+        visual_target_descent.time = original_time
+
+    assert recorded_offsets
+    assert all(offset == (0.0, 0.0) for offset in recorded_offsets)
+    assert any(command[0] < 0 for command in navi.commands)
+    assert all(command[1] == 0 for command in navi.commands)
+
+
+def test_horizontal_command_guard_runs_before_send_and_record() -> None:
+    _FakeTime.now = 0.0
+    navi = _Navigation()
+    guarded_inputs = []
+    recorded_commands = []
+    sample = (1, 0.0, 100.0, 20.0)
+    controller = visual_target_descent.VisualTargetDescentController(
+        fc=_FC(),
+        navi=navi,
+        stop_event=_StopEvent(),
+        latest_vision_sample=lambda: sample,
+        raise_if_vision_failed=lambda: None,
+        record_callback=(
+            lambda _started, _phase, _x, _y, vx, vy:
+            recorded_commands.append((vx, vy))
+        ),
+        correction_gain=0.15,
+        correction_deadband_px=3.0,
+        horizontal_speed_limit=15.0,
+        filter_alpha=0.25,
+        control_period=0.05,
+        vision_sample_stale_seconds=0.35,
+        vision_loss_timeout=1.0,
+    )
+
+    def guard(velocity_x, velocity_y):
+        guarded_inputs.append((velocity_x, velocity_y))
+        return 0, velocity_y
+
+    original_time = visual_target_descent.time
+    visual_target_descent.time = _FakeTime
+    try:
+        controller.descend_to_height(
+            target_height=100.0,
+            hover_seconds=0.0,
+            height_confirm_time=0.05,
+            timeout=1.0,
+            horizontal_command_guard=guard,
+        )
+    finally:
+        visual_target_descent.time = original_time
+
+    assert guarded_inputs
+    assert any(command[0] > 0 for command in guarded_inputs)
+    assert navi.commands
+    assert all(command[0] == 0 for command in navi.commands)
+    assert recorded_commands
+    assert all(command[0] == 0 for command in recorded_commands)
 
 
 def test_loss_resets_continuous_follow_timer() -> None:
@@ -378,7 +503,10 @@ def test_external_gate_total_timeout() -> None:
 
 def main() -> None:
     test_estimator()
+    test_estimator_velocity_predictor()
     test_provider_once_per_sequence_and_command_limit()
+    test_low_altitude_target_offset_changes_only_control_error()
+    test_horizontal_command_guard_runs_before_send_and_record()
     test_loss_resets_continuous_follow_timer()
     test_continuous_follow_total_timeout()
     test_stability_error_limit_and_external_gate()

@@ -14,7 +14,9 @@ from mission2_26_logic import (  # noqa: E402
     ARC_END,
     ARC_RADIUS,
     ARC_START,
+    ClockwiseArcVelocityPredictor,
     ENTRY_POINT,
+    LowAltitudeTargetOffset,
     PURSUIT_SLOWDOWN_POINT,
     PursuitSpeedSchedule,
     ROUTE_END,
@@ -25,6 +27,7 @@ from mission2_26_logic import (  # noqa: E402
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
 )
+from mission2_26_safety import EscortXBoundaryVelocityGuard  # noqa: E402
 
 
 def test_pursuit_trajectory_geometry() -> None:
@@ -61,6 +64,55 @@ def test_pursuit_trajectory_geometry() -> None:
     assert arc_points[1][0] > arc_points[0][0]
     assert arc_points[1][1] < arc_points[0][1]
     assert trajectory[-1][0] < trajectory[-2][0]
+
+
+def test_clockwise_arc_velocity_prediction() -> None:
+    predictor = ClockwiseArcVelocityPredictor()
+    assert predictor.predict(
+        (10.0, 0.0),
+        0.1,
+        PURSUIT_SLOWDOWN_POINT[0],
+        PURSUIT_SLOWDOWN_POINT[1],
+    ) == (10.0, 0.0)
+
+    velocity = (10.0, 0.0)
+    sample_dt = math.pi * ARC_RADIUS / 10.0 / 180.0
+    for index in range(180):
+        position_angle = math.radians(89.5 - index)
+        x = ARC_CENTER[0] + ARC_RADIUS * math.cos(position_angle)
+        y = ARC_CENTER[1] + ARC_RADIUS * math.sin(position_angle)
+        velocity = predictor.predict(velocity, sample_dt, x, y)
+
+    assert math.isclose(velocity[0], -10.0, abs_tol=1e-9)
+    assert math.isclose(velocity[1], 0.0, abs_tol=1e-9)
+    assert math.isclose(math.hypot(*velocity), 10.0, abs_tol=1e-9)
+
+
+def test_low_altitude_target_offset() -> None:
+    offset = LowAltitudeTargetOffset(
+        start_height=50.0,
+        final_height=25.0,
+        final_x_px=-30.0,
+    )
+    assert offset.offset(60.0) == (0.0, 0.0)
+    assert offset.offset(50.0) == (0.0, 0.0)
+    assert offset.offset(37.5) == (-15.0, 0.0)
+    assert offset.offset(25.0) == (-30.0, 0.0)
+    assert offset.offset(10.0) == (-30.0, 0.0)
+
+
+def test_escort_x_boundary_velocity_guard() -> None:
+    guard = EscortXBoundaryVelocityGuard(max_x=357.5)
+    assert guard.apply(357.5, 8, -3) == (8, -3)
+    assert guard.apply(357.5001, 8, -3) == (0, -3)
+    assert guard.apply(400.0, -8, 3) == (0, 3)
+
+    try:
+        guard.apply(math.nan, 8, 3)
+    except ValueError as exc:
+        assert "current_x" in str(exc)
+    else:
+        raise AssertionError("Invalid navigation position was accepted")
 
 
 def test_pursuit_speed_schedule() -> None:
@@ -311,6 +363,9 @@ def test_locked_red_led_dwell_and_cleanup() -> None:
 
 def main() -> None:
     test_pursuit_trajectory_geometry()
+    test_clockwise_arc_velocity_prediction()
+    test_low_altitude_target_offset()
+    test_escort_x_boundary_velocity_guard()
     test_pursuit_speed_schedule()
     test_route_pass_gate()
     test_platform_retakeoff_uses_live_hold_point()

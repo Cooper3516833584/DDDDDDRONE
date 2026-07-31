@@ -20,6 +20,8 @@ import mission1_26_base as mission_base
 import mission1_26_visual_descent_test as descent_test
 from mission2_26_logic import (
     ARC_END,
+    ClockwiseArcVelocityPredictor,
+    LowAltitudeTargetOffset,
     PURSUIT_SLOWDOWN_POINT,
     PursuitSpeedSchedule,
     ROUTE_GATE_RADIUS,
@@ -29,6 +31,7 @@ from mission2_26_logic import (
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
 )
+from mission2_26_safety import EscortXBoundaryVelocityGuard
 from visual_target_descent import PreDescentTimeoutError
 
 
@@ -40,11 +43,15 @@ PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
 RETURN_SPEED = 40.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
+ARC_VELOCITY_POSITION_TOLERANCE = 20.0
+ESCORT_MAX_X = 357.5
 
 ESCORT_SPEED_MIDPOINT = 10.0
 ESCORT_STABLE_SECONDS = 4.0
 ESCORT_GATE_TIMEOUT_SECONDS = 90.0
 TARGET_LANDING_HEIGHT = 25.0
+TARGET_OFFSET_START_HEIGHT = 50.0
+TARGET_OFFSET_FINAL_X_PX = -30.0
 TARGET_DESCENT_TIMEOUT_SECONDS = 15.0
 TARGET_LANDING_LOCK_TIMEOUT_SECONDS = 20.0
 LOCKED_DWELL_SECONDS = 5.0
@@ -110,6 +117,19 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         self.signals = Mission2Signals(self)
         self._digital_output_enabled = False
         self._route_gate = RoutePassGate(radius=ROUTE_GATE_RADIUS)
+        self._arc_velocity_predictor = ClockwiseArcVelocityPredictor(
+            position_tolerance=ARC_VELOCITY_POSITION_TOLERANCE,
+        )
+        self._low_altitude_target_offset = LowAltitudeTargetOffset(
+            start_height=TARGET_OFFSET_START_HEIGHT,
+            final_height=TARGET_LANDING_HEIGHT,
+            final_x_px=TARGET_OFFSET_FINAL_X_PX,
+            final_y_px=0.0,
+        )
+        self._escort_x_boundary_guard = EscortXBoundaryVelocityGuard(
+            max_x=ESCORT_MAX_X,
+        )
+        self._escort_x_boundary_active = False
         self._pursuit_speed_schedule = PursuitSpeedSchedule(
             initial_speed=PURSUIT_SPEED,
             approach_speed=PURSUIT_APPROACH_SPEED,
@@ -211,6 +231,43 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         raise RuntimeError("Task 2 stopped during target pursuit")
 
     def _follow_descend_and_land_on_target(self) -> None:
+        def predict_target_velocity(
+            velocity: Tuple[float, float],
+            sample_dt: float,
+        ) -> Tuple[float, float]:
+            return self._arc_velocity_predictor.predict(
+                velocity,
+                sample_dt,
+                self.navi.current_x,
+                self.navi.current_y,
+            )
+
+        def apply_escort_boundary(
+            velocity_x: int,
+            velocity_y: int,
+        ) -> Tuple[int, int]:
+            active = self._escort_x_boundary_guard.is_active(
+                self.navi.current_x
+            )
+            if active and not self._escort_x_boundary_active:
+                logger.warning(
+                    "[MISSION2-SAFETY] x={:.1f}cm exceeds {:.1f}cm; "
+                    "force escort vx to zero",
+                    self.navi.current_x,
+                    ESCORT_MAX_X,
+                )
+            elif not active and self._escort_x_boundary_active:
+                logger.info(
+                    "[MISSION2-SAFETY] x returned within boundary; "
+                    "release escort vx guard"
+                )
+            self._escort_x_boundary_active = active
+            return self._escort_x_boundary_guard.apply(
+                self.navi.current_x,
+                velocity_x,
+                velocity_y,
+            )
+
         final_velocity = self.moving_target_descent.follow_and_descend(
             target_height=TARGET_LANDING_HEIGHT,
             stabilize_seconds=ESCORT_STABLE_SECONDS,
@@ -223,6 +280,9 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             on_descent_start=self.signals.send_target_descent_started,
             pre_descent_gate=self._route_gate_is_open,
             pre_descent_max_error_px=TARGET_DETECTION_PIXEL_THRESHOLD,
+            velocity_predictor=predict_target_velocity,
+            target_offset_provider=self._low_altitude_target_offset.offset,
+            horizontal_command_guard=apply_escort_boundary,
         )
         logger.info(
             "[MISSION2] Reached target landing height; estimated target "

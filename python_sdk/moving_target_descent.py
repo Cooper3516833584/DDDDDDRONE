@@ -25,6 +25,12 @@ MovingRecordCallback = Callable[
     ],
     None,
 ]
+VelocityPredictor = Callable[
+    [Tuple[float, float], float],
+    Tuple[float, float],
+]
+TargetOffsetProvider = Callable[[float], Tuple[float, float]]
+HorizontalCommandGuard = Callable[[int, int], Tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -135,16 +141,44 @@ class TargetVelocityEstimator:
         x_px: float,
         y_px: float,
         sample_dt: float,
+        velocity_predictor: Optional[VelocityPredictor] = None,
     ) -> Tuple[float, float]:
         values = np.asarray([x_px, y_px, sample_dt], dtype=float)
         if not np.all(np.isfinite(values)):
             raise ValueError("Velocity-estimator inputs must be finite")
+        if velocity_predictor is not None and not callable(
+            velocity_predictor
+        ):
+            raise ValueError("velocity_predictor must be callable")
 
         dt = min(max(float(sample_dt), 0.0), self.max_sample_dt)
         error = np.asarray([x_px, y_px], dtype=float)
         error[np.abs(error) <= self.deadband_px] = 0.0
         with self._lock:
-            updated = self._velocity + error * self.integral_gain * dt
+            predicted = self._velocity.copy()
+            if velocity_predictor is not None:
+                predicted = np.asarray(
+                    velocity_predictor(
+                        (
+                            float(predicted[0]),
+                            float(predicted[1]),
+                        ),
+                        dt,
+                    ),
+                    dtype=float,
+                )
+                if (
+                    predicted.shape != (2,)
+                    or not np.all(np.isfinite(predicted))
+                ):
+                    raise ValueError(
+                        "velocity_predictor must return two finite values"
+                    )
+                predicted = self._limit_norm(
+                    predicted,
+                    self.speed_limit,
+                )
+            updated = predicted + error * self.integral_gain * dt
             self._velocity = self._limit_norm(updated, self.speed_limit)
             return (
                 float(self._velocity[0]),
@@ -252,9 +286,29 @@ class MovingTargetDescentController:
         on_height_reached: Optional[Callable[[], None]] = None,
         pre_descent_gate: Optional[Callable[[], bool]] = None,
         pre_descent_max_error_px: Optional[float] = None,
+        velocity_predictor: Optional[VelocityPredictor] = None,
+        target_offset_provider: Optional[TargetOffsetProvider] = None,
+        horizontal_command_guard: Optional[HorizontalCommandGuard] = None,
     ) -> Tuple[float, float]:
         """阻塞执行连续伴飞、同步下降和目标高度伴飞。"""
+        if velocity_predictor is not None and not callable(
+            velocity_predictor
+        ):
+            raise ValueError("velocity_predictor must be callable")
         self._estimator.reset(initial_target_velocity)
+
+        def provide_base_velocity(
+            x_px: float,
+            y_px: float,
+            sample_dt: float,
+        ) -> Tuple[float, float]:
+            return self._estimator.update(
+                x_px,
+                y_px,
+                sample_dt,
+                velocity_predictor=velocity_predictor,
+            )
+
         self._descent.descend_to_height(
             target_height=target_height,
             hover_seconds=hover_seconds,
@@ -263,12 +317,14 @@ class MovingTargetDescentController:
             height_confirm_time=height_confirm_time,
             timeout=descent_timeout,
             on_height_reached=on_height_reached,
-            base_velocity_provider=self._provide_base_velocity,
+            base_velocity_provider=provide_base_velocity,
             pre_descent_follow_seconds=stabilize_seconds,
             pre_descent_follow_timeout=stabilize_timeout,
             on_descent_start=on_descent_start,
             pre_descent_gate=pre_descent_gate,
             pre_descent_max_error_px=pre_descent_max_error_px,
+            target_offset_provider=target_offset_provider,
+            horizontal_command_guard=horizontal_command_guard,
         )
         return self._estimator.velocity
 
