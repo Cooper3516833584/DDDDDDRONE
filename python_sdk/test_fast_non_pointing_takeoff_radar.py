@@ -7,7 +7,9 @@
     非定点垂直起飞（90 cm 一键离地，垂直爬升至 150 cm）
       -> (100, 0)
       -> (0, 0)
-      -> 定点降落
+      -> 下降至 50 cm
+      -> 识别H标记并以30像素阈值完成视觉微调
+      -> 飞控一键降落
 
 新起飞函数仅供 mission1_26.py 和 mission2_26.py 的快速任务使用，
 不适用于要求定点起飞的常规任务。坐标和高度单位均为 cm；水平坐标系
@@ -26,9 +28,11 @@ from loguru import logger
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
+from testcode.home_h_visual_landing_support import visual_home_h_landing
 
 
 FC_SERIAL_DEV = "/dev/ttyACM0"
+CAMERA_INDEX = 0
 CRUISE_SPEED = 15.0
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 22.0
@@ -178,12 +182,17 @@ class Mission:
         if not self.navi.navigation_to_waypoint(TAKEOFF_POINT, wait=True):
             raise RuntimeError("failed to return to takeoff point")
 
-        logger.info("[TEST] Pointing landing at {}", TAKEOFF_POINT)
-        if not self.navi.pointing_landing(
-            TAKEOFF_POINT,
+        logger.info(
+            "[TEST] Descend to 50cm, align over home H marker and land"
+        )
+        if not visual_home_h_landing(
+            fc=self.fc,
+            navi=self.navi,
+            stop_event=self.stop_event,
+            camera_index=CAMERA_INDEX,
             height_timeout=LANDING_HEIGHT_TIMEOUT,
         ):
-            raise RuntimeError("pointing landing was not confirmed")
+            raise RuntimeError("visual H-marker landing was not confirmed")
         logger.info("[TEST] Fast takeoff navigation flight completed")
 
     def stop(self) -> None:
