@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections as _collections
 import collections.abc as _abc
+import datetime as _datetime
 import math as _math
 import sys as _sys
 import threading as _threading
@@ -33,6 +34,8 @@ _HOME_H_DEBUG_WINDOW = "Home H marker offset"
 _DEBUG_FPS: float | None = None
 _HOME_H_SEARCH_SCORE_THRESHOLD = 0.78
 _HOME_H_TRACK_SCORE_THRESHOLD = 0.66
+_HOME_H_VIDEO_FOURCC = "MJPG"
+_HOME_H_VIDEO_FPS_DEFAULT = 30.0
 
 try:
     _dataclass_slots = _dataclass(slots=True)
@@ -144,7 +147,13 @@ class _VisionResources:
 class _LatestFrameCapture:
     """Read continuously and retain only the newest camera frame."""
 
-    def __init__(self, cap: _cv2.VideoCapture) -> None:
+    def __init__(
+        self,
+        cap: _cv2.VideoCapture,
+        video_output_path: str | None = None,
+        video_fps: float = _HOME_H_VIDEO_FPS_DEFAULT,
+        camera_index: int = 0,
+    ) -> None:
         self._cap = cap
         self._condition = _threading.Condition()
         self._stop_event = _threading.Event()
@@ -158,6 +167,12 @@ class _LatestFrameCapture:
         self._sequence = 0
         self._consecutive_failures = 0
         self._read_error: str | None = None
+        self._video_output_path = video_output_path
+        self._video_fps = video_fps
+        self._camera_index = camera_index
+        self._video_writer: _cv2.VideoWriter | None = None
+        self._video_started_ns = 0
+        self._video_frames = 0
 
     def start(self) -> None:
         self._thread.start()
@@ -200,34 +215,180 @@ class _LatestFrameCapture:
             return self._sequence, self._frame, self._timestamp_ns
 
     def _read_loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                ok, frame = self._cap.read()
-            except Exception as exc:
-                with self._condition:
-                    self._read_error = f"{type(exc).__name__}: {exc}"
-                    self._consecutive_failures = _MAX_READ_FAILURES
-                    self._condition.notify_all()
-                return
-
-            if not ok or frame is None:
-                with self._condition:
-                    self._consecutive_failures += 1
-                    failed = self._consecutive_failures
-                    self._condition.notify_all()
-                if failed >= _MAX_READ_FAILURES:
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    ok, frame = self._cap.read()
+                except Exception as exc:
+                    with self._condition:
+                        self._read_error = f"{type(exc).__name__}: {exc}"
+                        self._consecutive_failures = _MAX_READ_FAILURES
+                        self._condition.notify_all()
                     return
-                self._stop_event.wait(0.01)
-                continue
 
-            captured_ns = _time.monotonic_ns()
+                if not ok or frame is None:
+                    with self._condition:
+                        self._consecutive_failures += 1
+                        failed = self._consecutive_failures
+                        self._condition.notify_all()
+                    if failed >= _MAX_READ_FAILURES:
+                        return
+                    self._stop_event.wait(0.01)
+                    continue
+
+                captured_ns = _time.monotonic_ns()
+                captured_wall_ns = _time.time_ns()
+                with self._condition:
+                    self._frame = frame
+                    self._timestamp_ns = captured_ns
+                    self._sequence += 1
+                    sequence = self._sequence
+                    self._consecutive_failures = 0
+                    self._read_error = None
+                    self._condition.notify_all()
+
+                if self._video_output_path is not None:
+                    if self._video_writer is None:
+                        if not self._create_video_writer(frame):
+                            return
+                    annotated = _stamp_camera_video_frame(
+                        frame,
+                        sequence,
+                        captured_ns,
+                        captured_wall_ns,
+                        self._video_started_ns,
+                        self._camera_index,
+                    )
+                    try:
+                        writer = self._video_writer
+                        if writer is None:
+                            raise RuntimeError("video writer is not initialized")
+                        writer.write(annotated)
+                        self._video_frames += 1
+                    except Exception as exc:
+                        with self._condition:
+                            self._read_error = (
+                                f"video write: {type(exc).__name__}: {exc}"
+                            )
+                            self._consecutive_failures = _MAX_READ_FAILURES
+                            self._condition.notify_all()
+                        return
+        finally:
+            writer = self._video_writer
+            self._video_writer = None
+            if writer is not None:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+
+    def _create_video_writer(self, frame: _np.ndarray) -> bool:
+        if self._video_output_path is None:
+            return False
+        height, width = frame.shape[:2]
+        if height <= 0 or width <= 0:
             with self._condition:
-                self._frame = frame
-                self._timestamp_ns = captured_ns
-                self._sequence += 1
-                self._consecutive_failures = 0
-                self._read_error = None
+                self._read_error = "video frame has invalid dimensions"
+                self._consecutive_failures = _MAX_READ_FAILURES
                 self._condition.notify_all()
+            return False
+        try:
+            fourcc = _cv2.VideoWriter_fourcc(*_HOME_H_VIDEO_FOURCC)
+            writer = _cv2.VideoWriter(
+                self._video_output_path,
+                fourcc,
+                self._video_fps,
+                (width, height),
+            )
+        except Exception as exc:
+            with self._condition:
+                self._read_error = (
+                    f"video writer create: {type(exc).__name__}: {exc}"
+                )
+                self._consecutive_failures = _MAX_READ_FAILURES
+                self._condition.notify_all()
+            return False
+        if not writer.isOpened():
+            with self._condition:
+                self._read_error = (
+                    "video writer could not open: "
+                    f"{self._video_output_path}"
+                )
+                self._consecutive_failures = _MAX_READ_FAILURES
+                self._condition.notify_all()
+            return False
+        self._video_writer = writer
+        self._video_started_ns = _time.monotonic_ns()
+        self._video_frames = 0
+        return True
+
+
+def _stamp_camera_video_frame(
+    frame: _np.ndarray,
+    sequence: int,
+    captured_ns: int,
+    captured_wall_ns: int,
+    started_ns: int,
+    camera_index: int,
+) -> _np.ndarray:
+    """Return a copy of the camera frame with readable timestamp overlays."""
+    display = frame.copy()
+    if display.ndim == 2:
+        display = _cv2.cvtColor(display, _cv2.COLOR_GRAY2BGR)
+    height, width = display.shape[:2]
+    font_scale = max(0.5, min(width, height) / 512.0)
+    thickness = max(1, int(round(font_scale * 1.8)))
+    elapsed_s = (
+        (captured_ns - started_ns) / 1_000_000_000.0
+        if started_ns > 0
+        else 0.0
+    )
+    wall_time = _datetime.datetime.fromtimestamp(
+        captured_wall_ns / 1_000_000_000.0
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    lines = (
+        f"camera={camera_index} seq={sequence}",
+        f"wall={wall_time}",
+        f"t={elapsed_s:.3f}s",
+    )
+    line_height = max(14, int(round(24 * font_scale)))
+    cursor_y = 12 + line_height
+    for text in lines:
+        (text_width, text_height), baseline = _cv2.getTextSize(
+            text,
+            _cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            thickness,
+        )
+        _cv2.rectangle(
+            display,
+            (6, cursor_y - text_height - 3),
+            (6 + text_width + 8, cursor_y + baseline),
+            (0, 0, 0),
+            -1,
+        )
+        _cv2.putText(
+            display,
+            text,
+            (10, cursor_y),
+            _cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 255, 255),
+            thickness,
+            _cv2.LINE_AA,
+        )
+        cursor_y += line_height
+    marker_size = max(8, min(width, height) // 16)
+    _cv2.drawMarker(
+        display,
+        (width // 2, height // 2),
+        (255, 255, 255),
+        _cv2.MARKER_CROSS,
+        marker_size,
+        max(1, thickness - 1),
+        _cv2.LINE_AA,
+    )
+    return display
 
 
 def _safe_capture_set(
@@ -3348,11 +3509,15 @@ def _draw_home_h_debug(
 
 def track_home_h_marker(
     camera_index: int,
+    video_output_path: str | None = None,
 ) -> _abc.Iterator[tuple[float | None, float | None]]:
     """Track the fixed home marker's capital-H center.
 
     Args:
         camera_index: OpenCV camera index.
+        video_output_path: Optional AVI path. When provided, every camera
+            frame is written with a wall-clock and monotonic timestamp
+            overlay, independent of H-marker processing pauses.
 
     Yields:
         A tuple ``(x_px, y_px)`` for each processed frame. ``x_px`` is
@@ -3367,7 +3532,15 @@ def track_home_h_marker(
     capture: _LatestFrameCapture | None = None
     try:
         _warm_up_camera(cap)
-        capture = _LatestFrameCapture(cap)
+        video_fps = float(cap.get(_cv2.CAP_PROP_FPS))
+        if not _math.isfinite(video_fps) or video_fps <= 1.0:
+            video_fps = _HOME_H_VIDEO_FPS_DEFAULT
+        capture = _LatestFrameCapture(
+            cap,
+            video_output_path=video_output_path,
+            video_fps=video_fps,
+            camera_index=camera_index,
+        )
         capture.start()
         tracker = _HomeHTracker()
         sequence = 0
