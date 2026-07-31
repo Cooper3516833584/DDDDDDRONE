@@ -51,6 +51,9 @@ STABILIZE_SECONDS = 10.0
 STABILIZE_TIMEOUT_SECONDS = 20.0
 # 特殊抛投后，缩短低空伴飞以避免下落货物遮挡移动目标标记。
 LOW_HOVER_SECONDS = 0.5
+# 抛投释放采用短间隔重复关断，降低单次命令未触发机械释放的概率。
+DROP_RELEASE_REPEAT_COUNT = 5
+DROP_RELEASE_INTERVAL_SECONDS = 0.05
 DESCENT_TIMEOUT_SECONDS = 15.0
 INITIAL_TARGET_VELOCITY = (3.6, 0.0)
 
@@ -357,7 +360,16 @@ class MovingTargetVisualDescentMission(
         return log_path
 
     def _disable_output_and_report(self) -> None:
-        self.fc.set_digital_output(0, False)
+        for attempt in range(DROP_RELEASE_REPEAT_COUNT):
+            if attempt:
+                self.stop_event.wait(DROP_RELEASE_INTERVAL_SECONDS)
+            self.fc.set_digital_output(0, False)
+            logger.info(
+                "[MISSION1] Digital output 0 disable acknowledged "
+                "({}/{})",
+                attempt + 1,
+                DROP_RELEASE_REPEAT_COUNT,
+            )
         self._digital_output_enabled = False
         logger.info(
             "[MISSION1] Digital output 0 disabled at {}cm",
