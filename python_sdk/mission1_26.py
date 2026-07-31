@@ -4,7 +4,7 @@
 追及路径与任务二保持一致：直线 + 右侧顺时针半圆弧 + 末段直线的
 曲线追及轨迹，非阻塞调用，速度按 初始->接近->减速后 三段调度。
 发现移动目标后，连续有效伴飞 10 秒，
-在同一视觉速度接管内从 150 cm 下降到 40 cm，并继续伴飞 2 秒。
+在同一视觉速度接管内从 150 cm 下降到 40 cm，并继续伴飞 0.5 秒。
 
 起飞采用非定点垂直起飞（90 cm 一键离地后垂直爬升至 150 cm），
 该阶段垂直速度设为 30 cm/s；起飞完成后先稳定偏航，再悬停 2.5s，
@@ -49,7 +49,8 @@ from moving_target_descent import MovingTargetDescentController
 DESCENT_TARGET_HEIGHT = 40.0
 STABILIZE_SECONDS = 10.0
 STABILIZE_TIMEOUT_SECONDS = 20.0
-LOW_HOVER_SECONDS = 2.0
+# 特殊抛投后，缩短低空伴飞以避免下落货物遮挡移动目标标记。
+LOW_HOVER_SECONDS = 0.5
 DESCENT_TIMEOUT_SECONDS = 15.0
 INITIAL_TARGET_VELOCITY = (3.6, 0.0)
 
