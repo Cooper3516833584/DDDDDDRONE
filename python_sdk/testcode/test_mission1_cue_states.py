@@ -54,6 +54,7 @@ class Mission1CueStateTests(unittest.TestCase):
             and _call_name(node)
             in {
                 "navigation_follow_trajectory",
+                "send_pursuit_started",
                 "_wait_until_target_detected_on_trajectory",
                 "send_escort_started",
                 "_perform_target_action",
@@ -61,6 +62,10 @@ class Mission1CueStateTests(unittest.TestCase):
         }
         self.assertLess(
             calls["navigation_follow_trajectory"],
+            calls["send_pursuit_started"],
+        )
+        self.assertLess(
+            calls["send_pursuit_started"],
             calls["_wait_until_target_detected_on_trajectory"],
         )
         self.assertLess(
@@ -90,6 +95,24 @@ class Mission1CueStateTests(unittest.TestCase):
         }
         self.assertIn("MISSION1_DROP_COMPLETED", attributes)
         self.assertNotIn("DROP_COMPLETED", attributes)
+
+    def test_pursuit_started_uses_cruising_state_15(self):
+        states = _class(self.base_tree, "MissionOperationState")
+        values = {
+            target.id: ast.literal_eval(node.value)
+            for node in states.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        self.assertEqual(15, values["CRUISING"])
+
+        signals = _class(self.mission_tree, "MissionGroundStationSignals")
+        method = _method(signals, "send_pursuit_started")
+        attributes = {
+            node.attr for node in ast.walk(method) if isinstance(node, ast.Attribute)
+        }
+        self.assertIn("CRUISING", attributes)
 
     def test_payload_is_released_before_drop_completed_is_reported(self):
         mission = _class(
