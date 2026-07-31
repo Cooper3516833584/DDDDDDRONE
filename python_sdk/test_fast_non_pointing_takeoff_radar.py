@@ -4,7 +4,7 @@
 默认只连接飞控和雷达、建立单雷达定位并持续打印位置，不会解锁或起飞。
 只有显式传入 ``--confirm-flight`` 才会执行真实飞行测试：
 
-    非定点快速起飞（60 cm 一键离地，继续爬升至 150 cm）
+    非定点垂直起飞（90 cm 一键离地，垂直爬升至 150 cm）
       -> (100, 0)
       -> (0, 0)
       -> 定点降落
@@ -156,7 +156,8 @@ class Mission:
         """执行快速起飞、单航点导航、返航和定点降落。"""
         logger.warning("[TEST] Confirmed real-flight mode")
         logger.info(
-            "[TEST] Fast non-pointing takeoff: first lift 60cm, target {:.0f}cm",
+            "[TEST] Non-pointing vertical takeoff: "
+            "first lift 90cm, target {:.0f}cm",
             CRUISE_HEIGHT,
         )
         self.navi.fast_non_pointing_takeoff(

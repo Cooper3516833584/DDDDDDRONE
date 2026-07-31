@@ -1804,18 +1804,18 @@ class Navigation(object):
         self.radar.get_target_points(TARGET_NUM)
 
     # 任务一/任务二专用快速起飞：不适用于常规任务。
-    # 该函数不执行起飞点定点锁定，并会较早衔接后续导航以缩短启动时间。
+    # 该函数不执行起飞点定点锁定，但必须完成垂直爬升后才衔接后续导航。
     def fast_non_pointing_takeoff(self, target_height=150):
         """
-        任务一/任务二专用的非定点快速起飞。
+        任务一/任务二专用的非定点垂直起飞。
 
-        本函数不适用于要求定点起飞的常规任务。飞控一键起飞到 60 cm
-        被确认启动后，立即在当前位置切入导航闭环；高度 PID 继续爬升到
-        target_height，调用方可直接衔接后续水平导航。
+        本函数不适用于要求定点起飞的常规任务。飞控一键起飞到 90 cm
+        并确认悬停后，在当前位置切入导航闭环并继续垂直爬升；只有确认
+        到达 target_height 后才返回，调用方随后才能衔接水平导航。
         """
         target_height = float(target_height)
-        if not np.isfinite(target_height) or target_height < 60:
-            raise ValueError("target_height must be finite and at least 60cm")
+        if not np.isfinite(target_height) or target_height < 90:
+            raise ValueError("target_height must be finite and at least 90cm")
         if not self.running:
             raise RuntimeError("[NAVI] Fast takeoff requires navigation to be running")
         if self.stop_event is not None and self.stop_event.is_set():
@@ -1840,7 +1840,7 @@ class Navigation(object):
             raise RuntimeError(error_message)
 
         logger.warning(
-            "[NAVI] Mission fast non-pointing takeoff: first lift=60cm, "
+            "[NAVI] Mission non-pointing vertical takeoff: first lift=90cm, "
             "target={}cm",
             target_height,
         )
@@ -1883,10 +1883,15 @@ class Navigation(object):
                 "[NAVI] Flight state became invalid before fast takeoff"
             )
 
-        self.fc.take_off(60)
+        self.fc.take_off(90)
         if not self.fc.wait_for_takeoff_done(timeout_s=5):
             raise RuntimeError(
                 "[NAVI] Flight controller did not confirm fast takeoff; "
+                "closed-loop navigation remains disabled"
+            )
+        if not self.fc.wait_for_hovering(timeout_s=8):
+            raise RuntimeError(
+                "[NAVI] Hovering was not confirmed after 90cm takeoff; "
                 "closed-loop navigation remains disabled"
             )
         if not (
@@ -1925,12 +1930,19 @@ class Navigation(object):
         self.switch_pid("hover")
         self.navigation_flag = True
         self.keep_height_flag = True
+        if not self.wait_for_height(
+            height_thres=8,
+            timeout=15,
+        ):
+            raise RuntimeError(
+                "[NAVI] Target height was not confirmed after vertical takeoff"
+            )
         logger.info(
-            "[NAVI] Fast takeoff handed off at ({:.1f}, {:.1f}); "
-            "continuing climb to {:.1f}cm",
+            "[NAVI] Non-pointing vertical takeoff reached {:.1f}cm at "
+            "hold point ({:.1f}, {:.1f})",
+            target_height,
             hold_x,
             hold_y,
-            target_height,
         )
 
     def pointing_takeoff(self, point, target_height=140):

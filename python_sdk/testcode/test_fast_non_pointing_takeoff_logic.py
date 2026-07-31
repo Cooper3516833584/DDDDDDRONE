@@ -42,6 +42,10 @@ class _FC:
     def wait_for_takeoff_done(timeout_s):
         return timeout_s == 5
 
+    @staticmethod
+    def wait_for_hovering(timeout_s):
+        return timeout_s == 8
+
 
 class _StopEvent:
     @staticmethod
@@ -64,11 +68,15 @@ class FastNonPointingTakeoffTest(unittest.TestCase):
         waypoints = []
         heights = []
         pid_names = []
+        height_waits = []
         navi._flight_state_is_fresh = lambda max_age=0.5: True
         navi.pose_is_fresh = lambda max_age=0.3: True
         navi.direct_set_waypoint = lambda point: waypoints.append(tuple(point))
         navi.set_height = lambda height: heights.append(float(height))
         navi.switch_pid = lambda name: pid_names.append(name)
+        navi.wait_for_height = lambda **kwargs: (
+            height_waits.append(kwargs) or True
+        )
 
         with patch(
             "FlightController.Solutions.Navigation.time.sleep",
@@ -76,10 +84,14 @@ class FastNonPointingTakeoffTest(unittest.TestCase):
         ) as sleep_mock:
             navi.fast_non_pointing_takeoff(target_height=150)
 
-        self.assertEqual(fc.takeoff_calls, [60])
+        self.assertEqual(fc.takeoff_calls, [90])
         self.assertEqual(waypoints, [(12.5, -7.5)])
         self.assertEqual(heights, [150.0])
         self.assertEqual(pid_names, ["hover"])
+        self.assertEqual(
+            height_waits,
+            [{"height_thres": 8, "timeout": 15}],
+        )
         self.assertTrue(navi.navigation_flag)
         self.assertTrue(navi.keep_height_flag)
         sleep_mock.assert_any_call(2.0)
