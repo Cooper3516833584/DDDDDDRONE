@@ -1803,6 +1803,136 @@ class Navigation(object):
     def radar_find_target(self,TARGET_NUM):
         self.radar.get_target_points(TARGET_NUM)
 
+    # 任务一/任务二专用快速起飞：不适用于常规任务。
+    # 该函数不执行起飞点定点锁定，并会较早衔接后续导航以缩短启动时间。
+    def fast_non_pointing_takeoff(self, target_height=150):
+        """
+        任务一/任务二专用的非定点快速起飞。
+
+        本函数不适用于要求定点起飞的常规任务。飞控一键起飞到 60 cm
+        被确认启动后，立即在当前位置切入导航闭环；高度 PID 继续爬升到
+        target_height，调用方可直接衔接后续水平导航。
+        """
+        target_height = float(target_height)
+        if not np.isfinite(target_height) or target_height < 60:
+            raise ValueError("target_height must be finite and at least 60cm")
+        if not self.running:
+            raise RuntimeError("[NAVI] Fast takeoff requires navigation to be running")
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise RuntimeError("[NAVI] Fast takeoff refused: external stop event is set")
+        if not self._flight_state_is_fresh():
+            raise RuntimeError("[NAVI] Fast takeoff refused: FC telemetry is stale")
+        if not self.pose_is_fresh():
+            raise RuntimeError("[NAVI] Fast takeoff refused: navigation pose is stale")
+        if self.fc.state.unlock.value:
+            raise RuntimeError("[NAVI] Fast takeoff refused: aircraft is already unlocked")
+
+        def wait_for_state(predicate, timeout, error_message):
+            deadline = time.perf_counter() + float(timeout)
+            while time.perf_counter() < deadline:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    raise RuntimeError(
+                        "[NAVI] Fast takeoff stopped by external stop event"
+                    )
+                if predicate():
+                    return
+                time.sleep(0.05)
+            raise RuntimeError(error_message)
+
+        logger.warning(
+            "[NAVI] Mission fast non-pointing takeoff: first lift=60cm, "
+            "target={}cm",
+            target_height,
+        )
+        self.navigation_flag = False
+        self.keep_height_flag = False
+
+        self.fc.set_flight_mode(self.fc.PROGRAM_MODE)
+        wait_for_state(
+            lambda: bool(
+                self._flight_state_is_fresh()
+                and self.fc.state.mode.value == self.fc.PROGRAM_MODE
+            ),
+            1.5,
+            "[NAVI] Fresh PROGRAM mode was not confirmed before fast takeoff",
+        )
+
+        self.fc.unlock()
+        wait_for_state(
+            lambda: bool(
+                self._flight_state_is_fresh()
+                and self.fc.state.mode.value == self.fc.PROGRAM_MODE
+                and self.fc.state.unlock.value
+            ),
+            3.0,
+            "[NAVI] Fresh PROGRAM/unlock feedback was not confirmed",
+        )
+
+        # 初次解锁后必须完整等待 2 秒，让电机完成预热。
+        time.sleep(2.0)
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise RuntimeError(
+                "[NAVI] Fast takeoff stopped during motor warmup"
+            )
+        if not (
+            self._flight_state_is_fresh()
+            and self.fc.state.mode.value == self.fc.PROGRAM_MODE
+            and self.fc.state.unlock.value
+        ):
+            raise RuntimeError(
+                "[NAVI] Flight state became invalid before fast takeoff"
+            )
+
+        self.fc.take_off(60)
+        if not self.fc.wait_for_takeoff_done(timeout_s=5):
+            raise RuntimeError(
+                "[NAVI] Flight controller did not confirm fast takeoff; "
+                "closed-loop navigation remains disabled"
+            )
+        if not (
+            self._flight_state_is_fresh()
+            and self.fc.state.unlock.value
+            and self.pose_is_fresh()
+        ):
+            raise RuntimeError(
+                "[NAVI] Flight or navigation state became invalid during fast takeoff"
+            )
+
+        self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
+        wait_for_state(
+            lambda: bool(
+                self._flight_state_is_fresh()
+                and self.fc.state.mode.value == self.fc.HOLD_POS_MODE
+                and self.fc.state.unlock.value
+            ),
+            1.5,
+            "[NAVI] Fresh HOLD_POS feedback was not confirmed after fast takeoff",
+        )
+        if not self.pose_is_fresh():
+            raise RuntimeError(
+                "[NAVI] Navigation pose is stale at fast takeoff handoff"
+            )
+
+        hold_x = float(self.current_x)
+        hold_y = float(self.current_y)
+        if not np.all(np.isfinite(np.asarray([hold_x, hold_y], dtype=float))):
+            raise RuntimeError(
+                "[NAVI] Navigation position is invalid at fast takeoff handoff"
+            )
+
+        self.direct_set_waypoint([hold_x, hold_y])
+        self.set_height(target_height)
+        self.switch_pid("hover")
+        self.navigation_flag = True
+        self.keep_height_flag = True
+        logger.info(
+            "[NAVI] Fast takeoff handed off at ({:.1f}, {:.1f}); "
+            "continuing climb to {:.1f}cm",
+            hold_x,
+            hold_y,
+            target_height,
+        )
+
     def pointing_takeoff(self, point, target_height=140):
         """
         定点起飞
