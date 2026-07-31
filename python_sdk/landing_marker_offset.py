@@ -16,7 +16,7 @@ import numpy as _np
 
 globals().pop("annotations", None)
 
-__all__ = ["track_landing_marker"]
+__all__ = ["track_home_h_marker", "track_landing_marker"]
 
 _FRAME_WIDTH = 256
 _FRAME_HEIGHT = 256
@@ -29,7 +29,10 @@ _SEARCH_SCORE_THRESHOLD = 0.68
 _TRACK_SCORE_THRESHOLD = 0.58
 _DEBUG = False
 _DEBUG_WINDOW = "Landing marker offset"
+_HOME_H_DEBUG_WINDOW = "Home H marker offset"
 _DEBUG_FPS: float | None = None
+_HOME_H_SEARCH_SCORE_THRESHOLD = 0.78
+_HOME_H_TRACK_SCORE_THRESHOLD = 0.66
 
 try:
     _dataclass_slots = _dataclass(slots=True)
@@ -96,6 +99,22 @@ class _CrossLine:
 @_dataclass_slots
 class _OpticalResult:
     detection: _Detection
+    points: _np.ndarray
+
+
+@_dataclass_slots
+class _HomeHDetection:
+    center_u: float
+    center_v: float
+    span_px: float
+    score: float
+    mask_index: int
+    bounds: _Roi
+
+
+@_dataclass_slots
+class _HomeHOpticalResult:
+    detection: _HomeHDetection
     points: _np.ndarray
 
 
@@ -2401,6 +2420,710 @@ class _MarkerTracker:
         self._low_score_count = 0
 
 
+def _home_h_geometry_from_component(
+    component: _np.ndarray,
+    offset: tuple[int, int],
+    mask_index: int,
+    temporal_score: float,
+) -> _HomeHDetection | None:
+    """Fit an arbitrary-rotation capital H without using nearby rings."""
+    point_v, point_u = _np.nonzero(component)
+    if len(point_u) < 80:
+        return None
+    points = _np.column_stack((point_u, point_v)).astype(_np.float64)
+    covariance = _np.cov(points, rowvar=False)
+    if covariance.shape != (2, 2) or not _np.all(_np.isfinite(covariance)):
+        return None
+    try:
+        eigenvalues, eigenvectors = _np.linalg.eigh(covariance)
+    except _np.linalg.LinAlgError:
+        return None
+    if not _np.all(_np.isfinite(eigenvalues)):
+        return None
+
+    canonical_width = 96
+    canonical_height = 64
+    best: _HomeHDetection | None = None
+    direction_order = _np.argsort(eigenvalues)[::-1]
+    for direction_index in direction_order:
+        direction = eigenvectors[:, int(direction_index)].astype(_np.float64)
+        normal = _np.asarray((-direction[1], direction[0]), dtype=_np.float64)
+        along = points @ direction
+        across = points @ normal
+        along_min = float(_np.min(along))
+        along_max = float(_np.max(along))
+        across_min = float(_np.min(across))
+        across_max = float(_np.max(across))
+        along_span = along_max - along_min
+        across_span = across_max - across_min
+        if along_span < 12.0 or across_span < 9.0:
+            continue
+        aspect = along_span / across_span
+        if not 1.15 <= aspect <= 2.80:
+            continue
+
+        along_scale = (canonical_width - 1) / along_span
+        across_scale = (canonical_height - 1) / across_span
+        transform = _np.asarray(
+            (
+                (
+                    direction[0] * along_scale,
+                    direction[1] * along_scale,
+                    -along_min * along_scale,
+                ),
+                (
+                    normal[0] * across_scale,
+                    normal[1] * across_scale,
+                    -across_min * across_scale,
+                ),
+            ),
+            dtype=_np.float32,
+        )
+        canonical = _cv2.warpAffine(
+            component,
+            transform,
+            (canonical_width, canonical_height),
+            flags=_cv2.INTER_NEAREST,
+            borderMode=_cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        foreground = canonical > 0
+        fill_ratio = float(_np.mean(foreground))
+        if not 0.20 <= fill_ratio <= 0.65:
+            continue
+
+        row_profile = _np.mean(foreground, axis=1)
+        half_height = canonical_height // 2
+        upper_weights = _np.maximum(
+            row_profile[:half_height] - 0.42,
+            0.0,
+        ) ** 2
+        lower_weights = _np.maximum(
+            row_profile[half_height:] - 0.42,
+            0.0,
+        ) ** 2
+        upper_weight_sum = float(_np.sum(upper_weights))
+        lower_weight_sum = float(_np.sum(lower_weights))
+        if upper_weight_sum <= 1e-9 or lower_weight_sum <= 1e-9:
+            continue
+        upper_center = float(
+            _np.sum(_np.arange(half_height) * upper_weights)
+            / upper_weight_sum
+        )
+        lower_rows = _np.arange(half_height, canonical_height)
+        lower_center = float(
+            _np.sum(lower_rows * lower_weights) / lower_weight_sum
+        )
+        separation = (lower_center - upper_center) / (canonical_height - 1)
+        if not 0.38 <= separation <= 0.88:
+            continue
+
+        upper_peak = float(
+            _np.max(row_profile[: int(round(0.46 * canonical_height))])
+        )
+        lower_peak = float(
+            _np.max(row_profile[int(round(0.54 * canonical_height)) :])
+        )
+        if min(upper_peak, lower_peak) < 0.55:
+            continue
+
+        rail_half_width = max(2, int(round(0.055 * canonical_height)))
+        upper_row = int(round(upper_center))
+        lower_row = int(round(lower_center))
+        upper_slice = foreground[
+            max(0, upper_row - rail_half_width) :
+            min(canonical_height, upper_row + rail_half_width + 1)
+        ]
+        lower_slice = foreground[
+            max(0, lower_row - rail_half_width) :
+            min(canonical_height, lower_row + rail_half_width + 1)
+        ]
+        upper_coverage = float(_np.mean(_np.any(upper_slice, axis=0)))
+        lower_coverage = float(_np.mean(_np.any(lower_slice, axis=0)))
+        rail_coverage = min(upper_coverage, lower_coverage)
+        if rail_coverage < 0.70:
+            continue
+
+        connector_margin = max(2.0, 0.12 * (lower_center - upper_center))
+        middle_start = int(_math.ceil(upper_center + connector_margin))
+        middle_stop = int(_math.floor(lower_center - connector_margin)) + 1
+        if middle_stop - middle_start < 6:
+            continue
+        middle = foreground[middle_start:middle_stop]
+        column_profile = _np.mean(middle, axis=0)
+        central_start = int(round(0.25 * canonical_width))
+        central_stop = int(round(0.75 * canonical_width))
+        central_profile = column_profile[central_start:central_stop]
+        if central_profile.size == 0:
+            continue
+        connector_peak = float(_np.max(central_profile))
+        if connector_peak < 0.65:
+            continue
+        connector_columns = _np.arange(canonical_width)
+        connector_selected = _np.zeros(canonical_width, dtype=bool)
+        connector_selected[central_start:central_stop] = (
+            central_profile >= max(0.50, 0.75 * connector_peak)
+        )
+        connector_weights = _np.where(
+            connector_selected,
+            column_profile,
+            0.0,
+        )
+        connector_weight_sum = float(_np.sum(connector_weights))
+        if connector_weight_sum <= 1e-9:
+            continue
+        connector_center = float(
+            _np.sum(connector_columns * connector_weights)
+            / connector_weight_sum
+        )
+        connector_fraction = connector_center / (canonical_width - 1)
+        if not 0.28 <= connector_fraction <= 0.72:
+            continue
+
+        side_columns = _np.zeros(canonical_width, dtype=bool)
+        side_columns[
+            int(round(0.12 * canonical_width)) :
+            int(round(0.88 * canonical_width))
+        ] = True
+        connector_half_width = max(4, int(round(0.075 * canonical_width)))
+        connector_index = int(round(connector_center))
+        side_columns[
+            max(0, connector_index - connector_half_width) :
+            min(canonical_width, connector_index + connector_half_width + 1)
+        ] = False
+        if not _np.any(side_columns):
+            continue
+        side_dark_fraction = float(_np.mean(middle[:, side_columns]))
+        if side_dark_fraction > 0.28:
+            continue
+
+        flipped = _np.flip(foreground, axis=(0, 1)).astype(_np.uint8) * 255
+        flipped = _cv2.dilate(
+            flipped,
+            _np.ones((3, 3), dtype=_np.uint8),
+            iterations=1,
+        ) > 0
+        symmetry_score = float(
+            _np.count_nonzero(foreground & flipped)
+            / max(1, _np.count_nonzero(foreground))
+        )
+        if symmetry_score < 0.58:
+            continue
+
+        rail_score = float(
+            _np.clip(
+                0.5 * (upper_peak + lower_peak) / 0.90,
+                0.0,
+                1.0,
+            )
+        )
+        coverage_score = float(_np.clip(rail_coverage / 0.88, 0.0, 1.0))
+        connector_score = float(_np.clip(connector_peak / 0.90, 0.0, 1.0))
+        side_score = float(
+            _np.clip((0.28 - side_dark_fraction) / 0.22, 0.0, 1.0)
+        )
+        center_score = float(
+            _np.clip(1.0 - abs(connector_fraction - 0.5) / 0.22, 0.0, 1.0)
+        )
+        separation_score = float(
+            _np.clip(1.0 - abs(separation - 0.62) / 0.28, 0.0, 1.0)
+        )
+        aspect_score = float(
+            _np.clip(
+                1.0 - abs(_math.log(aspect / 1.65)) / _math.log(2.0),
+                0.0,
+                1.0,
+            )
+        )
+        score = float(
+            _np.clip(
+                0.15 * rail_score
+                + 0.13 * coverage_score
+                + 0.18 * connector_score
+                + 0.12 * side_score
+                + 0.10 * center_score
+                + 0.09 * separation_score
+                + 0.10 * symmetry_score
+                + 0.06 * aspect_score
+                + 0.07 * temporal_score,
+                0.0,
+                1.0,
+            )
+        )
+
+        canonical_center_v = 0.5 * (upper_center + lower_center)
+        along_center = connector_center / along_scale + along_min
+        across_center = canonical_center_v / across_scale + across_min
+        local_center = direction * along_center + normal * across_center
+        center_u = float(local_center[0] + offset[0])
+        center_v = float(local_center[1] + offset[1])
+        if not _np.all(_np.isfinite((center_u, center_v, score))):
+            continue
+        local_x, local_y, local_width, local_height = _cv2.boundingRect(
+            _np.column_stack((point_u, point_v)).astype(_np.int32)
+        )
+        bounds = (
+            local_x + offset[0],
+            local_y + offset[1],
+            local_x + local_width + offset[0],
+            local_y + local_height + offset[1],
+        )
+        detection = _HomeHDetection(
+            center_u=center_u,
+            center_v=center_v,
+            span_px=float(max(along_span, across_span)),
+            score=score,
+            mask_index=mask_index,
+            bounds=bounds,
+        )
+        if best is None or detection.score > best.score:
+            best = detection
+    return best
+
+
+def _home_h_temporal_score(
+    center: tuple[float, float],
+    span: float,
+    previous: _HomeHDetection | None,
+) -> float:
+    if previous is None or previous.span_px <= 0.0 or span <= 0.0:
+        return 0.5
+    displacement = _math.hypot(
+        center[0] - previous.center_u,
+        center[1] - previous.center_v,
+    )
+    position_score = _math.exp(
+        -displacement / max(1.0, 0.55 * previous.span_px)
+    )
+    size_score = _math.exp(
+        -abs(_math.log(span / previous.span_px)) / 0.45
+    )
+    return float(_np.clip(0.65 * position_score + 0.35 * size_score, 0.0, 1.0))
+
+
+def _collect_home_h_detections(
+    masks: list[_np.ndarray],
+    search_roi: _Roi | None,
+    previous: _HomeHDetection | None,
+) -> list[_HomeHDetection]:
+    if not masks:
+        return []
+    image_height, image_width = masks[0].shape
+    image_area = image_height * image_width
+    roi = search_roi or (0, 0, image_width, image_height)
+    x0, y0, x1, y1 = _clip_roi(roi, image_width, image_height)
+    if x1 - x0 < 12 or y1 - y0 < 12:
+        return []
+
+    detections: list[_HomeHDetection] = []
+    for mask_index, mask in enumerate(masks):
+        roi_mask = mask[y0:y1, x0:x1]
+        count, labels, stats, centroids = _cv2.connectedComponentsWithStats(
+            roi_mask,
+            connectivity=8,
+        )
+        for label in range(1, count):
+            local_x, local_y, width, height, area = (
+                int(value) for value in stats[label]
+            )
+            if area < max(80, int(round(0.0012 * image_area))):
+                continue
+            if area > int(round(0.25 * image_area)):
+                continue
+            if min(width, height) < 10:
+                continue
+            fill_ratio = area / float(width * height)
+            if not 0.20 <= fill_ratio <= 0.70:
+                continue
+            component = _np.where(
+                labels[
+                    local_y : local_y + height,
+                    local_x : local_x + width,
+                ]
+                == label,
+                255,
+                0,
+            ).astype(_np.uint8)
+            global_center = (
+                float(centroids[label][0] + x0),
+                float(centroids[label][1] + y0),
+            )
+            span = float(max(width, height))
+            temporal = _home_h_temporal_score(global_center, span, previous)
+            detection = _home_h_geometry_from_component(
+                component,
+                (x0 + local_x, y0 + local_y),
+                mask_index,
+                temporal,
+            )
+            if detection is not None and detection.score >= 0.60:
+                detections.append(detection)
+    return detections
+
+
+def _find_home_h_candidate(
+    gray: _np.ndarray,
+    search_roi: _Roi | None,
+    previous: _HomeHDetection | None,
+    resources: _VisionResources,
+) -> _HomeHDetection | None:
+    masks = _build_binary_variants(gray, resources)
+    detections = _collect_home_h_detections(masks, search_roi, previous)
+    if not detections:
+        return None
+
+    best: _HomeHDetection | None = None
+    best_rank = -_math.inf
+    for anchor in detections:
+        cluster = [
+            detection
+            for detection in detections
+            if _math.hypot(
+                detection.center_u - anchor.center_u,
+                detection.center_v - anchor.center_v,
+            )
+            <= max(4.0, 0.14 * anchor.span_px)
+        ]
+        by_mask: dict[int, _HomeHDetection] = {}
+        for detection in cluster:
+            current = by_mask.get(detection.mask_index)
+            if current is None or detection.score > current.score:
+                by_mask[detection.mask_index] = detection
+        distinct = list(by_mask.values())
+        weights = _np.asarray(
+            [max(0.01, detection.score) ** 2 for detection in distinct],
+            dtype=_np.float64,
+        )
+        centers = _np.asarray(
+            [(detection.center_u, detection.center_v) for detection in distinct],
+            dtype=_np.float64,
+        )
+        center = _np.average(centers, axis=0, weights=weights)
+        spans = _np.asarray(
+            [detection.span_px for detection in distinct],
+            dtype=_np.float64,
+        )
+        span = float(_np.average(spans, weights=weights))
+        strongest = max(distinct, key=lambda detection: detection.score)
+        score = float(
+            _np.clip(
+                strongest.score + 0.025 * (len(distinct) - 1),
+                0.0,
+                1.0,
+            )
+        )
+        rank = score + 0.01 * len(distinct)
+        if rank > best_rank:
+            best_rank = rank
+            best = _HomeHDetection(
+                center_u=float(center[0]),
+                center_v=float(center[1]),
+                span_px=span,
+                score=score,
+                mask_index=strongest.mask_index,
+                bounds=strongest.bounds,
+            )
+    return best
+
+
+def _home_h_detections_are_consistent(
+    previous: _HomeHDetection,
+    current: _HomeHDetection,
+) -> bool:
+    if previous.span_px <= 0.0 or current.span_px <= 0.0:
+        return False
+    displacement = _math.hypot(
+        current.center_u - previous.center_u,
+        current.center_v - previous.center_v,
+    )
+    if displacement > max(24.0, 0.60 * previous.span_px):
+        return False
+    size_ratio = current.span_px / previous.span_px
+    return 0.65 <= size_ratio <= 1.55
+
+
+def _home_h_feature_points(
+    gray: _np.ndarray,
+    detection: _HomeHDetection,
+) -> _np.ndarray | None:
+    height, width = gray.shape
+    margin = max(4, int(round(0.08 * detection.span_px)))
+    x0, y0, x1, y1 = _clip_roi(
+        (
+            detection.bounds[0] - margin,
+            detection.bounds[1] - margin,
+            detection.bounds[2] + margin,
+            detection.bounds[3] + margin,
+        ),
+        width,
+        height,
+    )
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    roi = gray[y0:y1, x0:x1]
+    points = _cv2.goodFeaturesToTrack(
+        roi,
+        maxCorners=60,
+        qualityLevel=0.01,
+        minDistance=max(3, int(round(0.025 * detection.span_px))),
+        blockSize=5,
+    )
+    if points is None:
+        return None
+    points = points.astype(_np.float32)
+    points[:, 0, 0] += float(x0)
+    points[:, 0, 1] += float(y0)
+    return points
+
+
+def _track_home_h_optical_flow(
+    previous_gray: _np.ndarray,
+    current_gray: _np.ndarray,
+    previous_points: _np.ndarray,
+    previous_detection: _HomeHDetection,
+) -> _HomeHOpticalResult | None:
+    if len(previous_points) < 6:
+        return None
+    criteria = (
+        _cv2.TERM_CRITERIA_EPS | _cv2.TERM_CRITERIA_COUNT,
+        25,
+        0.01,
+    )
+    current_points, forward_status, _ = _cv2.calcOpticalFlowPyrLK(
+        previous_gray,
+        current_gray,
+        previous_points,
+        None,
+        winSize=(25, 25),
+        maxLevel=3,
+        criteria=criteria,
+    )
+    if current_points is None or forward_status is None:
+        return None
+    backward_points, backward_status, _ = _cv2.calcOpticalFlowPyrLK(
+        current_gray,
+        previous_gray,
+        current_points,
+        None,
+        winSize=(25, 25),
+        maxLevel=3,
+        criteria=criteria,
+    )
+    if backward_points is None or backward_status is None:
+        return None
+    forward_ok = forward_status.reshape(-1) > 0
+    backward_ok = backward_status.reshape(-1) > 0
+    finite = (
+        _np.all(_np.isfinite(current_points.reshape(-1, 2)), axis=1)
+        & _np.all(_np.isfinite(backward_points.reshape(-1, 2)), axis=1)
+    )
+    round_trip = _np.linalg.norm(
+        previous_points.reshape(-1, 2) - backward_points.reshape(-1, 2),
+        axis=1,
+    )
+    valid = forward_ok & backward_ok & finite & (round_trip < 1.8)
+    if int(_np.count_nonzero(valid)) < 6:
+        return None
+    source = previous_points.reshape(-1, 2)[valid].astype(_np.float32)
+    target = current_points.reshape(-1, 2)[valid].astype(_np.float32)
+    matrix, inlier_mask = _cv2.estimateAffinePartial2D(
+        source,
+        target,
+        method=_cv2.RANSAC,
+        ransacReprojThreshold=2.5,
+    )
+    if matrix is None or inlier_mask is None:
+        return None
+    inliers = inlier_mask.reshape(-1) > 0
+    inlier_count = int(_np.count_nonzero(inliers))
+    if inlier_count < 5 or inlier_count / len(source) < 0.45:
+        return None
+    linear = matrix[:, :2].astype(_np.float64)
+    determinant = float(_np.linalg.det(linear))
+    if not _math.isfinite(determinant) or determinant <= 0.0:
+        return None
+    scale = _math.sqrt(float(linear[0, 0] ** 2 + linear[1, 0] ** 2))
+    if not 0.75 <= scale <= 1.30:
+        return None
+    rotation = _math.degrees(
+        _math.atan2(float(linear[1, 0]), float(linear[0, 0]))
+    )
+    if abs(rotation) > 30.0:
+        return None
+
+    center = matrix.astype(_np.float64) @ _np.asarray(
+        (previous_detection.center_u, previous_detection.center_v, 1.0),
+        dtype=_np.float64,
+    )
+    if not _np.all(_np.isfinite(center)):
+        return None
+    displacement = _math.hypot(
+        float(center[0]) - previous_detection.center_u,
+        float(center[1]) - previous_detection.center_v,
+    )
+    if displacement > max(35.0, 0.55 * previous_detection.span_px):
+        return None
+
+    x0, y0, x1, y1 = previous_detection.bounds
+    corners = _np.asarray(
+        ((x0, y0, 1.0), (x1, y0, 1.0), (x1, y1, 1.0), (x0, y1, 1.0)),
+        dtype=_np.float64,
+    )
+    transformed = corners @ matrix.astype(_np.float64).T
+    if not _np.all(_np.isfinite(transformed)):
+        return None
+    bounds = (
+        int(_math.floor(float(_np.min(transformed[:, 0])))),
+        int(_math.floor(float(_np.min(transformed[:, 1])))),
+        int(_math.ceil(float(_np.max(transformed[:, 0])))),
+        int(_math.ceil(float(_np.max(transformed[:, 1])))),
+    )
+    updated_points = target[inliers].reshape(-1, 1, 2).astype(_np.float32)
+    detection = _HomeHDetection(
+        center_u=float(center[0]),
+        center_v=float(center[1]),
+        span_px=float(previous_detection.span_px * scale),
+        score=float(max(0.66, previous_detection.score * 0.992)),
+        mask_index=previous_detection.mask_index,
+        bounds=bounds,
+    )
+    return _HomeHOpticalResult(detection=detection, points=updated_points)
+
+
+class _HomeHTracker:
+    def __init__(self) -> None:
+        self._resources = _VisionResources()
+        self._state = "SEARCH"
+        self._search_history: _collections.deque[_HomeHDetection | None] = (
+            _collections.deque(maxlen=3)
+        )
+        self._detection: _HomeHDetection | None = None
+        self._previous_gray: _np.ndarray | None = None
+        self._previous_points: _np.ndarray | None = None
+        self._track_frame_count = 0
+        self._miss_count = 0
+
+    def process(self, gray: _np.ndarray) -> _HomeHDetection | None:
+        if self._state == "SEARCH":
+            return self._process_search(gray)
+        return self._process_track(gray)
+
+    def _process_search(self, gray: _np.ndarray) -> _HomeHDetection | None:
+        previous = next(
+            (
+                detection
+                for detection in reversed(self._search_history)
+                if detection is not None
+            ),
+            None,
+        )
+        detection = _find_home_h_candidate(
+            gray,
+            None,
+            previous,
+            self._resources,
+        )
+        if detection is not None and detection.score < _HOME_H_SEARCH_SCORE_THRESHOLD:
+            detection = None
+        if (
+            detection is not None
+            and previous is not None
+            and not _home_h_detections_are_consistent(previous, detection)
+        ):
+            detection = None
+        self._search_history.append(detection)
+        if detection is None:
+            return None
+        if len(self._search_history) < 3:
+            return detection
+        recent = [item for item in self._search_history if item is not None]
+        if len(recent) < 2:
+            return None
+        if not _home_h_detections_are_consistent(recent[-2], detection):
+            return None
+        self._state = "TRACK"
+        self._detection = detection
+        self._previous_gray = gray
+        self._previous_points = _home_h_feature_points(gray, detection)
+        self._track_frame_count = 0
+        self._miss_count = 0
+        return detection
+
+    def _tracking_roi(self, detection: _HomeHDetection) -> _Roi:
+        side = min(
+            float(max(_FRAME_WIDTH, _FRAME_HEIGHT)),
+            max(80.0, 2.5 * detection.span_px),
+        )
+        return _square_roi(
+            (detection.center_u, detection.center_v),
+            side,
+            _FRAME_WIDTH,
+            _FRAME_HEIGHT,
+        )
+
+    def _process_track(self, gray: _np.ndarray) -> _HomeHDetection | None:
+        previous = self._detection
+        if previous is None:
+            self._reset_to_search()
+            return None
+        self._track_frame_count += 1
+        optical: _HomeHOpticalResult | None = None
+        if self._previous_gray is not None and self._previous_points is not None:
+            optical = _track_home_h_optical_flow(
+                self._previous_gray,
+                gray,
+                self._previous_points,
+                previous,
+            )
+        search_roi = (
+            None
+            if self._track_frame_count % 15 == 0
+            else self._tracking_roi(previous)
+        )
+        detection = _find_home_h_candidate(
+            gray,
+            search_roi,
+            previous,
+            self._resources,
+        )
+        if detection is None and search_roi is not None:
+            detection = _find_home_h_candidate(
+                gray,
+                None,
+                previous,
+                self._resources,
+            )
+        if (
+            detection is None
+            or detection.score < _HOME_H_TRACK_SCORE_THRESHOLD
+            or not _home_h_detections_are_consistent(previous, detection)
+        ):
+            if optical is not None:
+                self._detection = optical.detection
+                self._previous_gray = gray
+                self._previous_points = optical.points
+                self._miss_count = 0
+                return optical.detection
+            self._miss_count += 1
+            if self._miss_count >= 3:
+                self._reset_to_search()
+            return None
+        self._detection = detection
+        self._previous_gray = gray
+        self._previous_points = _home_h_feature_points(gray, detection)
+        self._miss_count = 0
+        return detection
+
+    def _reset_to_search(self) -> None:
+        self._state = "SEARCH"
+        self._search_history.clear()
+        self._detection = None
+        self._previous_gray = None
+        self._previous_points = None
+        self._track_frame_count = 0
+        self._miss_count = 0
+
+
 def _prepare_gray_frame(frame: _np.ndarray) -> _np.ndarray | None:
     if not isinstance(frame, _np.ndarray) or frame.size == 0:
         return None
@@ -2532,6 +3255,156 @@ def _draw_debug(
     _cv2.imshow(_DEBUG_WINDOW, display)
     key = _cv2.waitKey(1) & 0xFF
     return key not in (ord("q"), ord("Q"))
+
+
+def _draw_home_h_debug(
+    frame: _np.ndarray,
+    tracker: _HomeHTracker,
+    detection: _HomeHDetection | None,
+    output: tuple[float | None, float | None],
+) -> bool:
+    if frame.shape[:2] != (_FRAME_HEIGHT, _FRAME_WIDTH):
+        display = _cv2.resize(
+            frame,
+            (_FRAME_WIDTH, _FRAME_HEIGHT),
+            interpolation=_cv2.INTER_AREA,
+        )
+    else:
+        display = frame.copy()
+    if display.ndim == 2:
+        display = _cv2.cvtColor(display, _cv2.COLOR_GRAY2BGR)
+    _cv2.drawMarker(
+        display,
+        (int(round(_FRAME_CENTER_U)), int(round(_FRAME_CENTER_V))),
+        (255, 255, 255),
+        _cv2.MARKER_CROSS,
+        16,
+        1,
+        _cv2.LINE_AA,
+    )
+    if detection is None:
+        status = f"{tracker._state} no reliable H"
+        offset_text = "x_px=--  y_px=--"
+    else:
+        x0, y0, x1, y1 = detection.bounds
+        _cv2.rectangle(display, (x0, y0), (x1 - 1, y1 - 1), (0, 255, 0), 1)
+        target_point = (
+            int(round(detection.center_u)),
+            int(round(detection.center_v)),
+        )
+        _cv2.drawMarker(
+            display,
+            target_point,
+            (0, 0, 255),
+            _cv2.MARKER_CROSS,
+            18,
+            2,
+            _cv2.LINE_AA,
+        )
+        _cv2.line(
+            display,
+            (int(round(_FRAME_CENTER_U)), int(round(_FRAME_CENTER_V))),
+            target_point,
+            (0, 200, 255),
+            2,
+            _cv2.LINE_AA,
+        )
+        status = f"{tracker._state} H score={detection.score:.2f}"
+        offset_text = f"x_px={output[0]:.2f}  y_px={output[1]:.2f}"
+    _cv2.putText(
+        display,
+        status,
+        (8, 22),
+        _cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (0, 255, 255),
+        1,
+        _cv2.LINE_AA,
+    )
+    _cv2.putText(
+        display,
+        offset_text,
+        (8, 45),
+        _cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (0, 255, 255),
+        1,
+        _cv2.LINE_AA,
+    )
+    _cv2.putText(
+        display,
+        "Q: quit",
+        (8, _FRAME_HEIGHT - 10),
+        _cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (210, 210, 210),
+        1,
+        _cv2.LINE_AA,
+    )
+    _cv2.imshow(_HOME_H_DEBUG_WINDOW, display)
+    key = _cv2.waitKey(1) & 0xFF
+    return key not in (ord("q"), ord("Q"))
+
+
+def track_home_h_marker(
+    camera_index: int,
+) -> _abc.Iterator[tuple[float | None, float | None]]:
+    """Track the fixed home marker's capital-H center.
+
+    Args:
+        camera_index: OpenCV camera index.
+
+    Yields:
+        A tuple ``(x_px, y_px)`` for each processed frame. ``x_px`` is
+        positive toward the top of the image, and ``y_px`` is positive
+        toward the left of the image. If a complete capital H is not
+        reliably detected in the current frame, yields ``(None, None)``.
+
+    Nearby circles are neither detected nor used as a fallback. The return
+    value is a generator; its camera is released when it is closed or exits.
+    """
+    cap = _open_camera(camera_index)
+    capture: _LatestFrameCapture | None = None
+    try:
+        _warm_up_camera(cap)
+        capture = _LatestFrameCapture(cap)
+        capture.start()
+        tracker = _HomeHTracker()
+        sequence = 0
+
+        while True:
+            sequence, frame, _timestamp_ns = capture.read_after(sequence)
+            gray = _prepare_gray_frame(frame)
+            if gray is None:
+                yield None, None
+                continue
+            detection = tracker.process(gray)
+            if detection is None:
+                output: tuple[float | None, float | None] = (None, None)
+            else:
+                output = (
+                    float(_FRAME_CENTER_V - detection.center_v),
+                    float(_FRAME_CENTER_U - detection.center_u),
+                )
+            if _DEBUG and not _draw_home_h_debug(
+                frame,
+                tracker,
+                detection,
+                output,
+            ):
+                return
+            yield output
+    finally:
+        if capture is not None:
+            capture.stop()
+        cap.release()
+        if capture is not None:
+            capture.join()
+        if _DEBUG:
+            try:
+                _cv2.destroyWindow(_HOME_H_DEBUG_WINDOW)
+            except _cv2.error:
+                pass
 
 
 def track_landing_marker(
