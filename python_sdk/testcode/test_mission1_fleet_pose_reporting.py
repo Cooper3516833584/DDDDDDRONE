@@ -36,6 +36,7 @@ fake_navigation = types.ModuleType(
 fake_navigation.Navigation = FakeNavigationBase
 fake_marker = types.ModuleType("landing_marker_offset")
 fake_marker.track_landing_marker = lambda _camera: iter(())
+fake_marker.track_switchable_marker = lambda _camera, _h_mode: iter(())
 stub_modules = {
     "loguru": fake_loguru,
     "FlightController": fake_flight_controller,
@@ -50,9 +51,14 @@ original_modules = {
 sys.modules.update(stub_modules)
 
 from mission1_26_base import (
+    FLEET_TRACE_DRAIN_TIMEOUT_SECONDS,
+    FLEET_TRACE_MIN_DISTANCE_CM,
+    FLEET_TRACE_SAMPLE_INTERVAL_SECONDS,
+    FLEET_TRACE_STATIONARY_KEEPALIVE_SECONDS,
     Mission,
     MissionFleetStateProvider,
     MissionOperationState,
+    drain_terminal_fleet_trace,
 )
 from mission1_26_visual_descent_test import (
     SingleRadarNavigation,
@@ -94,18 +100,37 @@ class FakeNavigation:
 
 
 class FakeMission:
-    def __init__(self, pose_ready):
+    def __init__(self, pose_ready, operation_state=MissionOperationState.READY):
         self.pose_ready = pose_ready
+        self.operation_state = operation_state
 
-    @staticmethod
-    def fleet_status():
-        return MissionOperationState.READY, 0
+    def fleet_status(self):
+        return self.operation_state, 0
 
     def fleet_pose_ready(self):
         return self.pose_ready
 
 
 class MissionFleetPoseReportingTests(unittest.TestCase):
+    def test_mission_trace_density_matches_ground_batch_capacity(self):
+        self.assertEqual(0.25, FLEET_TRACE_SAMPLE_INTERVAL_SECONDS)
+        self.assertEqual(2.0, FLEET_TRACE_MIN_DISTANCE_CM)
+        self.assertEqual(1.0, FLEET_TRACE_STATIONARY_KEEPALIVE_SECONDS)
+
+    def test_terminal_trace_drain_uses_bounded_timeout(self):
+        class FleetNode:
+            timeout = None
+
+            def wait_for_trace_drain(self, timeout):
+                self.timeout = timeout
+                return True
+
+        node = FleetNode()
+
+        drain_terminal_fleet_trace(node)
+
+        self.assertEqual(FLEET_TRACE_DRAIN_TIMEOUT_SECONDS, node.timeout)
+
     def test_single_radar_pose_refreshes_navigation_timestamp(self):
         navigation = object.__new__(SingleRadarNavigation)
         navigation._test_pose = (10.0, 20.0, 15.0, True)
@@ -164,6 +189,22 @@ class MissionFleetPoseReportingTests(unittest.TestCase):
         mission.set_fleet_status(MissionOperationState.TAKEOFF)
 
         self.assertTrue(mission.fleet_pose_ready())
+
+    def test_drop_completed_state_remains_busy_during_low_hover(self):
+        provider = MissionFleetStateProvider(
+            FakeFlightController(),
+            FakeNavigation(),
+            FakeMission(
+                pose_ready=True,
+                operation_state=(
+                    MissionOperationState.MISSION1_DROP_COMPLETED
+                ),
+            ),
+        )
+
+        state = provider()
+
+        self.assertTrue(state.node_flags & int(NodeFlags.BUSY))
 
 
 if __name__ == "__main__":

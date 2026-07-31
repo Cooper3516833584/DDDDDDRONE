@@ -72,7 +72,6 @@ class MissionGroundStationSignals:
 
     TAKEOFF_SIGNAL_RECEIVED = 2
     DROP_STARTED = 6
-    DROP_COMPLETED = 7
 
     def __init__(self, mission: "MovingTargetVisualDescentMission") -> None:
         self._mission = mission
@@ -102,7 +101,10 @@ class MissionGroundStationSignals:
         self._send("drop_started", self.DROP_STARTED)
 
     def send_drop_completed(self) -> None:
-        self._send("drop_completed", self.DROP_COMPLETED)
+        self._send(
+            "drop_completed",
+            mission1.MissionOperationState.MISSION1_DROP_COMPLETED,
+        )
 
     def send_return_started(self) -> None:
         self._send(
@@ -573,10 +575,12 @@ def main() -> None:
             state_provider=mission1.MissionFleetStateProvider(fc, navi, mission),
             trace_options=TraceSamplingOptions(
                 enabled=True,
-                sample_interval_s=0.50,
+                sample_interval_s=mission1.FLEET_TRACE_SAMPLE_INTERVAL_SECONDS,
                 buffer_capacity=600,
-                min_distance_cm=5.0,
-                stationary_keepalive_s=2.0,
+                min_distance_cm=mission1.FLEET_TRACE_MIN_DISTANCE_CM,
+                stationary_keepalive_s=(
+                    mission1.FLEET_TRACE_STATIONARY_KEEPALIVE_SECONDS
+                ),
             ),
         )
         mission.bind_ground_commands(fleet_node.command_queue)
@@ -635,6 +639,7 @@ def main() -> None:
             logger.exception("[MISSION1] Failed to stop radar")
 
         if fleet_node is not None:
+            mission1.drain_terminal_fleet_trace(fleet_node)
             fleet_node.close()
         try:
             fc.close()

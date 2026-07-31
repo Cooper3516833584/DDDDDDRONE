@@ -117,6 +117,34 @@ class MissionOperationState:
     COMPLETED = 11
     STOPPED = 12
     FAULT = 13
+    # MISSION1 only: digital output 0 is off and the payload is released.
+    MISSION1_DROP_COMPLETED = 14
+
+
+FLEET_TRACE_DRAIN_TIMEOUT_SECONDS = 6.0
+FLEET_TRACE_SAMPLE_INTERVAL_SECONDS = 0.25
+FLEET_TRACE_MIN_DISTANCE_CM = 2.0
+FLEET_TRACE_STATIONARY_KEEPALIVE_SECONDS = 1.0
+
+
+def drain_terminal_fleet_trace(fleet_node) -> None:
+    if fleet_node is None:
+        return
+    logger.info(
+        "[GROUND] Waiting up to {:.1f}s for terminal trace drain",
+        FLEET_TRACE_DRAIN_TIMEOUT_SECONDS,
+    )
+    try:
+        drained = fleet_node.wait_for_trace_drain(
+            FLEET_TRACE_DRAIN_TIMEOUT_SECONDS
+        )
+    except Exception:
+        logger.exception("[GROUND] Terminal trace drain failed")
+        return
+    if drained:
+        logger.info("[GROUND] Terminal trace drain confirmed")
+        return
+    logger.warning("[GROUND] Terminal trace drain timed out")
 
 
 class MissionFleetStateProvider:
@@ -151,6 +179,7 @@ class MissionFleetStateProvider:
             MissionOperationState.TAKEOFF,
             MissionOperationState.HOVERING,
             MissionOperationState.ESCORTING,
+            MissionOperationState.MISSION1_DROP_COMPLETED,
             MissionOperationState.RETURNING_HOME,
             MissionOperationState.LANDING_HOME,
         ):
