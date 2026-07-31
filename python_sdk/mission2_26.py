@@ -519,10 +519,10 @@ def main() -> None:
             ),
             trace_options=TraceSamplingOptions(
                 enabled=True,
-                sample_interval_s=0.10,
+                sample_interval_s=0.50,
                 buffer_capacity=600,
-                min_distance_cm=1.0,
-                stationary_keepalive_s=1.0,
+                min_distance_cm=5.0,
+                stationary_keepalive_s=2.0,
             ),
         )
         mission.run()
