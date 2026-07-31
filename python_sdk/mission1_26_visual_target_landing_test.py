@@ -23,7 +23,7 @@ from loguru import logger
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
-import mission1_26 as mission1
+import mission1_26_base as mission1
 import mission1_26_visual_descent_test as descent_test
 
 

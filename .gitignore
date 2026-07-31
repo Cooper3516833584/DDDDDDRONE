@@ -32,3 +32,6 @@ __pycache__/
 /python_sdk/testcode/test_qr_number_display_task.py
 
 .vscode/
+
+/build/keil/
+/tmp/

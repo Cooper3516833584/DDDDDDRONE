@@ -3,6 +3,12 @@ import threading
 import time
 import types
 import unittest
+from pathlib import Path
+
+
+SDK_DIR = Path(__file__).resolve().parents[1]
+if str(SDK_DIR) not in sys.path:
+    sys.path.insert(0, str(SDK_DIR))
 
 from fleet_bus.models import NodeFlags
 
@@ -43,14 +49,17 @@ original_modules = {
 }
 sys.modules.update(stub_modules)
 
-from mission1_26 import (
+from mission1_26_base import (
     Mission,
     MissionFleetStateProvider,
     MissionOperationState,
+)
+from mission1_26_visual_descent_test import (
     SingleRadarNavigation,
 )
 
-sys.modules.pop("mission1_26", None)
+sys.modules.pop("mission1_26_base", None)
+sys.modules.pop("mission1_26_visual_descent_test", None)
 for module_name, original in original_modules.items():
     if original is None:
         sys.modules.pop(module_name, None)

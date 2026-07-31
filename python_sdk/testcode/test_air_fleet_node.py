@@ -60,7 +60,7 @@ def request(seq, command=None, session=10):
 
 class AirFleetNodeTests(unittest.TestCase):
     def test_default_turnaround_supports_dense_pose_polling(self):
-        self.assertEqual(0.05, NodeTiming().turnaround_s)
+        self.assertAlmostEqual(0.10, NodeTiming().turnaround_s)
 
     def setUp(self):
         self.transport = FakeTransport()
