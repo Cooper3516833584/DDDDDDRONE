@@ -95,6 +95,9 @@ class MissionGroundStationSignals:
             "takeoff_succeeded", mission1.MissionOperationState.HOVERING
         )
 
+    def send_pursuit_started(self) -> None:
+        self._send("pursuit_started", mission1.MissionOperationState.CRUISING)
+
     def send_escort_started(self) -> None:
         self._send("escort_started", mission1.MissionOperationState.ESCORTING)
 
@@ -506,6 +509,7 @@ class MovingTargetVisualDescentMission(
         ):
             raise RuntimeError("Failed to start task 1 pursuit trajectory")
 
+        self.signals.send_pursuit_started()
         self._wait_until_target_detected_on_trajectory()
         self.signals.send_escort_started()
         self._perform_target_action()

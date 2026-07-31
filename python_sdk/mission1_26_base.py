@@ -119,6 +119,8 @@ class MissionOperationState:
     FAULT = 13
     # MISSION1 only: digital output 0 is off and the payload is released.
     MISSION1_DROP_COMPLETED = 14
+    # MISSION1 only: pursuit trajectory is running before target acquisition.
+    CRUISING = 15
 
 
 FLEET_TRACE_DRAIN_TIMEOUT_SECONDS = 6.0
@@ -179,6 +181,7 @@ class MissionFleetStateProvider:
         if operation_state in (
             MissionOperationState.TAKEOFF,
             MissionOperationState.HOVERING,
+            MissionOperationState.CRUISING,
             MissionOperationState.ESCORTING,
             MissionOperationState.MISSION1_DROP_COMPLETED,
             MissionOperationState.RETURNING_HOME,

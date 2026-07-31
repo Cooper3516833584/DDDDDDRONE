@@ -208,6 +208,20 @@ class MissionFleetPoseReportingTests(unittest.TestCase):
 
         self.assertTrue(state.node_flags & int(NodeFlags.BUSY))
 
+    def test_cruising_state_remains_busy_during_pursuit(self):
+        provider = MissionFleetStateProvider(
+            FakeFlightController(),
+            FakeNavigation(),
+            FakeMission(
+                pose_ready=True,
+                operation_state=MissionOperationState.CRUISING,
+            ),
+        )
+
+        state = provider()
+
+        self.assertTrue(state.node_flags & int(NodeFlags.BUSY))
+
 
 if __name__ == "__main__":
     unittest.main()
