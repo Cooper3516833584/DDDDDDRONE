@@ -47,6 +47,7 @@ LANDING_APPROACH_SPEED = 15.0
 LANDING_CONTROL_FREQUENCY = 10.0
 LANDING_ALIGNMENT_TIMEOUT = 60.0
 LANDING_FRAME_TIMEOUT = 1.0
+CAMERA_START_TIMEOUT = 10.0
 LANDING_MIN_CONTROL_HEIGHT = 25.0
 LANDING_MAX_CONTROL_HEIGHT = 75.0
 LANDING_TOUCHDOWN_ALTITUDE = 8.0
@@ -128,6 +129,7 @@ class _HomeHOffsetReader:
         self._offsets = track_home_h_marker(camera_index)
         self._output = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
+        self._tracking_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name="home-h-offset-reader",
@@ -144,23 +146,37 @@ class _HomeHOffsetReader:
         except queue.Full:
             pass
 
+    def _read_and_publish(self) -> bool:
+        try:
+            offset = next(self._offsets)
+        except StopIteration:
+            self._publish(
+                (
+                    "error",
+                    RuntimeError("H-marker tracker stopped unexpectedly"),
+                )
+            )
+            return False
+        except Exception as exc:
+            self._publish(("error", exc))
+            return False
+        self._publish(("offset", offset))
+        return True
+
     def _run(self) -> None:
         try:
+            # The first next() opens the camera, warms it up and verifies that
+            # it can produce a frame. H-marker processing remains paused until
+            # the aircraft starts returning from the test waypoint.
+            if not self._read_and_publish():
+                return
             while not self._stop_event.is_set():
-                try:
-                    offset = next(self._offsets)
-                except StopIteration:
-                    self._publish(
-                        (
-                            "error",
-                            RuntimeError("H-marker tracker stopped unexpectedly"),
-                        )
-                    )
+                if not self._tracking_event.wait(timeout=0.1):
+                    continue
+                if self._stop_event.is_set():
+                    break
+                if not self._read_and_publish():
                     return
-                except Exception as exc:
-                    self._publish(("error", exc))
-                    return
-                self._publish(("offset", offset))
         finally:
             try:
                 self._offsets.close()
@@ -170,6 +186,9 @@ class _HomeHOffsetReader:
     def start(self) -> None:
         self._thread.start()
 
+    def enable_tracking(self) -> None:
+        self._tracking_event.set()
+
     def read(self, timeout: float):
         kind, payload = self._output.get(timeout=timeout)
         if kind == "error":
@@ -178,6 +197,7 @@ class _HomeHOffsetReader:
 
     def close(self) -> None:
         self._stop_event.set()
+        self._tracking_event.set()
         self._thread.join(timeout=1.0)
         if self._thread.is_alive():
             logger.warning(
@@ -190,6 +210,7 @@ def visual_home_h_landing(
     fc: FC_Controller,
     navi: Navigation,
     stop_event: threading.Event,
+    offset_reader: _HomeHOffsetReader,
     camera_index: int,
 ) -> bool:
     """下降至50 cm，以H标记完成视觉微调，再交给飞控一键降落。"""
@@ -230,8 +251,6 @@ def visual_home_h_landing(
         LANDING_HEIGHT,
         camera_index,
     )
-    offset_reader = _HomeHOffsetReader(camera_index)
-    offset_reader.start()
     centered = False
     centered_frames = 0
     period = 1.0 / LANDING_CONTROL_FREQUENCY
@@ -349,7 +368,6 @@ def visual_home_h_landing(
             navi.stop_move()
     finally:
         navi.stop_move()
-        offset_reader.close()
 
     if not centered:
         logger.error("[HOME-LAND] H-marker alignment was not confirmed")
@@ -430,6 +448,7 @@ class Mission:
         self.radar = radar
         self.navi = navi
         self.stop_event = stop_event
+        self.camera_reader: Optional[_HomeHOffsetReader] = None
 
     def prepare_navigation(self) -> None:
         """启动单雷达导航、等待有效位姿并以当前位置建立任务原点。"""
@@ -448,6 +467,29 @@ class Mission:
         )
         logger.info(
             "[TEST] Radar basepoint calibrated: {}", self.navi.basepoint
+        )
+
+    def prepare_camera(self) -> None:
+        """Open, warm up and verify the downward camera before takeoff."""
+        if self.camera_reader is not None:
+            return
+        logger.info(
+            "[TEST] Starting downward camera {} before takeoff",
+            CAMERA_INDEX,
+        )
+        reader = _HomeHOffsetReader(CAMERA_INDEX)
+        self.camera_reader = reader
+        reader.start()
+        try:
+            reader.read(timeout=CAMERA_START_TIMEOUT)
+        except queue.Empty as exc:
+            raise RuntimeError(
+                "downward camera did not produce its first frame within "
+                "{:.1f}s".format(CAMERA_START_TIMEOUT)
+            ) from exc
+        logger.info(
+            "[TEST] Downward camera {} is open and producing frames",
+            CAMERA_INDEX,
         )
 
     def monitor_pose(self) -> None:
@@ -471,6 +513,10 @@ class Mission:
     def run(self) -> None:
         """执行快速起飞、单航点导航、返航和定点降落。"""
         logger.warning("[TEST] Confirmed real-flight mode")
+        self.prepare_camera()
+        camera_reader = self.camera_reader
+        if camera_reader is None:
+            raise RuntimeError("downward camera reader was not initialized")
         logger.info(
             "[TEST] Non-pointing vertical takeoff: "
             "first lift 90cm, target {:.0f}cm",
@@ -490,6 +536,11 @@ class Mission:
                 "failed to reach waypoint {}".format(TEST_WAYPOINT)
             )
 
+        logger.info(
+            "[TEST] Start H-marker recognition before returning from {}",
+            TEST_WAYPOINT,
+        )
+        camera_reader.enable_tracking()
         logger.info("[TEST] Return to takeoff point {}", TAKEOFF_POINT)
         if not self.navi.navigation_to_waypoint(TAKEOFF_POINT, wait=True):
             raise RuntimeError("failed to return to takeoff point")
@@ -501,6 +552,7 @@ class Mission:
             fc=self.fc,
             navi=self.navi,
             stop_event=self.stop_event,
+            offset_reader=camera_reader,
             camera_index=CAMERA_INDEX,
         ):
             raise RuntimeError("visual H-marker landing was not confirmed")
@@ -509,6 +561,9 @@ class Mission:
     def stop(self) -> None:
         self.stop_event.set()
         self.navi.stop()
+        if self.camera_reader is not None:
+            self.camera_reader.close()
+            self.camera_reader = None
         logger.info("[TEST] Mission stopped")
 
 
