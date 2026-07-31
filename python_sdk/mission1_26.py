@@ -63,6 +63,9 @@ PURSUIT_APPROACH_SPEED = 25.0
 PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 
+# 完成抛投并恢复巡航高度后的水平返航速度（cm/s）。
+RETURN_SPEED = 40.0
+
 
 class MissionGroundStationSignals:
     """Publish moving-target mission phases through the existing FleetBus link."""
@@ -129,6 +132,7 @@ class MovingTargetVisualDescentMission(
         self.signals = MissionGroundStationSignals(self)
         self._ground_commands = None
         self._digital_output_enabled = False
+        self._drop_indicator_enabled = False
         self.moving_target_descent = MovingTargetDescentController(
             fc=self.fc,
             navi=self.navi,
@@ -355,19 +359,35 @@ class MovingTargetVisualDescentMission(
         )
         self.signals.send_drop_completed()
 
+    def _start_drop_and_indicator(self) -> None:
+        self.fc.set_indicator_led(255, 255, 0)
+        self._drop_indicator_enabled = True
+        logger.info("[MISSION1] Drop indicator LED set to yellow")
+        self.signals.send_drop_started()
+
+    def _stop_drop_indicator(self) -> None:
+        if not self._drop_indicator_enabled:
+            return
+        self.fc.set_indicator_led(0, 0, 0)
+        self._drop_indicator_enabled = False
+        logger.info("[MISSION1] Drop indicator LED turned off")
+
     def _perform_target_action(self) -> None:
-        final_velocity = self.moving_target_descent.follow_and_descend(
-            target_height=DESCENT_TARGET_HEIGHT,
-            stabilize_seconds=STABILIZE_SECONDS,
-            stabilize_timeout=STABILIZE_TIMEOUT_SECONDS,
-            hover_seconds=LOW_HOVER_SECONDS,
-            initial_target_velocity=INITIAL_TARGET_VELOCITY,
-            height_tolerance=descent_test.HEIGHT_TOLERANCE,
-            height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
-            descent_timeout=DESCENT_TIMEOUT_SECONDS,
-            on_descent_start=self.signals.send_drop_started,
-            on_height_reached=self._disable_output_and_report,
-        )
+        try:
+            final_velocity = self.moving_target_descent.follow_and_descend(
+                target_height=DESCENT_TARGET_HEIGHT,
+                stabilize_seconds=STABILIZE_SECONDS,
+                stabilize_timeout=STABILIZE_TIMEOUT_SECONDS,
+                hover_seconds=LOW_HOVER_SECONDS,
+                initial_target_velocity=INITIAL_TARGET_VELOCITY,
+                height_tolerance=descent_test.HEIGHT_TOLERANCE,
+                height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
+                descent_timeout=DESCENT_TIMEOUT_SECONDS,
+                on_descent_start=self._start_drop_and_indicator,
+                on_height_reached=self._disable_output_and_report,
+            )
+        finally:
+            self._stop_drop_indicator()
         logger.info(
             "[MISSION1] Moving-target descent finished; estimated target "
             "velocity=({:.2f}, {:.2f})cm/s",
@@ -482,14 +502,14 @@ class MovingTargetVisualDescentMission(
             pos_thres=PURSUIT_POSITION_THRESHOLD,
         ):
             raise RuntimeError("Failed to start task 1 pursuit trajectory")
-        self.signals.send_escort_started()
 
         self._wait_until_target_detected_on_trajectory()
+        self.signals.send_escort_started()
         self._perform_target_action()
 
         # 返航开始时切换到 H 降落点检测；相机保持全程开启。
         self.enable_h_landing_vision()
-        navi.set_navigation_speed(mission1.PURSUIT_SPEED)
+        navi.set_navigation_speed(RETURN_SPEED)
         if not navi.navigation_to_waypoint(
             mission1.TAKEOFF_POINT,
             wait=True,
