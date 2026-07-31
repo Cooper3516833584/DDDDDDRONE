@@ -562,7 +562,7 @@ def main() -> None:
             trace_options=TraceSamplingOptions(
                 enabled=True,
                 sample_interval_s=mission_base.FLEET_TRACE_SAMPLE_INTERVAL_SECONDS,
-                buffer_capacity=600,
+                buffer_capacity=mission_base.FLEET_TRACE_BUFFER_CAPACITY,
                 min_distance_cm=mission_base.FLEET_TRACE_MIN_DISTANCE_CM,
                 stationary_keepalive_s=(
                     mission_base.FLEET_TRACE_STATIONARY_KEEPALIVE_SECONDS
