@@ -36,6 +36,7 @@ fake_navigation = types.ModuleType(
 fake_navigation.Navigation = FakeNavigationBase
 fake_marker = types.ModuleType("landing_marker_offset")
 fake_marker.track_landing_marker = lambda _camera: iter(())
+fake_marker.track_switchable_marker = lambda _camera, _h_mode: iter(())
 stub_modules = {
     "loguru": fake_loguru,
     "FlightController": fake_flight_controller,
@@ -50,9 +51,11 @@ original_modules = {
 sys.modules.update(stub_modules)
 
 from mission1_26_base import (
+    FLEET_TRACE_DRAIN_TIMEOUT_SECONDS,
     Mission,
     MissionFleetStateProvider,
     MissionOperationState,
+    drain_terminal_fleet_trace,
 )
 from mission1_26_visual_descent_test import (
     SingleRadarNavigation,
@@ -106,6 +109,20 @@ class FakeMission:
 
 
 class MissionFleetPoseReportingTests(unittest.TestCase):
+    def test_terminal_trace_drain_uses_bounded_timeout(self):
+        class FleetNode:
+            timeout = None
+
+            def wait_for_trace_drain(self, timeout):
+                self.timeout = timeout
+                return True
+
+        node = FleetNode()
+
+        drain_terminal_fleet_trace(node)
+
+        self.assertEqual(FLEET_TRACE_DRAIN_TIMEOUT_SECONDS, node.timeout)
+
     def test_single_radar_pose_refreshes_navigation_timestamp(self):
         navigation = object.__new__(SingleRadarNavigation)
         navigation._test_pose = (10.0, 20.0, 15.0, True)

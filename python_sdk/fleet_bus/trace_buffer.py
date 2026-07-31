@@ -109,6 +109,12 @@ class PoseTraceBuffer:
         with self._lock:
             return len(self._samples)
 
+    def latest_cursor(self) -> Tuple[int, int]:
+        """Return one lock-consistent trace session and latest sample sequence."""
+        with self._lock:
+            latest_sample_seq = self._samples[-1].sample_seq if self._samples else 0
+            return self._trace_session, latest_sample_seq
+
     def _next_session(self, previous: Optional[int]) -> int:
         while True:
             value = self._session_factory()

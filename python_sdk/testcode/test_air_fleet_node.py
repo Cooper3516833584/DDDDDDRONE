@@ -412,6 +412,61 @@ class AirFleetNodeTests(unittest.TestCase):
         self.wait_for_writes(2)
         self.assertEqual(first_response, self.transport.writes[1])
 
+    def test_terminal_trace_drain_waits_for_matching_cursor(self):
+        self.node.trace_buffer.record(
+            TraceSample(100, 1, 2, 3, 400, 4, 1)
+        )
+        trace_session = self.node.trace_buffer.trace_session
+        result = []
+        waiter = threading.Thread(
+            target=lambda: result.append(self.node.wait_for_trace_drain(0.5))
+        )
+        waiter.start()
+
+        self.node.feed_bytes(trace_request(
+            25,
+            TraceRequestPayload(trace_session ^ 1, 1, 4, 0),
+        ))
+        self.wait_for_writes(1)
+        time.sleep(0.02)
+        self.assertTrue(waiter.is_alive())
+        self.node.feed_bytes(trace_request(
+            26,
+            TraceRequestPayload(trace_session, 0, 4, 0),
+        ))
+        self.wait_for_writes(2)
+        time.sleep(0.02)
+        self.assertTrue(waiter.is_alive())
+        self.node.feed_bytes(trace_request(
+            27,
+            TraceRequestPayload(trace_session, 1, 4, 0),
+        ))
+        self.wait_for_writes(3)
+
+        waiter.join(0.5)
+        self.assertEqual([True], result)
+
+    def test_terminal_trace_drain_times_out_without_confirmation(self):
+        self.node.trace_buffer.record(
+            TraceSample(100, 1, 2, 3, 400, 4, 1)
+        )
+        self.assertFalse(self.node.wait_for_trace_drain(0.02))
+
+    def test_close_interrupts_terminal_trace_drain(self):
+        self.node.trace_buffer.record(
+            TraceSample(100, 1, 2, 3, 400, 4, 1)
+        )
+        result = []
+        waiter = threading.Thread(
+            target=lambda: result.append(self.node.wait_for_trace_drain(1.0))
+        )
+        waiter.start()
+
+        self.node.close()
+
+        waiter.join(0.5)
+        self.assertEqual([False], result)
+
     def test_invalid_trace_sample_is_rejected_before_it_can_poison_buffer(self):
         with self.assertRaises(ProtocolError):
             self.node.trace_buffer.record(

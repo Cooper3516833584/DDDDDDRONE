@@ -615,6 +615,7 @@ def main() -> None:
             logger.exception("[MISSION1] Failed to stop radar")
 
         if fleet_node is not None:
+            mission1.drain_terminal_fleet_trace(fleet_node)
             fleet_node.close()
         try:
             fc.close()

@@ -119,6 +119,29 @@ class MissionOperationState:
     FAULT = 13
 
 
+FLEET_TRACE_DRAIN_TIMEOUT_SECONDS = 6.0
+
+
+def drain_terminal_fleet_trace(fleet_node) -> None:
+    if fleet_node is None:
+        return
+    logger.info(
+        "[GROUND] Waiting up to {:.1f}s for terminal trace drain",
+        FLEET_TRACE_DRAIN_TIMEOUT_SECONDS,
+    )
+    try:
+        drained = fleet_node.wait_for_trace_drain(
+            FLEET_TRACE_DRAIN_TIMEOUT_SECONDS
+        )
+    except Exception:
+        logger.exception("[GROUND] Terminal trace drain failed")
+        return
+    if drained:
+        logger.info("[GROUND] Terminal trace drain confirmed")
+        return
+    logger.warning("[GROUND] Terminal trace drain timed out")
+
+
 class MissionFleetStateProvider:
     """Publish the mission phase and launch-point-relative navigation pose."""
 
