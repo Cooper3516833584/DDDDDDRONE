@@ -22,8 +22,9 @@
 - 主机名：`fc-ubuntu`
 - 飞控串口：`/dev/ttyACM0`
 - HC-14 已从飞控 `UT2/USART2` 移到 CH340 测试架，通过 USB 直接连接机载 Linux
-- HC-14 默认路径：`/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`
+- HC-14：`/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 -> /dev/ttyUSB1`
 - HC-14 USB 标识：CH340，USB ID `1a86:7523`
+- 雷达 CP2102：`/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0 -> /dev/ttyUSB0`
 
 生产 FleetBus 由机载上位机直接打开 CH340/HC-14，与小车使用相同物理链路和 `BB 33` 封装。它不再调用飞控命令 `0x0D`、无线回调或 `UT2/USART2`。优先使用稳定的 `/dev/serial/by-id/` 路径；若实际 CH340 标识不同，通过 `D_TASK_HC14_PORT` 覆盖，不要猜测易变的 `/dev/ttyUSB*` 编号。地面站仍不得打开 `/dev/ttyACM0`。
 
@@ -127,7 +128,7 @@ C:\Users\TZDEZACR\Desktop\ground_station\Ground_Station\components
 - 互换后首次真实 PING 收到 `RECEIVED -> ACCEPTED -> COMPLETED`，最终状态为 `COMPLETED`，重传 0 次；
 - 随后连续 5 次真实 PING 均收到相同完整 ACK 序列，最终状态均为 `COMPLETED`，重传均为 0 次，近距离低频 HC-14 双向通信验证通过。
 
-2026-08-01 用户已将机载 HC-14 移到 CH340 测试架并通过 USB 连接上位机。代码已切换为直连方案；机载实际 `/dev/serial/by-id/` 枚举、直连 PING、15 点 TRACE 高吞吐、真实飞行距离、飞行中干扰和长期稳定性仍需在设备恢复 SSH 后验证。
+2026-08-01 用户已将机载 HC-14 移到 CH340 测试架并通过 USB 连接上位机。SSH 枚举已确认 CH340 稳定路径映射到 `/dev/ttyUSB1`，CP2102 雷达仍映射到 `/dev/ttyUSB0`。代码已切换为直连方案；直连 PING、15 点 TRACE 高吞吐、真实飞行距离、飞行中干扰和长期稳定性仍需验证。
 
 ## 6. 推荐排障顺序
 
