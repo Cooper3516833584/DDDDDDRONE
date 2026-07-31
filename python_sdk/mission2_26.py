@@ -3,6 +3,11 @@
 本入口会直连真实飞控、单雷达和相机并执行两次起飞与两次降落。运行前
 必须确认 ``server_ros.py`` 及其他 ``FC_Server`` 已关闭，并清空追及
 路线、移动平台和返航区域。任务二不控制任何数字输出通道。
+
+起飞采用非定点垂直起飞（90 cm 一键离地后垂直爬升至 150 cm），
+该阶段垂直速度设为 30 cm/s。返航开始时切换到 H 降落点检测，
+下降至 60 cm 后以 30 像素阈值完成视觉校准，再在该点定点降落，
+降落阶段垂直速度设为 15 cm/s。相机全程保持开启，不重复开关。
 """
 
 import math
@@ -292,7 +297,6 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             final_velocity[1],
         )
 
-        self._stop_vision_tracker()
         land_on_target_and_confirm_lock(
             self.fc,
             self.navi,
@@ -333,6 +337,8 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
 
     def _return_home_and_land(self) -> None:
         self.signals.send_return_started()
+        # 返航开始时切换到 H 降落点检测；相机保持全程开启。
+        self.enable_h_landing_vision()
         self.navi.set_navigation_speed(RETURN_SPEED)
         if not self.navi.navigation_to_waypoint(
             mission_base.TAKEOFF_POINT,
@@ -340,11 +346,10 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         ):
             raise RuntimeError("Failed to return to initial takeoff point")
         self.signals.send_landing_started()
-        self._finish_at_takeoff_point()
+        self._visual_h_landing_at_takeoff()
 
     def _recover_home_after_expected_failure(self, reason: str) -> None:
         logger.error("[MISSION2] Safe return requested: {}", reason)
-        self._stop_vision_tracker()
         self.navi.navigation_stop_here()
         if not self.fc.state.unlock.value:
             self.set_fleet_status(
@@ -418,10 +423,11 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         self.fc.set_indicator_led(0, 255, 0)
         self.signals.send_takeoff_started()
 
-        navi.pointing_takeoff(
-            mission_base.TAKEOFF_POINT,
+        navi.set_vertical_speed(mission_base.FAST_TAKEOFF_VERTICAL_SPEED)
+        navi.fast_non_pointing_takeoff(
             target_height=CRUISE_HEIGHT,
         )
+        navi.set_vertical_speed(VERTICAL_SPEED)
         self.signals.send_takeoff_succeeded()
         self.fc.set_indicator_led(0, 0, 0)
         navi.set_yaw(0)

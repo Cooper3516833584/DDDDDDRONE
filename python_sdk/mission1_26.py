@@ -5,10 +5,15 @@
 定点降落框架。发现移动目标后，连续有效伴飞 10 秒，
 在同一视觉速度接管内从 150 cm 下降到 40 cm，并继续伴飞 2 秒。
 
+起飞采用非定点垂直起飞（90 cm 一键离地后垂直爬升至 150 cm），
+该阶段垂直速度设为 30 cm/s。返航开始时切换到 H 降落点检测，
+下降至 60 cm 后以 30 像素阈值完成视觉校准，再在该点定点降落，
+降落阶段垂直速度设为 15 cm/s。相机全程保持开启，不重复开关。
+
 本文件会连接真实飞控、雷达和相机并执行飞行。运行前必须确认
 server_ros.py 及其他 FC_Server 已关闭、现场和投放区域安全。
 地面站通过 FleetBus 依次发送准备和起飞命令；准备命令开启电磁铁，
-起飞命令仅在地面站完成三端联调时序后放行定点起飞。
+起飞命令仅在地面站完成三端联调时序后放行非定点起飞。
 """
 
 import csv
@@ -254,7 +259,6 @@ class MovingTargetVisualDescentMission(
         )
 
         self.signals.send_return_started()
-        self._stop_vision_tracker()
         self.navi.set_height(float(mission1.CRUISE_HEIGHT))
         self.navi.keep_height_flag = True
         if not self.navi.wait_for_height(
@@ -316,10 +320,11 @@ class MovingTargetVisualDescentMission(
         self.signals.send_takeoff_started()
 
         try:
-            navi.pointing_takeoff(
-                mission1.TAKEOFF_POINT,
+            navi.set_vertical_speed(mission1.FAST_TAKEOFF_VERTICAL_SPEED)
+            navi.fast_non_pointing_takeoff(
                 target_height=mission1.CRUISE_HEIGHT,
             )
+            navi.set_vertical_speed(mission1.VERTICAL_SPEED)
             self._ground_commands.complete(takeoff_command)
         except Exception:
             self._ground_commands.fail(takeoff_command, error_code=1)
@@ -354,6 +359,8 @@ class MovingTargetVisualDescentMission(
         self.signals.send_escort_started()
         self._perform_target_action()
 
+        # 返航开始时切换到 H 降落点检测；相机保持全程开启。
+        self.enable_h_landing_vision()
         navi.set_navigation_speed(mission1.PURSUIT_SPEED)
         if not navi.navigation_to_waypoint(
             mission1.TAKEOFF_POINT,
@@ -362,7 +369,7 @@ class MovingTargetVisualDescentMission(
             raise RuntimeError("Failed to return to takeoff point")
 
         self.signals.send_landing_started()
-        self._finish_at_takeoff_point()
+        self._visual_h_landing_at_takeoff()
         self.signals.send_mission_completed()
         logger.info(
             "[MISSION1] Moving-target visual descent flight completed"
