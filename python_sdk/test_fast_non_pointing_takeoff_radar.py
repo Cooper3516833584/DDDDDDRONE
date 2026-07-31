@@ -18,11 +18,14 @@
 """
 
 import argparse
+import csv
 import math
 import queue
 import sys
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -35,6 +38,7 @@ from landing_marker_offset import track_home_h_marker
 
 FC_SERIAL_DEV = "/dev/ttyACM0"
 CAMERA_INDEX = 0
+VIDEO_OUTPUT_DIR_NAME = "fc_log"
 CRUISE_SPEED = 15.0
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 22.0
@@ -57,6 +61,141 @@ TAKEOFF_POINT = (0.0, 0.0)
 TEST_WAYPOINT = (100.0, 0.0)
 RADAR_POSE_READY_TIMEOUT = 15.0
 MONITOR_INTERVAL = 1.0
+
+
+def _safe_float(value, default: float = math.nan) -> float:
+    try:
+        result = float(value)
+    except Exception:
+        return default
+    if not math.isfinite(result):
+        return default
+    return result
+
+
+def _fc_mode_value(fc: FC_Controller) -> Optional[int]:
+    try:
+        return int(fc.state.mode.value)
+    except Exception:
+        return None
+
+
+def _fc_unlock_value(fc: FC_Controller) -> Optional[bool]:
+    try:
+        return bool(fc.state.unlock.value)
+    except Exception:
+        return None
+
+
+def _navi_snapshot(navi: Navigation) -> dict:
+    pose_fresh = None
+    try:
+        pose_fresh = bool(navi.pose_is_fresh())
+    except Exception:
+        pass
+    return {
+        "x_cm": _safe_float(getattr(navi, "current_x", None)),
+        "y_cm": _safe_float(getattr(navi, "current_y", None)),
+        "yaw_deg": _safe_float(getattr(navi, "current_yaw", None)),
+        "height_cm": _safe_float(getattr(navi, "current_height", None)),
+        "pose_fresh": pose_fresh,
+    }
+
+
+class _LandingTelemetryLog:
+    """Append-only CSV telemetry log for diagnosing landing accuracy."""
+
+    _FIELDS = [
+        "wall_time",
+        "monotonic_s",
+        "phase",
+        "x_px",
+        "y_px",
+        "pixel_distance_px",
+        "height_cm",
+        "x_cm",
+        "y_cm",
+        "yaw_deg",
+        "fc_mode",
+        "unlock",
+        "pose_fresh",
+        "direction_deg",
+        "speed_cm_s",
+        "centered_frames",
+        "message",
+    ]
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._closed = False
+        self._file = path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=self._FIELDS)
+        self._writer.writeheader()
+        self._file.flush()
+
+    def write(
+        self,
+        phase: str,
+        x_px: Optional[float] = None,
+        y_px: Optional[float] = None,
+        height_cm: Optional[float] = None,
+        x_cm: Optional[float] = None,
+        y_cm: Optional[float] = None,
+        yaw_deg: Optional[float] = None,
+        fc_mode: Optional[int] = None,
+        unlock: Optional[bool] = None,
+        pose_fresh: Optional[bool] = None,
+        direction_deg: Optional[float] = None,
+        speed_cm_s: Optional[float] = None,
+        centered_frames: Optional[int] = None,
+        message: str = "",
+    ) -> None:
+        pixel_distance_px = (
+            math.hypot(x_px, y_px)
+            if x_px is not None and y_px is not None
+            else None
+        )
+        row = {
+            "wall_time": datetime.now().isoformat(timespec="milliseconds"),
+            "monotonic_s": time.monotonic(),
+            "phase": phase,
+            "x_px": x_px,
+            "y_px": y_px,
+            "pixel_distance_px": pixel_distance_px,
+            "height_cm": height_cm,
+            "x_cm": x_cm,
+            "y_cm": y_cm,
+            "yaw_deg": yaw_deg,
+            "fc_mode": fc_mode,
+            "unlock": unlock,
+            "pose_fresh": pose_fresh,
+            "direction_deg": direction_deg,
+            "speed_cm_s": speed_cm_s,
+            "centered_frames": centered_frames,
+            "message": message,
+        }
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self._writer.writerow(row)
+                self._file.flush()
+            except Exception:
+                logger.exception(
+                    "[HOME-LAND] Failed to write telemetry row"
+                )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._file.flush()
+                self._file.close()
+            except Exception:
+                logger.exception("[HOME-LAND] Failed to close telemetry log")
 
 
 class SingleRadarNavigation(Navigation):
@@ -125,8 +264,16 @@ def wait_for_radar_pose(
 class _HomeHOffsetReader:
     """在守护线程中读取相机，向控制线程只提供最新一帧偏移。"""
 
-    def __init__(self, camera_index: int):
-        self._offsets = track_home_h_marker(camera_index)
+    def __init__(
+        self,
+        camera_index: int,
+        video_output_path: Optional[str] = None,
+    ):
+        self._offsets = track_home_h_marker(
+            camera_index,
+            video_output_path=video_output_path,
+        )
+        self.video_output_path = video_output_path
         self._output = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._tracking_event = threading.Event()
@@ -212,8 +359,22 @@ def visual_home_h_landing(
     stop_event: threading.Event,
     offset_reader: _HomeHOffsetReader,
     camera_index: int,
+    telemetry_log: Optional[_LandingTelemetryLog] = None,
 ) -> bool:
     """下降至50 cm，以H标记完成视觉微调，再交给飞控一键降落。"""
+    snapshot = _navi_snapshot(navi)
+    if telemetry_log is not None:
+        telemetry_log.write(
+            "visual_landing_start",
+            height_cm=snapshot["height_cm"],
+            x_cm=snapshot["x_cm"],
+            y_cm=snapshot["y_cm"],
+            yaw_deg=snapshot["yaw_deg"],
+            fc_mode=_fc_mode_value(fc),
+            unlock=_fc_unlock_value(fc),
+            pose_fresh=snapshot["pose_fresh"],
+            message="descend to 50cm and align over home H",
+        )
     if stop_event.is_set():
         logger.warning("[HOME-LAND] Visual landing stopped before descent")
         return False
@@ -251,6 +412,19 @@ def visual_home_h_landing(
         LANDING_HEIGHT,
         camera_index,
     )
+    snapshot = _navi_snapshot(navi)
+    if telemetry_log is not None:
+        telemetry_log.write(
+            "visual_approach_height",
+            height_cm=snapshot["height_cm"],
+            x_cm=snapshot["x_cm"],
+            y_cm=snapshot["y_cm"],
+            yaw_deg=snapshot["yaw_deg"],
+            fc_mode=_fc_mode_value(fc),
+            unlock=_fc_unlock_value(fc),
+            pose_fresh=snapshot["pose_fresh"],
+            message="visual approach height reached",
+        )
     centered = False
     centered_frames = 0
     period = 1.0 / LANDING_CONTROL_FREQUENCY
@@ -298,6 +472,25 @@ def visual_home_h_landing(
                     )
                 )
             except queue.Empty:
+                if telemetry_log is not None:
+                    telemetry_log.write(
+                        "camera_frame_timeout",
+                        height_cm=_safe_float(navi.current_height),
+                        x_cm=_safe_float(navi.current_x),
+                        y_cm=_safe_float(navi.current_y),
+                        yaw_deg=_safe_float(navi.current_yaw),
+                        fc_mode=_fc_mode_value(fc),
+                        unlock=_fc_unlock_value(fc),
+                        pose_fresh=(
+                            None
+                            if not hasattr(navi, "pose_is_fresh")
+                            else navi.pose_is_fresh()
+                        ),
+                        message=(
+                            "no new H-marker camera frame within "
+                            f"{LANDING_FRAME_TIMEOUT:.1f}s"
+                        ),
+                    )
                 logger.error(
                     "[HOME-LAND] No new H-marker camera frame within {:.1f}s",
                     LANDING_FRAME_TIMEOUT,
@@ -333,6 +526,22 @@ def visual_home_h_landing(
 
             if x_px is None or y_px is None:
                 centered_frames = 0
+                if telemetry_log is not None:
+                    telemetry_log.write(
+                        "no_h_marker",
+                        height_cm=_safe_float(navi.current_height),
+                        x_cm=_safe_float(navi.current_x),
+                        y_cm=_safe_float(navi.current_y),
+                        yaw_deg=_safe_float(navi.current_yaw),
+                        fc_mode=_fc_mode_value(fc),
+                        unlock=_fc_unlock_value(fc),
+                        pose_fresh=(
+                            None
+                            if not hasattr(navi, "pose_is_fresh")
+                            else navi.pose_is_fresh()
+                        ),
+                        centered_frames=0,
+                    )
                 stop_event.wait(period)
                 continue
 
@@ -352,6 +561,27 @@ def visual_home_h_landing(
                     LANDING_CENTER_CONFIRM_FRAMES,
                     distance_px,
                 )
+                if telemetry_log is not None:
+                    telemetry_log.write(
+                        "h_offset",
+                        x_px=x_px,
+                        y_px=y_px,
+                        height_cm=_safe_float(navi.current_height),
+                        x_cm=_safe_float(navi.current_x),
+                        y_cm=_safe_float(navi.current_y),
+                        yaw_deg=_safe_float(navi.current_yaw),
+                        fc_mode=_fc_mode_value(fc),
+                        unlock=_fc_unlock_value(fc),
+                        pose_fresh=(
+                            None
+                            if not hasattr(navi, "pose_is_fresh")
+                            else navi.pose_is_fresh()
+                        ),
+                        direction_deg=0.0,
+                        speed_cm_s=0.0,
+                        centered_frames=centered_frames,
+                        message="H marker centered",
+                    )
                 if centered_frames >= LANDING_CENTER_CONFIRM_FRAMES:
                     centered = True
                     break
@@ -364,12 +594,49 @@ def visual_home_h_landing(
                 speed=LANDING_APPROACH_SPEED,
                 direction_deg=direction_deg,
             )
+            if telemetry_log is not None:
+                telemetry_log.write(
+                    "h_offset",
+                    x_px=x_px,
+                    y_px=y_px,
+                    height_cm=_safe_float(navi.current_height),
+                    x_cm=_safe_float(navi.current_x),
+                    y_cm=_safe_float(navi.current_y),
+                    yaw_deg=_safe_float(navi.current_yaw),
+                    fc_mode=_fc_mode_value(fc),
+                    unlock=_fc_unlock_value(fc),
+                    pose_fresh=(
+                        None
+                        if not hasattr(navi, "pose_is_fresh")
+                        else navi.pose_is_fresh()
+                    ),
+                    direction_deg=direction_deg,
+                    speed_cm_s=LANDING_APPROACH_SPEED,
+                    centered_frames=0,
+                    message="visual correction command",
+                )
             stop_event.wait(period)
             navi.stop_move()
     finally:
         navi.stop_move()
 
     if not centered:
+        if telemetry_log is not None:
+            telemetry_log.write(
+                "alignment_failed",
+                height_cm=_safe_float(navi.current_height),
+                x_cm=_safe_float(navi.current_x),
+                y_cm=_safe_float(navi.current_y),
+                yaw_deg=_safe_float(navi.current_yaw),
+                fc_mode=_fc_mode_value(fc),
+                unlock=_fc_unlock_value(fc),
+                pose_fresh=(
+                    None
+                    if not hasattr(navi, "pose_is_fresh")
+                    else navi.pose_is_fresh()
+                ),
+                message="H-marker alignment was not confirmed",
+            )
         logger.error("[HOME-LAND] H-marker alignment was not confirmed")
         return False
     if not fc.state.is_fresh(0.5) or not fc.state.unlock.value:
@@ -382,6 +649,22 @@ def visual_home_h_landing(
     time.sleep(0.1)
     fc.stablize()
     fc.land()
+    if telemetry_log is not None:
+        telemetry_log.write(
+            "landing_command",
+            height_cm=_safe_float(navi.current_height),
+            x_cm=_safe_float(navi.current_x),
+            y_cm=_safe_float(navi.current_y),
+            yaw_deg=_safe_float(navi.current_yaw),
+            fc_mode=_fc_mode_value(fc),
+            unlock=_fc_unlock_value(fc),
+            pose_fresh=(
+                None
+                if not hasattr(navi, "pose_is_fresh")
+                else navi.pose_is_fresh()
+            ),
+            message="program mode stabilize and land",
+        )
 
     started_at = time.perf_counter()
     landed = False
@@ -399,6 +682,14 @@ def visual_home_h_landing(
             break
 
     if not landed:
+        if telemetry_log is not None:
+            telemetry_log.write(
+                "landing_timeout",
+                height_cm=altitude,
+                fc_mode=_fc_mode_value(fc),
+                unlock=_fc_unlock_value(fc),
+                message="landing timeout; keep landing command active",
+            )
         logger.error(
             "[HOME-LAND] Landing timeout; keep landing command active and "
             "refuse airborne force-lock"
@@ -433,6 +724,18 @@ def visual_home_h_landing(
                 "fresh touchdown altitude"
             )
             return False
+    if telemetry_log is not None:
+        telemetry_log.write(
+            "locked",
+            height_cm=(
+                float(fc.state.alt_add.value)
+                if fc.state.is_fresh(0.5)
+                else None
+            ),
+            fc_mode=_fc_mode_value(fc),
+            unlock=_fc_unlock_value(fc),
+            message="landing lock confirmed",
+        )
     return True
 
 
@@ -449,6 +752,33 @@ class Mission:
         self.navi = navi
         self.stop_event = stop_event
         self.camera_reader: Optional[_HomeHOffsetReader] = None
+        self.video_path: Optional[Path] = None
+        self.telemetry_log: Optional[_LandingTelemetryLog] = None
+
+    def _new_runtime_path(self, prefix: str, suffix: str) -> Path:
+        log_dir = Path(__file__).resolve().parent / VIDEO_OUTPUT_DIR_NAME
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return log_dir / (
+            prefix
+            + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            + suffix
+        )
+
+    def _log_phase(self, phase: str, message: str = "") -> None:
+        if self.telemetry_log is None:
+            return
+        snapshot = _navi_snapshot(self.navi)
+        self.telemetry_log.write(
+            phase,
+            height_cm=snapshot["height_cm"],
+            x_cm=snapshot["x_cm"],
+            y_cm=snapshot["y_cm"],
+            yaw_deg=snapshot["yaw_deg"],
+            fc_mode=_fc_mode_value(self.fc),
+            unlock=_fc_unlock_value(self.fc),
+            pose_fresh=snapshot["pose_fresh"],
+            message=message,
+        )
 
     def prepare_navigation(self) -> None:
         """启动单雷达导航、等待有效位姿并以当前位置建立任务原点。"""
@@ -473,11 +803,26 @@ class Mission:
         """Open, warm up and verify the downward camera before takeoff."""
         if self.camera_reader is not None:
             return
+        video_path = self._new_runtime_path(
+            "home_h_landing_video_",
+            ".avi",
+        )
+        telemetry_path = self._new_runtime_path(
+            "home_h_landing_telemetry_",
+            ".csv",
+        )
+        logger.info("[TEST] Video recording path: {}", video_path)
+        logger.info("[TEST] Telemetry log path: {}", telemetry_path)
+        self.video_path = video_path
+        self.telemetry_log = _LandingTelemetryLog(telemetry_path)
         logger.info(
             "[TEST] Starting downward camera {} before takeoff",
             CAMERA_INDEX,
         )
-        reader = _HomeHOffsetReader(CAMERA_INDEX)
+        reader = _HomeHOffsetReader(
+            CAMERA_INDEX,
+            video_output_path=str(video_path),
+        )
         self.camera_reader = reader
         reader.start()
         try:
@@ -490,6 +835,9 @@ class Mission:
         logger.info(
             "[TEST] Downward camera {} is open and producing frames",
             CAMERA_INDEX,
+        )
+        logger.info(
+            "[TEST] Video recording and telemetry logging started"
         )
 
     def monitor_pose(self) -> None:
@@ -514,6 +862,7 @@ class Mission:
         """执行快速起飞、单航点导航、返航和定点降落。"""
         logger.warning("[TEST] Confirmed real-flight mode")
         self.prepare_camera()
+        self._log_phase("camera_ready", message="downward camera verified")
         camera_reader = self.camera_reader
         if camera_reader is None:
             raise RuntimeError("downward camera reader was not initialized")
@@ -525,25 +874,42 @@ class Mission:
         self.navi.fast_non_pointing_takeoff(
             target_height=CRUISE_HEIGHT,
         )
+        self._log_phase(
+            "takeoff_complete",
+            message=f"target cruise height {CRUISE_HEIGHT:.0f}cm",
+        )
 
         self.navi.set_yaw(0)
         if not self.navi.wait_for_yaw():
             raise RuntimeError("yaw stabilization was not confirmed")
+        self._log_phase("yaw_ready", message="yaw stabilized to 0deg")
 
         logger.info("[TEST] Navigate to waypoint {}", TEST_WAYPOINT)
         if not self.navi.navigation_to_waypoint(TEST_WAYPOINT, wait=True):
             raise RuntimeError(
                 "failed to reach waypoint {}".format(TEST_WAYPOINT)
             )
+        self._log_phase(
+            "waypoint_reached",
+            message=f"waypoint {TEST_WAYPOINT} reached",
+        )
 
         logger.info(
             "[TEST] Start H-marker recognition before returning from {}",
             TEST_WAYPOINT,
         )
         camera_reader.enable_tracking()
+        self._log_phase(
+            "home_tracking_enabled",
+            message="H-marker recognition enabled before return",
+        )
         logger.info("[TEST] Return to takeoff point {}", TAKEOFF_POINT)
         if not self.navi.navigation_to_waypoint(TAKEOFF_POINT, wait=True):
             raise RuntimeError("failed to return to takeoff point")
+        self._log_phase(
+            "returned_home",
+            message=f"takeoff point {TAKEOFF_POINT} reached",
+        )
 
         logger.info(
             "[TEST] Descend to 50cm, align over home H marker and land"
@@ -554,8 +920,13 @@ class Mission:
             stop_event=self.stop_event,
             offset_reader=camera_reader,
             camera_index=CAMERA_INDEX,
+            telemetry_log=self.telemetry_log,
         ):
             raise RuntimeError("visual H-marker landing was not confirmed")
+        self._log_phase(
+            "landing_complete",
+            message="visual H-marker landing completed",
+        )
         logger.info("[TEST] Fast takeoff navigation flight completed")
 
     def stop(self) -> None:
@@ -564,6 +935,30 @@ class Mission:
         if self.camera_reader is not None:
             self.camera_reader.close()
             self.camera_reader = None
+        if self.telemetry_log is not None:
+            self.telemetry_log.write(
+                "mission_stopped",
+                height_cm=_safe_float(self.navi.current_height),
+                x_cm=_safe_float(self.navi.current_x),
+                y_cm=_safe_float(self.navi.current_y),
+                yaw_deg=_safe_float(self.navi.current_yaw),
+                fc_mode=_fc_mode_value(self.fc),
+                unlock=_fc_unlock_value(self.fc),
+                pose_fresh=(
+                    None
+                    if not hasattr(self.navi, "pose_is_fresh")
+                    else self.navi.pose_is_fresh()
+                ),
+                message="mission stopped",
+            )
+            self.telemetry_log.close()
+            logger.info(
+                "[TEST] Telemetry log closed: {}",
+                self.telemetry_log.path,
+            )
+            self.telemetry_log = None
+        if self.video_path is not None:
+            logger.info("[TEST] Video recording path: {}", self.video_path)
         logger.info("[TEST] Mission stopped")
 
 
