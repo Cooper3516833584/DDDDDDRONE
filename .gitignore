@@ -5,9 +5,18 @@
 /*.xlsm
 /*.xlsb
 
-# Python bytecode caches
+# Python bytecode and tool caches
 __pycache__/
 *.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # Runtime inventory records
 /python_sdk/2024_D_24_inventory.json
