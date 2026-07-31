@@ -1,0 +1,21 @@
+[Unit]
+Description=D-task drone mission dispatcher
+After=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=fc
+WorkingDirectory=@PYTHON_SDK_DIR@
+ExecStart=/usr/bin/python3 -u @PYTHON_SDK_DIR@/d_task_dispatcher.py
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+KillMode=control-group
+Environment=PYTHONUNBUFFERED=1
+UMask=0022
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

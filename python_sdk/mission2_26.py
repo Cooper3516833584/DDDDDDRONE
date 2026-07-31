@@ -67,16 +67,6 @@ class TargetNotFoundError(RuntimeError):
 class Mission2Signals(mission1.MissionGroundStationSignals):
     """任务二新增阶段的通信占位和 FleetBus 状态映射。"""
 
-    def wait_for_takeoff_signal(self) -> None:
-        logger.info("[GROUND] Waiting for terminal takeoff signal")
-        descent_test.wait_for_terminal_start_command(
-            digital_output_enabled=False
-        )
-        self._send(
-            "takeoff_signal_received",
-            self.TAKEOFF_SIGNAL_RECEIVED,
-        )
-
     def send_pursuit_started(self) -> None:
         self._send(
             "task2_pursuit_started",
@@ -410,18 +400,35 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         )
 
         self._start_vision_tracker()
-        self.signals.send_initialization_success()
         self.fc.set_indicator_led(255, 0, 0)
-        self.signals.wait_for_takeoff_signal()
+        prepare_command = self._wait_for_ground_command(
+            mission1.CommandId.DRONE_PREPARE_MISSION
+        )
+        try:
+            self.signals.send_initialization_success()
+            self._ground_commands.complete(prepare_command)
+        except Exception:
+            self._ground_commands.fail(prepare_command, error_code=1)
+            raise
+        takeoff_command = self._wait_for_ground_command(
+            mission1.CommandId.DRONE_START_MISSION
+        )
+        self.signals.send_takeoff_signal_received()
         if self.stop_event.is_set():
+            self._ground_commands.fail(takeoff_command, error_code=1)
             return
         self.fc.set_indicator_led(0, 255, 0)
         self.signals.send_takeoff_started()
 
-        navi.pointing_takeoff(
-            mission_base.TAKEOFF_POINT,
-            target_height=CRUISE_HEIGHT,
-        )
+        try:
+            navi.pointing_takeoff(
+                mission_base.TAKEOFF_POINT,
+                target_height=CRUISE_HEIGHT,
+            )
+            self._ground_commands.complete(takeoff_command)
+        except Exception:
+            self._ground_commands.fail(takeoff_command, error_code=1)
+            raise
         self.signals.send_takeoff_succeeded()
         self.fc.set_indicator_led(0, 0, 0)
         navi.set_yaw(0)
@@ -512,6 +519,7 @@ def main() -> None:
             navi,
             stop_event,
             readonly=True,
+            allow_start_mission=True,
             state_provider=mission_base.MissionFleetStateProvider(
                 fc,
                 navi,
@@ -525,6 +533,7 @@ def main() -> None:
                 stationary_keepalive_s=2.0,
             ),
         )
+        mission.bind_ground_commands(fleet_node.command_queue)
         mission.run()
     except KeyboardInterrupt:
         logger.warning("[MISSION2] Interrupted by user")

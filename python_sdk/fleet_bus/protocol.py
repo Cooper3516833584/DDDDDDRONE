@@ -24,6 +24,7 @@ from .models import (
     TraceReportPayload,
     TraceRequestPayload,
     TraceSample,
+    MissionId,
 )
 
 
@@ -557,6 +558,22 @@ def decode_command(data: bytes) -> CommandPayload:
     if len(data) < 2:
         raise ProtocolError("payload", "COMMAND payload is too short")
     return CommandPayload(data[0], data[1], bytes(data[2:]))
+
+
+def encode_drone_select_mission(mission_id: int) -> bytes:
+    try:
+        return bytes((int(MissionId(mission_id)),))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ProtocolError("payload", "DRONE_SELECT_MISSION mission id must be 1 or 2") from exc
+
+
+def decode_drone_select_mission(data: bytes) -> MissionId:
+    if len(data) != 1:
+        raise ProtocolError("payload", "DRONE_SELECT_MISSION body must be one byte")
+    try:
+        return MissionId(data[0])
+    except ValueError as exc:
+        raise ProtocolError("payload", "unknown DRONE_SELECT_MISSION mission id") from exc
 
 
 def encode_ack(payload: AckPayload) -> bytes:

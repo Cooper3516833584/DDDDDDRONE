@@ -32,6 +32,7 @@ from .protocol import (
     encode_report,
     encode_survey_report,
     encode_trace_report,
+    decode_drone_select_mission,
     new_session,
     pack_frame,
 )
@@ -58,6 +59,7 @@ class AirFleetNode:
         survey_provider: Optional[Callable[[], SurveyState]] = None,
         wait: Callable[[float], None] = time.sleep,
         trace_options: TraceSamplingOptions = TraceSamplingOptions(),
+        allowed_readonly_command_ids=frozenset(),
     ) -> None:
         self._transport = transport
         self._state_provider = state_provider
@@ -66,6 +68,9 @@ class AirFleetNode:
         self._timing = timing
         self._readonly = readonly
         self._allow_start_mission = allow_start_mission
+        self._allowed_readonly_command_ids = frozenset(
+            int(command_id) for command_id in allowed_readonly_command_ids
+        )
         self._survey_provider = survey_provider
         self._wait = wait
         self._parser = FrameParser(int(NodeId.DRONE))
@@ -248,6 +253,14 @@ class AirFleetNode:
             )
 
         if (
+            command.command_id == int(CommandId.DRONE_SELECT_MISSION)
+            and command.command_id not in self._allowed_readonly_command_ids
+        ):
+            return self._ack(
+                request, command.command_id, AckStatus.REJECTED, AckReason.UNSUPPORTED
+            )
+
+        if (
             self._readonly
             and command.command_id == int(CommandId.TARGETED_STOP)
         ):
@@ -257,11 +270,11 @@ class AirFleetNode:
             )
 
         if self._readonly and not (
-            self._allow_start_mission
-            and command.command_id in (
+            command.command_id in self._allowed_readonly_command_ids
+            or (self._allow_start_mission and command.command_id in (
                 int(CommandId.DRONE_START_MISSION),
                 int(CommandId.DRONE_PREPARE_MISSION),
-            )
+            ))
         ):
             return self._ack(
                 request, command.command_id, AckStatus.REJECTED, AckReason.UNSUPPORTED
@@ -273,6 +286,7 @@ class AirFleetNode:
                 command.command_id not in (
                     int(CommandId.DRONE_START_MISSION),
                     int(CommandId.DRONE_PREPARE_MISSION),
+                    int(CommandId.DRONE_SELECT_MISSION),
                 )
                 and not state.node_flags & 0x0001
             ):
@@ -301,6 +315,8 @@ class AirFleetNode:
     def _decode_command_body(command: CommandPayload) -> object:
         if command.command_id == int(CommandId.DRONE_GOTO):
             return decode_drone_goto(command.command_body)
+        if command.command_id == int(CommandId.DRONE_SELECT_MISSION):
+            return decode_drone_select_mission(command.command_body)
         if command.command_id in (
             int(CommandId.PING),
             int(CommandId.TARGETED_STOP),
@@ -361,6 +377,7 @@ def attach_air_fleet_node(
     heading_offset_deg: float = 0.0,
     state_provider: Optional[Callable[[], object]] = None,
     trace_options: TraceSamplingOptions = TraceSamplingOptions(),
+    allowed_readonly_command_ids=frozenset(),
 ) -> AirFleetNode:
     """Create the one FCWirelessTransport callback owner for FleetBus mode.
 
@@ -391,6 +408,7 @@ def attach_air_fleet_node(
         stop_event,
         readonly=readonly,
         allow_start_mission=allow_start_mission,
+        allowed_readonly_command_ids=allowed_readonly_command_ids,
         survey_provider=survey_provider,
         trace_options=trace_options,
     )
