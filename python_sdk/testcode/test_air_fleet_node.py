@@ -54,6 +54,18 @@ class FakeTransport:
         self.write_threads.append(threading.current_thread().name)
 
 
+class FailOnceTransport(FakeTransport):
+    def __init__(self):
+        super().__init__()
+        self.failures_remaining = 1
+
+    def write(self, data):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("simulated FC ACK timeout")
+        super().write(data)
+
+
 def request(seq, command=None, session=10):
     kind = MessageKind.POLL
     payload = b"\x07\x00"
@@ -138,6 +150,29 @@ class AirFleetNodeTests(unittest.TestCase):
                 report.z_cm,
             ),
         )
+
+    def test_transport_write_failure_does_not_stop_reply_worker(self):
+        self.node.close()
+        self.transport = FailOnceTransport()
+        self.node = AirFleetNode(
+            self.transport,
+            lambda: self.state,
+            self.commands,
+            self.flight_stop,
+            NodeTiming(turnaround_s=0),
+        )
+        self.node.start()
+
+        self.node.feed_bytes(request(30))
+        deadline = time.monotonic() + 1
+        while self.node.write_failures < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(1, self.node.write_failures)
+
+        self.node.feed_bytes(request(31))
+        self.wait_for_writes(1)
+        report = decode_report(unpack_frame(self.transport.writes[0]).payload)
+        self.assertEqual(31, report.request_seq)
 
     def test_goto_is_queued_without_flight_action(self):
         body = encode_drone_goto(DroneGotoCommand(20, 30, 100, 4500))

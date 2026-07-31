@@ -22,6 +22,7 @@ __pycache__/
 /python_sdk/vision_for_simulation/camera_recording_*.csv
 /.vscode/
 /python_sdk/.vscode/
+/python_sdk/.d_task_dispatcher.lock
 
 # Hardware-debug artifacts
 /python_sdk/radar_resolve_debug.png

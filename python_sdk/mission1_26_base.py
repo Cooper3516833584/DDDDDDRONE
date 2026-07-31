@@ -34,7 +34,10 @@ from fleet_bus.pose_provider import NavigationAirStateProvider
 from landing_marker_offset import track_switchable_marker
 
 
-FC_SERIAL_DEV = "/dev/ttyACM0"
+FC_SERIAL_DEV = (
+    "/dev/serial/by-id/"
+    "usb-Rhine-Lab_LX_FlightController_76-if00"
+)
 CAMERA_INDEX = 0
 
 TAKEOFF_POINT = np.array([0.0, 0.0])

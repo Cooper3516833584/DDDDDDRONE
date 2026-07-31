@@ -1,5 +1,6 @@
 """FleetBus V1 drone endpoint with no direct flight-control operations."""
 
+import logging
 import queue
 import threading
 import time
@@ -44,6 +45,9 @@ from .trace_buffer import (
 )
 
 
+LOG = logging.getLogger("fleet-air-node")
+
+
 class AirFleetNode:
     """Parse in the transport callback and process/reply only in a worker thread."""
 
@@ -79,6 +83,7 @@ class AirFleetNode:
         self._session = new_session()
         self._stop = threading.Event()
         self._worker = None  # type: Optional[threading.Thread]
+        self.write_failures = 0
         self._trace_buffer = PoseTraceBuffer(trace_options)
         self._trace_sampler = (
             PoseTraceSampler(
@@ -159,7 +164,13 @@ class AirFleetNode:
                 continue
             self._wait(self._timing.turnaround_s)
             if not self._stop.is_set():
-                self._transport.write(response)
+                try:
+                    self._transport.write(response)
+                except Exception:
+                    self.write_failures += 1
+                    LOG.exception(
+                        "FleetBus response write failed; keeping reply worker active"
+                    )
 
     def _handle(self, frame: Frame) -> Optional[bytes]:
         if frame.src != int(NodeId.GROUND):

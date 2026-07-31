@@ -11,8 +11,11 @@ ExecStart=/usr/bin/python3 -u @PYTHON_SDK_DIR@/d_task_dispatcher.py
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=20
-KillMode=control-group
+KillMode=mixed
+RuntimeDirectory=d-task-drone-dispatcher
+RuntimeDirectoryMode=0755
 Environment=PYTHONUNBUFFERED=1
+Environment=D_TASK_DISPATCHER_LOCK=/run/d-task-drone-dispatcher/dispatcher.lock
 UMask=0022
 StandardOutput=journal
 StandardError=journal

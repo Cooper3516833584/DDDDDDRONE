@@ -34,7 +34,16 @@ MISSION_ENTRY = {
 DISPATCHER_READY = 30
 DISPATCHER_SWITCHING = 31
 DISPATCHER_FAULT = 32
-FC_SERIAL_DEV = "/dev/ttyACM0"
+FC_SERIAL_DEV = (
+    "/dev/serial/by-id/"
+    "usb-Rhine-Lab_LX_FlightController_76-if00"
+)
+LOCK_PATH = Path(
+    os.environ.get(
+        "D_TASK_DISPATCHER_LOCK",
+        str(ROOT / ".d_task_dispatcher.lock"),
+    )
+)
 
 
 def mission_entry(mission_id: MissionId) -> Path:
@@ -216,7 +225,7 @@ class Dispatcher:
             self.child = None
 
     def run_forever(self):
-        with _SingleInstance(ROOT / ".d_task_dispatcher.lock"):
+        with _SingleInstance(LOCK_PATH):
             while not self.stop_event.is_set():
                 try:
                     result = self.run_once()
