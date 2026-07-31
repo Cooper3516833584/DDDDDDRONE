@@ -289,13 +289,20 @@ class MovingTargetDescentController:
         velocity_predictor: Optional[VelocityPredictor] = None,
         target_offset_provider: Optional[TargetOffsetProvider] = None,
         horizontal_command_guard: Optional[HorizontalCommandGuard] = None,
+        reset_estimator: bool = True,
     ) -> Tuple[float, float]:
-        """阻塞执行连续伴飞、同步下降和目标高度伴飞。"""
+        """阻塞执行连续伴飞、同步下降和目标高度伴飞。
+
+        reset_estimator: 是否在开始前重置目标速度估计。连续两段伴飞
+            衔接时传 False，沿用上一段伴飞器继续积分估计；目标速度
+            不会突变，重置会丢失已收敛的速度估计。
+        """
         if velocity_predictor is not None and not callable(
             velocity_predictor
         ):
             raise ValueError("velocity_predictor must be callable")
-        self._estimator.reset(initial_target_velocity)
+        if reset_estimator:
+            self._estimator.reset(initial_target_velocity)
 
         def provide_base_velocity(
             x_px: float,

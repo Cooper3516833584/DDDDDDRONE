@@ -55,6 +55,8 @@ ESCORT_MAX_X = 357.5
 ESCORT_SPEED_MIDPOINT = 10.0
 ESCORT_STABLE_SECONDS = 4.0
 ESCORT_GATE_TIMEOUT_SECONDS = 90.0
+# 稳定伴飞 4 秒后先下降到该中间高度；经过门控点后继续下降到最终降落高度。
+TARGET_DESCENT_INTERMEDIATE_HEIGHT = 100.0
 TARGET_LANDING_HEIGHT = 25.0
 TARGET_OFFSET_START_HEIGHT = 50.0
 TARGET_OFFSET_FINAL_X_PX = -30.0
@@ -274,8 +276,9 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                 velocity_y,
             )
 
-        final_velocity = self.moving_target_descent.follow_and_descend(
-            target_height=TARGET_LANDING_HEIGHT,
+        # 阶段1：稳定伴飞 4 秒后先下降到中间高度，不要求先经过门控点。
+        self.moving_target_descent.follow_and_descend(
+            target_height=TARGET_DESCENT_INTERMEDIATE_HEIGHT,
             stabilize_seconds=ESCORT_STABLE_SECONDS,
             stabilize_timeout=ESCORT_GATE_TIMEOUT_SECONDS,
             hover_seconds=0.0,
@@ -284,11 +287,36 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
             descent_timeout=TARGET_DESCENT_TIMEOUT_SECONDS,
             on_descent_start=self.signals.send_target_descent_started,
+            pre_descent_max_error_px=TARGET_DETECTION_PIXEL_THRESHOLD,
+            velocity_predictor=predict_target_velocity,
+            horizontal_command_guard=apply_escort_boundary,
+        )
+        logger.info(
+            "[MISSION2] Reached intermediate descent height {:.0f}cm; "
+            "waiting for route gate before continuing descent",
+            TARGET_DESCENT_INTERMEDIATE_HEIGHT,
+        )
+
+        # 阶段2：经过门控点 (207.5,-187.5) 后继续下降到最终降落高度。
+        # 沿用阶段1伴飞器的目标速度估计（不重置），目标速度不会突变。
+        final_velocity = self.moving_target_descent.follow_and_descend(
+            target_height=TARGET_LANDING_HEIGHT,
+            stabilize_seconds=0.0,
+            stabilize_timeout=ESCORT_GATE_TIMEOUT_SECONDS,
+            hover_seconds=0.0,
+            initial_target_velocity=(
+                self.moving_target_descent.estimated_target_velocity
+            ),
+            height_tolerance=descent_test.HEIGHT_TOLERANCE,
+            height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
+            descent_timeout=TARGET_DESCENT_TIMEOUT_SECONDS,
+            on_descent_start=None,
             pre_descent_gate=self._route_gate_is_open,
             pre_descent_max_error_px=TARGET_DETECTION_PIXEL_THRESHOLD,
             velocity_predictor=predict_target_velocity,
             target_offset_provider=self._low_altitude_target_offset.offset,
             horizontal_command_guard=apply_escort_boundary,
+            reset_estimator=False,
         )
         logger.info(
             "[MISSION2] Reached target landing height; estimated target "
