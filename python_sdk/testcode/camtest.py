@@ -29,7 +29,7 @@ if wb_prop is None:
     wb_prop = getattr(cv2, "CAP_PROP_WB_TEMPERATURE", None)
 if wb_prop is None:
     wb_prop = 42
-if not cap.set(wb_prop, 6500):
+if not cap.set(wb_prop, 500):
     print(f"[warn] 摄像头不支持设置色温 (prop={wb_prop})")
 
 # 5) 取一帧并保存
