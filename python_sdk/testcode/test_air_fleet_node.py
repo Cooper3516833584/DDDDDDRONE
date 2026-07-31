@@ -17,17 +17,24 @@ from fleet_bus.models import (
     NodeId,
     NodeTiming,
     SurveyState,
+    TraceReportFlags,
+    TraceRequestPayload,
+    TraceSample,
 )
 from fleet_bus.pose_provider import NavigationAirStateProvider
 from fleet_bus.protocol import (
+    ProtocolError,
     decode_ack,
     decode_report,
     decode_survey_report,
+    decode_trace_report,
     encode_command,
     encode_drone_goto,
+    encode_trace_request,
     pack_frame,
     unpack_frame,
 )
+from fleet_bus.trace_buffer import TraceSamplingOptions
 
 
 class FakeTransport:
@@ -55,6 +62,25 @@ def request(seq, command=None, session=10):
         payload = encode_command(command)
     return pack_frame(
         Frame(1, NodeId.GROUND, NodeId.DRONE, kind, 0, session, seq, payload)
+    )
+
+
+def trace_request(seq, value=None, session=10, payload=None):
+    if payload is None:
+        payload = encode_trace_request(
+            value or TraceRequestPayload(0, 0, 15, 0)
+        )
+    return pack_frame(
+        Frame(
+            1,
+            NodeId.GROUND,
+            NodeId.DRONE,
+            MessageKind.TRACE_REQUEST,
+            0,
+            session,
+            seq,
+            payload,
+        )
     )
 
 
@@ -306,6 +332,115 @@ class AirFleetNodeTests(unittest.TestCase):
             survey.wildfire_col,
         ))
         self.assertEqual((395, 315), survey.cell_positions_cm[-1])
+
+    def test_trace_request_returns_legal_empty_report(self):
+        self.node.feed_bytes(trace_request(20))
+        self.wait_for_writes(1)
+        frame = unpack_frame(self.transport.writes[0])
+        self.assertEqual(MessageKind.TRACE_REPORT, frame.kind)
+        report = decode_trace_report(frame.payload)
+        self.assertEqual((10, 20), (report.request_session, report.request_seq))
+        self.assertNotEqual(0, report.trace_session)
+        self.assertEqual(
+            (0, 0, 0, ()),
+            (
+                report.oldest_available_seq,
+                report.first_sample_seq,
+                report.latest_available_seq,
+                report.samples,
+            ),
+        )
+
+    def test_trace_request_batches_without_control_and_replays_cached_bytes(self):
+        self.node.trace_buffer.record(
+            TraceSample(100, 1, 2, 3, 400, 4, 1)
+        )
+        self.node.trace_buffer.record(
+            TraceSample(200, 5, 6, 7, 500, 3, 1)
+        )
+        packet = trace_request(21)
+        self.node.feed_bytes(packet)
+        self.wait_for_writes(1)
+        first_response = self.transport.writes[0]
+        report = decode_trace_report(unpack_frame(first_response).payload)
+        self.assertEqual(2, len(report.samples))
+        self.assertTrue(
+            report.report_flags & int(TraceReportFlags.CURSOR_RESET)
+        )
+        self.assertIsNone(self.commands.receive(0.01))
+        self.assertFalse(self.flight_stop.is_set())
+
+        self.node.trace_buffer.record(
+            TraceSample(300, 9, 10, 11, 600, 2, 1)
+        )
+        self.node.feed_bytes(packet)
+        self.wait_for_writes(2)
+        self.assertEqual(first_response, self.transport.writes[1])
+
+    def test_invalid_trace_sample_is_rejected_before_it_can_poison_buffer(self):
+        with self.assertRaises(ProtocolError):
+            self.node.trace_buffer.record(
+                TraceSample(100, 1, 2, 3, 36000, 4, 1)
+            )
+        self.assertEqual(0, self.node.trace_buffer.sample_count)
+        self.node.trace_buffer.record(
+            TraceSample(200, 1, 2, 3, 100, 4, 1)
+        )
+        self.node.feed_bytes(trace_request(24))
+        self.wait_for_writes(1)
+        report = decode_trace_report(
+            unpack_frame(self.transport.writes[0]).payload
+        )
+        self.assertEqual(1, len(report.samples))
+
+    def test_invalid_trace_request_does_not_stop_worker(self):
+        self.node.feed_bytes(trace_request(22, payload=b""))
+        self.node.feed_bytes(request(23))
+        self.wait_for_writes(1)
+        response = unpack_frame(self.transport.writes[0])
+        self.assertEqual(MessageKind.REPORT, response.kind)
+
+    def test_enabled_trace_sampler_starts_once_and_stops_on_close(self):
+        self.node.close()
+        self.transport = FakeTransport()
+        sample_number = [0]
+
+        def changing_state():
+            sample_number[0] += 1
+            return AirFleetState(
+                int(NodeFlags.POSE_VALID | NodeFlags.READY),
+                sample_number[0] * 10,
+                sample_number[0] * 2,
+                0,
+                0,
+                0,
+                pose_quality=4,
+            )
+
+        self.node = AirFleetNode(
+            self.transport,
+            changing_state,
+            self.commands,
+            self.flight_stop,
+            NodeTiming(turnaround_s=0),
+            trace_options=TraceSamplingOptions(
+                enabled=True,
+                sample_interval_s=0.01,
+                buffer_capacity=20,
+            ),
+        )
+        self.node.start()
+        sampler = self.node.trace_sampler
+        self.assertIsNotNone(sampler)
+        deadline = time.monotonic() + 0.5
+        while self.node.trace_buffer.sample_count < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertGreaterEqual(self.node.trace_buffer.sample_count, 2)
+        self.node.start()
+        self.assertTrue(sampler.running)
+        self.node.close()
+        self.assertFalse(sampler.running)
+        self.node.close()
 
 
 class PoseProviderTests(unittest.TestCase):
