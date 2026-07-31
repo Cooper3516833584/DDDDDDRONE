@@ -18,6 +18,8 @@
 """
 
 import argparse
+import math
+import queue
 import sys
 import threading
 import time
@@ -28,7 +30,7 @@ from loguru import logger
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
-from testcode.home_h_visual_landing_support import visual_home_h_landing
+from landing_marker_offset import track_home_h_marker
 
 
 FC_SERIAL_DEV = "/dev/ttyACM0"
@@ -37,6 +39,19 @@ CRUISE_SPEED = 15.0
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 22.0
 LANDING_HEIGHT_TIMEOUT = 8.0
+LANDING_HEIGHT = 50.0
+LANDING_HEIGHT_TOLERANCE = 8.0
+LANDING_PIXEL_THRESHOLD = 30.0
+LANDING_CENTER_CONFIRM_FRAMES = 5
+LANDING_APPROACH_SPEED = 15.0
+LANDING_CONTROL_FREQUENCY = 10.0
+LANDING_ALIGNMENT_TIMEOUT = 60.0
+LANDING_FRAME_TIMEOUT = 1.0
+LANDING_MIN_CONTROL_HEIGHT = 25.0
+LANDING_MAX_CONTROL_HEIGHT = 75.0
+LANDING_TOUCHDOWN_ALTITUDE = 8.0
+LANDING_TOUCHDOWN_TIMEOUT = 12.0
+LANDING_LOCK_TIMEOUT = 4.0
 TAKEOFF_POINT = (0.0, 0.0)
 TEST_WAYPOINT = (100.0, 0.0)
 RADAR_POSE_READY_TIMEOUT = 15.0
@@ -104,6 +119,303 @@ def wait_for_radar_pose(
     raise RuntimeError(
         "single-radar navigation pose was not ready before timeout"
     )
+
+
+class _HomeHOffsetReader:
+    """在守护线程中读取相机，向控制线程只提供最新一帧偏移。"""
+
+    def __init__(self, camera_index: int):
+        self._offsets = track_home_h_marker(camera_index)
+        self._output = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="home-h-offset-reader",
+            daemon=True,
+        )
+
+    def _publish(self, item) -> None:
+        try:
+            self._output.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._output.put_nowait(item)
+        except queue.Full:
+            pass
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    offset = next(self._offsets)
+                except StopIteration:
+                    self._publish(
+                        (
+                            "error",
+                            RuntimeError("H-marker tracker stopped unexpectedly"),
+                        )
+                    )
+                    return
+                except Exception as exc:
+                    self._publish(("error", exc))
+                    return
+                self._publish(("offset", offset))
+        finally:
+            try:
+                self._offsets.close()
+            except Exception:
+                logger.exception("[HOME-LAND] Failed to close H-marker tracker")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def read(self, timeout: float):
+        kind, payload = self._output.get(timeout=timeout)
+        if kind == "error":
+            raise payload
+        return payload
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
+        if self._thread.is_alive():
+            logger.warning(
+                "[HOME-LAND] Camera reader did not stop promptly; "
+                "daemon cleanup deferred until process exit"
+            )
+
+
+def visual_home_h_landing(
+    fc: FC_Controller,
+    navi: Navigation,
+    stop_event: threading.Event,
+    camera_index: int,
+) -> bool:
+    """下降至50 cm，以H标记完成视觉微调，再交给飞控一键降落。"""
+    if stop_event.is_set():
+        logger.warning("[HOME-LAND] Visual landing stopped before descent")
+        return False
+    if not navi.running:
+        logger.error("[HOME-LAND] Navigation is not running")
+        return False
+    if not fc.state.is_fresh(0.5) or not fc.state.unlock.value:
+        logger.error("[HOME-LAND] Flight state is stale or aircraft is locked")
+        return False
+    if not navi.pose_is_fresh():
+        logger.error("[HOME-LAND] Navigation pose is stale")
+        return False
+
+    navi.set_height(LANDING_HEIGHT)
+    navi.keep_height_flag = True
+    if not navi.wait_for_height(
+        height_thres=LANDING_HEIGHT_TOLERANCE,
+        timeout=LANDING_HEIGHT_TIMEOUT,
+    ):
+        logger.error(
+            "[HOME-LAND] Failed to reach visual approach height {}cm",
+            LANDING_HEIGHT,
+        )
+        return False
+    if (
+        stop_event.is_set()
+        or not fc.state.is_fresh(0.5)
+        or not navi.pose_is_fresh()
+    ):
+        logger.error("[HOME-LAND] State invalid before visual alignment")
+        return False
+
+    logger.info(
+        "[HOME-LAND] Reached {}cm; tracking H marker on camera {}",
+        LANDING_HEIGHT,
+        camera_index,
+    )
+    offset_reader = _HomeHOffsetReader(camera_index)
+    offset_reader.start()
+    centered = False
+    centered_frames = 0
+    period = 1.0 / LANDING_CONTROL_FREQUENCY
+    deadline = time.monotonic() + LANDING_ALIGNMENT_TIMEOUT
+    try:
+        while time.monotonic() < deadline:
+            if stop_event.is_set():
+                logger.warning("[HOME-LAND] Alignment stopped externally")
+                break
+            if (
+                not fc.state.is_fresh(0.5)
+                or not fc.state.unlock.value
+                or fc.state.mode.value != fc.HOLD_POS_MODE
+                or not navi.pose_is_fresh()
+            ):
+                logger.error(
+                    "[HOME-LAND] Flight or radar state became invalid "
+                    "during visual alignment"
+                )
+                break
+            try:
+                current_height = float(navi.current_height)
+            except Exception:
+                current_height = math.nan
+            if (
+                not math.isfinite(current_height)
+                or current_height < LANDING_MIN_CONTROL_HEIGHT
+                or current_height > LANDING_MAX_CONTROL_HEIGHT
+            ):
+                logger.error(
+                    "[HOME-LAND] Unsafe height during visual alignment: {}cm",
+                    current_height,
+                )
+                break
+
+            # Stop before waiting for the next camera frame. If camera capture
+            # blocks, no previous horizontal velocity remains latched.
+            navi.stop_move()
+            remaining = deadline - time.monotonic()
+            try:
+                x_px, y_px = offset_reader.read(
+                    timeout=max(
+                        0.01,
+                        min(LANDING_FRAME_TIMEOUT, remaining),
+                    )
+                )
+            except queue.Empty:
+                logger.error(
+                    "[HOME-LAND] No new H-marker camera frame within {:.1f}s",
+                    LANDING_FRAME_TIMEOUT,
+                )
+                break
+
+            if (
+                time.monotonic() >= deadline
+                or stop_event.is_set()
+                or not fc.state.is_fresh(0.5)
+                or not fc.state.unlock.value
+                or fc.state.mode.value != fc.HOLD_POS_MODE
+                or not navi.pose_is_fresh()
+            ):
+                logger.error(
+                    "[HOME-LAND] State invalid after waiting for camera frame"
+                )
+                break
+            try:
+                current_height = float(navi.current_height)
+            except Exception:
+                current_height = math.nan
+            if (
+                not math.isfinite(current_height)
+                or current_height < LANDING_MIN_CONTROL_HEIGHT
+                or current_height > LANDING_MAX_CONTROL_HEIGHT
+            ):
+                logger.error(
+                    "[HOME-LAND] Unsafe height after camera wait: {}cm",
+                    current_height,
+                )
+                break
+
+            if x_px is None or y_px is None:
+                centered_frames = 0
+                stop_event.wait(period)
+                continue
+
+            x_px = float(x_px)
+            y_px = float(y_px)
+            if not math.isfinite(x_px) or not math.isfinite(y_px):
+                centered_frames = 0
+                stop_event.wait(period)
+                continue
+
+            distance_px = math.hypot(x_px, y_px)
+            if distance_px <= LANDING_PIXEL_THRESHOLD:
+                centered_frames += 1
+                logger.info(
+                    "[HOME-LAND] H marker centered {}/{}: distance={:.1f}px",
+                    centered_frames,
+                    LANDING_CENTER_CONFIRM_FRAMES,
+                    distance_px,
+                )
+                if centered_frames >= LANDING_CENTER_CONFIRM_FRAMES:
+                    centered = True
+                    break
+                stop_event.wait(period)
+                continue
+
+            centered_frames = 0
+            direction_deg = math.degrees(math.atan2(y_px, x_px))
+            navi.move_by_direction(
+                speed=LANDING_APPROACH_SPEED,
+                direction_deg=direction_deg,
+            )
+            stop_event.wait(period)
+            navi.stop_move()
+    finally:
+        navi.stop_move()
+        offset_reader.close()
+
+    if not centered:
+        logger.error("[HOME-LAND] H-marker alignment was not confirmed")
+        return False
+    if not fc.state.is_fresh(0.5) or not fc.state.unlock.value:
+        logger.error("[HOME-LAND] Flight state invalid after visual alignment")
+        return False
+
+    navi.navigation_flag = False
+    navi.keep_height_flag = False
+    fc.set_flight_mode(fc.PROGRAM_MODE)
+    time.sleep(0.1)
+    fc.stablize()
+    fc.land()
+
+    started_at = time.perf_counter()
+    landed = False
+    while time.perf_counter() - started_at < LANDING_TOUCHDOWN_TIMEOUT:
+        time.sleep(0.1)
+        try:
+            altitude = float(fc.state.alt_add.value)
+        except Exception:
+            altitude = 999.0
+        if (
+            fc.state.is_fresh(0.5)
+            and altitude <= LANDING_TOUCHDOWN_ALTITUDE
+        ) or not fc.state.unlock.value:
+            landed = True
+            break
+
+    if not landed:
+        logger.error(
+            "[HOME-LAND] Landing timeout; keep landing command active and "
+            "refuse airborne force-lock"
+        )
+        fc.land()
+        return False
+
+    try:
+        locked = fc.wait_for_lock(timeout_s=LANDING_LOCK_TIMEOUT)
+    except TypeError:
+        locked = fc.wait_for_lock(LANDING_LOCK_TIMEOUT)
+    if not locked:
+        state_fresh = fc.state.is_fresh(0.5)
+        altitude = (
+            float(fc.state.alt_add.value) if state_fresh else 999.0
+        )
+        if state_fresh and altitude <= LANDING_TOUCHDOWN_ALTITUDE:
+            fc.lock()
+            try:
+                locked = fc.wait_for_lock(timeout_s=LANDING_LOCK_TIMEOUT)
+            except TypeError:
+                locked = fc.wait_for_lock(LANDING_LOCK_TIMEOUT)
+            if not locked:
+                logger.error(
+                    "[HOME-LAND] Lock command was sent but lock feedback "
+                    "was not confirmed"
+                )
+                return False
+        else:
+            logger.error(
+                "[HOME-LAND] Lock not confirmed; refuse lock without "
+                "fresh touchdown altitude"
+            )
+            return False
+    return True
 
 
 class Mission:
@@ -190,7 +502,6 @@ class Mission:
             navi=self.navi,
             stop_event=self.stop_event,
             camera_index=CAMERA_INDEX,
-            height_timeout=LANDING_HEIGHT_TIMEOUT,
         ):
             raise RuntimeError("visual H-marker landing was not confirmed")
         logger.info("[TEST] Fast takeoff navigation flight completed")
