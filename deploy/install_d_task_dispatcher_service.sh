@@ -11,7 +11,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-if pgrep -f '[s]erver_ros.py|[m]ission[12]_26.py|[w]atchdog' >/dev/null 2>&1; then
+if pgrep -f '[s]erver_ros.py|[m]ission[12]_26.py|[f]c-server-watchdog.sh' >/dev/null 2>&1; then
     echo "existing server/task/watchdog process detected; stop safely and retry" >&2
     exit 1
 fi
