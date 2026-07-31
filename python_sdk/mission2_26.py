@@ -15,6 +15,7 @@ from loguru import logger
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
+from fleet_bus.trace_buffer import TraceSamplingOptions
 import mission1_26 as mission1
 import mission1_26_base as mission_base
 import mission1_26_visual_descent_test as descent_test
@@ -37,10 +38,10 @@ from visual_target_descent import PreDescentTimeoutError
 
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 20.0
-PURSUIT_SPEED = 40.0
+PURSUIT_SPEED = 20.0
 PURSUIT_APPROACH_SPEED = 25.0
 PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
-RETURN_SPEED = 40.0
+RETURN_SPEED = 20.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
 ARC_VELOCITY_POSITION_TOLERANCE = 20.0
@@ -515,6 +516,13 @@ def main() -> None:
                 fc,
                 navi,
                 mission,
+            ),
+            trace_options=TraceSamplingOptions(
+                enabled=True,
+                sample_interval_s=0.10,
+                buffer_capacity=600,
+                min_distance_cm=1.0,
+                stationary_keepalive_s=1.0,
             ),
         )
         mission.run()

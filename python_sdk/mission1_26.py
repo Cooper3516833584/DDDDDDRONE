@@ -26,6 +26,7 @@ from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
 from fleet_bus.models import CommandId
+from fleet_bus.trace_buffer import TraceSamplingOptions
 import mission1_26_base as mission1
 import mission1_26_visual_descent_test as descent_test
 from moving_target_descent import MovingTargetDescentController
@@ -415,6 +416,13 @@ def main() -> None:
             readonly=True,
             allow_start_mission=True,
             state_provider=mission1.MissionFleetStateProvider(fc, navi, mission),
+            trace_options=TraceSamplingOptions(
+                enabled=True,
+                sample_interval_s=0.10,
+                buffer_capacity=600,
+                min_distance_cm=1.0,
+                stationary_keepalive_s=1.0,
+            ),
         )
         mission.bind_ground_commands(fleet_node.command_queue)
         mission.run()

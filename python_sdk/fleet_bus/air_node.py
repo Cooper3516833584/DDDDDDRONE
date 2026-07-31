@@ -27,11 +27,19 @@ from .protocol import (
     RecentResponseCache,
     decode_command,
     decode_drone_goto,
+    decode_trace_request,
     encode_ack,
     encode_report,
     encode_survey_report,
+    encode_trace_report,
     new_session,
     pack_frame,
+)
+from .trace_buffer import (
+    PoseTraceBuffer,
+    PoseTraceSampler,
+    TraceSamplingOptions,
+    air_state_to_trace_sample,
 )
 
 
@@ -49,6 +57,7 @@ class AirFleetNode:
         allow_start_mission: bool = False,
         survey_provider: Optional[Callable[[], SurveyState]] = None,
         wait: Callable[[float], None] = time.sleep,
+        trace_options: TraceSamplingOptions = TraceSamplingOptions(),
     ) -> None:
         self._transport = transport
         self._state_provider = state_provider
@@ -65,6 +74,17 @@ class AirFleetNode:
         self._session = new_session()
         self._stop = threading.Event()
         self._worker = None  # type: Optional[threading.Thread]
+        self._trace_buffer = PoseTraceBuffer(trace_options)
+        self._trace_sampler = (
+            PoseTraceSampler(
+                state_provider=state_provider,
+                trace_buffer=self._trace_buffer,
+                options=trace_options,
+                state_adapter=air_state_to_trace_sample,
+            )
+            if trace_options.enabled
+            else None
+        )  # type: Optional[PoseTraceSampler]
 
     @property
     def parser(self) -> FrameParser:
@@ -74,17 +94,37 @@ class AirFleetNode:
     def command_queue(self) -> AirCommandQueue:
         return self._commands
 
+    @property
+    def trace_buffer(self) -> PoseTraceBuffer:
+        return self._trace_buffer
+
+    @property
+    def trace_sampler(self) -> Optional[PoseTraceSampler]:
+        return self._trace_sampler
+
     def start(self) -> None:
         if self._worker is not None:
             return
+        if self._trace_sampler is not None:
+            self._trace_sampler.start()
         self._stop.clear()
         self._worker = threading.Thread(
             target=self._run, name="fleet-air-node", daemon=True
         )
         self._worker.start()
-        self._transport.start()
+        try:
+            self._transport.start()
+        except Exception:
+            self._stop.set()
+            self._worker.join(timeout=1.0)
+            self._worker = None
+            if self._trace_sampler is not None:
+                self._trace_sampler.close()
+            raise
 
     def close(self) -> None:
+        if self._trace_sampler is not None:
+            self._trace_sampler.close()
         self._transport.stop()
         self._stop.set()
         worker = self._worker
@@ -106,7 +146,10 @@ class AirFleetNode:
                 frame = self._inbox.get(timeout=0.1)
             except queue.Empty:
                 continue
-            response = self._handle(frame)
+            try:
+                response = self._handle(frame)
+            except ProtocolError:
+                continue
             if response is None or self._stop.is_set():
                 continue
             self._wait(self._timing.turnaround_s)
@@ -124,6 +167,8 @@ class AirFleetNode:
             response = self._report(frame)
         elif frame.kind == int(MessageKind.SURVEY_REQUEST):
             response = self._survey_report(frame)
+        elif frame.kind == int(MessageKind.TRACE_REQUEST):
+            response = self._trace_report(frame)
         elif frame.kind == int(MessageKind.COMMAND):
             response = self._command(frame)
         else:
@@ -176,6 +221,16 @@ class AirFleetNode:
             )
         )
         return self._response(request, MessageKind.SURVEY_REPORT, payload)
+
+    def _trace_report(self, request: Frame) -> bytes:
+        trace_request = decode_trace_request(request.payload)
+        report = self._trace_buffer.build_report(
+            request.session,
+            request.seq,
+            trace_request,
+        )
+        payload = encode_trace_report(report)
+        return self._response(request, MessageKind.TRACE_REPORT, payload)
 
     def _command(self, request: Frame) -> bytes:
         try:
@@ -305,6 +360,7 @@ def attach_air_fleet_node(
     position_transform: Optional[Callable] = None,
     heading_offset_deg: float = 0.0,
     state_provider: Optional[Callable[[], object]] = None,
+    trace_options: TraceSamplingOptions = TraceSamplingOptions(),
 ) -> AirFleetNode:
     """Create the one FCWirelessTransport callback owner for FleetBus mode.
 
@@ -336,6 +392,7 @@ def attach_air_fleet_node(
         readonly=readonly,
         allow_start_mission=allow_start_mission,
         survey_provider=survey_provider,
+        trace_options=trace_options,
     )
     holder["node"] = node
     node.start()
