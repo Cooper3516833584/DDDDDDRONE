@@ -58,6 +58,20 @@ HEIGHT_TOLERANCE = 5.0
 HEIGHT_CONFIRM_SECONDS = 0.4
 MAX_VISUAL_DESCENT_RECORDS = 3000
 
+# 返航定点降落：以 60cm 高度视觉对准 H 标记后再定点降落。
+# 参数与 test_fast_non_pointing_takeoff_radar.py 验证的降落逻辑一致。
+H_LANDING_VERTICAL_SPEED = 15.0
+H_LANDING_HEIGHT = 60.0
+H_LANDING_HEIGHT_TOLERANCE = 8.0
+H_LANDING_HEIGHT_TIMEOUT = 8.0
+H_LANDING_PIXEL_THRESHOLD = 30.0
+H_LANDING_CENTER_CONFIRM_FRAMES = 5
+H_LANDING_APPROACH_SPEED = 15.0
+H_LANDING_CONTROL_PERIOD = 0.1
+H_LANDING_ALIGNMENT_TIMEOUT = 60.0
+H_LANDING_MIN_CONTROL_HEIGHT = 25.0
+H_LANDING_MAX_CONTROL_HEIGHT = 75.0
+
 
 def wait_for_terminal_start_command(
     digital_output_enabled: bool = True,
@@ -287,6 +301,136 @@ class StaticTargetVisualDescentMission(mission1.Mission):
             height_timeout=LANDING_HEIGHT_TIMEOUT_SECONDS,
         ):
             raise RuntimeError("Failed to land at takeoff point")
+
+    def _current_navi_height(self) -> Optional[float]:
+        try:
+            return float(self.navi.current_height)
+        except Exception:
+            return None
+
+    def _visual_h_landing_at_takeoff(self) -> None:
+        """返航后以 60cm 高度视觉对准 H 标记，再在该点调用定点降落。
+
+        H 标记的视觉判断自返航时（enable_h_landing_vision）已经开始，
+        但只有下降到 60cm 进入本方法后，H 偏移才实际影响飞行控制。
+        本阶段垂直速度设为 15cm/s。
+        """
+        navi = self.navi
+        if self.stop_event.is_set():
+            raise RuntimeError("Visual H landing stopped before descent")
+        if not navi.running:
+            raise RuntimeError("Navigation is not running")
+        if not self.fc.state.is_fresh(0.5) or not self.fc.state.unlock.value:
+            raise RuntimeError("Flight state is stale or aircraft is locked")
+        if not navi.pose_is_fresh():
+            raise RuntimeError("Navigation pose is stale")
+
+        navi.set_vertical_speed(H_LANDING_VERTICAL_SPEED)
+        navi.set_height(H_LANDING_HEIGHT)
+        navi.keep_height_flag = True
+        if not navi.wait_for_height(
+            height_thres=H_LANDING_HEIGHT_TOLERANCE,
+            timeout=H_LANDING_HEIGHT_TIMEOUT,
+        ):
+            raise RuntimeError(
+                "Failed to reach H visual approach height {}cm".format(
+                    H_LANDING_HEIGHT
+                )
+            )
+        if (
+            self.stop_event.is_set()
+            or not self.fc.state.is_fresh(0.5)
+            or not navi.pose_is_fresh()
+        ):
+            raise RuntimeError("State invalid before H visual alignment")
+
+        centered = False
+        centered_frames = 0
+        deadline = time.monotonic() + H_LANDING_ALIGNMENT_TIMEOUT
+        try:
+            while time.monotonic() < deadline:
+                if self.stop_event.is_set():
+                    logger.warning("[H-LAND] Alignment stopped externally")
+                    break
+                if (
+                    not self.fc.state.is_fresh(0.5)
+                    or not self.fc.state.unlock.value
+                    or self.fc.state.mode.value != self.fc.HOLD_POS_MODE
+                    or not navi.pose_is_fresh()
+                ):
+                    raise RuntimeError(
+                        "Flight or radar state became invalid "
+                        "during H alignment"
+                    )
+                current_height = self._current_navi_height()
+                if (
+                    current_height is None
+                    or not math.isfinite(current_height)
+                    or current_height < H_LANDING_MIN_CONTROL_HEIGHT
+                    or current_height > H_LANDING_MAX_CONTROL_HEIGHT
+                ):
+                    raise RuntimeError(
+                        "Unsafe height during H alignment: {}cm".format(
+                            current_height
+                        )
+                    )
+
+                # 读取前先停水平运动，避免等待视觉样本期间残留水平速度。
+                navi.stop_move()
+                sample = self._latest_vision_sample()
+                if (
+                    sample is None
+                    or time.monotonic() - sample[1]
+                    > mission1.VISION_SAMPLE_STALE_SECONDS
+                ):
+                    centered_frames = 0
+                    self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                    continue
+
+                x_px, y_px = sample[2], sample[3]
+                if x_px is None or y_px is None:
+                    centered_frames = 0
+                    self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                    continue
+
+                x_px = float(x_px)
+                y_px = float(y_px)
+                distance_px = math.hypot(x_px, y_px)
+                if distance_px <= H_LANDING_PIXEL_THRESHOLD:
+                    centered_frames += 1
+                    logger.info(
+                        "[H-LAND] H marker centered {}/{}: distance={:.1f}px",
+                        centered_frames,
+                        H_LANDING_CENTER_CONFIRM_FRAMES,
+                        distance_px,
+                    )
+                    if centered_frames >= H_LANDING_CENTER_CONFIRM_FRAMES:
+                        centered = True
+                        break
+                    self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                    continue
+
+                centered_frames = 0
+                direction_deg = math.degrees(math.atan2(y_px, x_px))
+                navi.move_by_direction(
+                    speed=H_LANDING_APPROACH_SPEED,
+                    direction_deg=direction_deg,
+                )
+                self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                navi.stop_move()
+        finally:
+            navi.stop_move()
+
+        if not centered:
+            raise RuntimeError("H-marker alignment was not confirmed")
+        if not self.fc.state.is_fresh(0.5) or not self.fc.state.unlock.value:
+            raise RuntimeError("Flight state invalid after H visual alignment")
+
+        landing_point = navi.current_point
+        if not navi.pointing_landing(landing_point):
+            raise RuntimeError(
+                "Pointing landing was not confirmed after H alignment"
+            )
 
     def run(self) -> None:
         navi = self.navi

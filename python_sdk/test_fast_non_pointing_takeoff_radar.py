@@ -7,9 +7,9 @@
     非定点垂直起飞（90 cm 一键离地，垂直爬升至 150 cm）
       -> (100, 0)
       -> (0, 0)
-      -> 下降至 50 cm
-      -> 识别H标记并以30像素阈值完成视觉微调
-      -> 飞控一键降落
+      -> 下降至 60 cm
+      -> 识别H标记并以30像素阈值完成视觉校准
+      -> 在该点调用 pointing_landing 定点降落
 
 新起飞函数仅供 mission1_26.py 和 mission2_26.py 的快速任务使用，
 不适用于要求定点起飞的常规任务。坐标和高度单位均为 cm；水平坐标系
@@ -43,7 +43,7 @@ CRUISE_SPEED = 15.0
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 22.0
 LANDING_HEIGHT_TIMEOUT = 8.0
-LANDING_HEIGHT = 50.0
+LANDING_HEIGHT = 60.0
 LANDING_HEIGHT_TOLERANCE = 8.0
 LANDING_PIXEL_THRESHOLD = 30.0
 LANDING_CENTER_CONFIRM_FRAMES = 5
@@ -361,7 +361,7 @@ def visual_home_h_landing(
     camera_index: int,
     telemetry_log: Optional[_LandingTelemetryLog] = None,
 ) -> bool:
-    """下降至50 cm，以H标记完成视觉微调，再交给飞控一键降落。"""
+    """下降至60 cm，以H标记完成视觉校准，再在该点调用 pointing_landing 定点降落。"""
     snapshot = _navi_snapshot(navi)
     if telemetry_log is not None:
         telemetry_log.write(
@@ -373,7 +373,7 @@ def visual_home_h_landing(
             fc_mode=_fc_mode_value(fc),
             unlock=_fc_unlock_value(fc),
             pose_fresh=snapshot["pose_fresh"],
-            message="descend to 50cm and align over home H",
+            message="descend to 60cm and align over home H",
         )
     if stop_event.is_set():
         logger.warning("[HOME-LAND] Visual landing stopped before descent")
@@ -645,10 +645,15 @@ def visual_home_h_landing(
 
     navi.navigation_flag = False
     navi.keep_height_flag = False
-    fc.set_flight_mode(fc.PROGRAM_MODE)
-    time.sleep(0.1)
-    fc.stablize()
-    fc.land()
+    # 视觉校准完成后，以当前位置为落点调用定点降落
+    landing_point = navi.current_point
+    logger.info(
+        "[HOME-LAND] Visual calibration completed at {}cm; "
+        "calling pointing_landing at ({:.1f}, {:.1f})",
+        LANDING_HEIGHT,
+        float(landing_point[0]),
+        float(landing_point[1]),
+    )
     if telemetry_log is not None:
         telemetry_log.write(
             "landing_command",
@@ -663,75 +668,23 @@ def visual_home_h_landing(
                 if not hasattr(navi, "pose_is_fresh")
                 else navi.pose_is_fresh()
             ),
-            message="program mode stabilize and land",
+            message="calling pointing_landing at calibrated point",
         )
-
-    started_at = time.perf_counter()
-    landed = False
-    while time.perf_counter() - started_at < LANDING_TOUCHDOWN_TIMEOUT:
-        time.sleep(0.1)
-        try:
-            altitude = float(fc.state.alt_add.value)
-        except Exception:
-            altitude = 999.0
-        if (
-            fc.state.is_fresh(0.5)
-            and altitude <= LANDING_TOUCHDOWN_ALTITUDE
-        ) or not fc.state.unlock.value:
-            landed = True
-            break
-
-    if not landed:
+    if not navi.pointing_landing(landing_point):
         if telemetry_log is not None:
             telemetry_log.write(
                 "landing_timeout",
-                height_cm=altitude,
+                height_cm=_safe_float(navi.current_height),
                 fc_mode=_fc_mode_value(fc),
                 unlock=_fc_unlock_value(fc),
-                message="landing timeout; keep landing command active",
+                message="pointing_landing was not confirmed",
             )
-        logger.error(
-            "[HOME-LAND] Landing timeout; keep landing command active and "
-            "refuse airborne force-lock"
-        )
-        fc.land()
+        logger.error("[HOME-LAND] Pointing landing was not confirmed")
         return False
-
-    try:
-        locked = fc.wait_for_lock(timeout_s=LANDING_LOCK_TIMEOUT)
-    except TypeError:
-        locked = fc.wait_for_lock(LANDING_LOCK_TIMEOUT)
-    if not locked:
-        state_fresh = fc.state.is_fresh(0.5)
-        altitude = (
-            float(fc.state.alt_add.value) if state_fresh else 999.0
-        )
-        if state_fresh and altitude <= LANDING_TOUCHDOWN_ALTITUDE:
-            fc.lock()
-            try:
-                locked = fc.wait_for_lock(timeout_s=LANDING_LOCK_TIMEOUT)
-            except TypeError:
-                locked = fc.wait_for_lock(LANDING_LOCK_TIMEOUT)
-            if not locked:
-                logger.error(
-                    "[HOME-LAND] Lock command was sent but lock feedback "
-                    "was not confirmed"
-                )
-                return False
-        else:
-            logger.error(
-                "[HOME-LAND] Lock not confirmed; refuse lock without "
-                "fresh touchdown altitude"
-            )
-            return False
     if telemetry_log is not None:
         telemetry_log.write(
             "locked",
-            height_cm=(
-                float(fc.state.alt_add.value)
-                if fc.state.is_fresh(0.5)
-                else None
-            ),
+            height_cm=_safe_float(navi.current_height),
             fc_mode=_fc_mode_value(fc),
             unlock=_fc_unlock_value(fc),
             message="landing lock confirmed",
@@ -912,7 +865,8 @@ class Mission:
         )
 
         logger.info(
-            "[TEST] Descend to 50cm, align over home H marker and land"
+            "[TEST] Descend to 60cm, align over home H marker, "
+            "then pointing landing at the calibrated point"
         )
         if not visual_home_h_landing(
             fc=self.fc,

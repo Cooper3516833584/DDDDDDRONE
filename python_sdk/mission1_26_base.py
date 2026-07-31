@@ -31,7 +31,7 @@ from FlightController.Solutions.Navigation import Navigation
 from fleet_bus.air_node import attach_air_fleet_node
 from fleet_bus.models import AirFleetState, NodeFlags
 from fleet_bus.pose_provider import NavigationAirStateProvider
-from landing_marker_offset import track_landing_marker
+from landing_marker_offset import track_switchable_marker
 
 
 FC_SERIAL_DEV = "/dev/ttyACM0"
@@ -41,6 +41,9 @@ TAKEOFF_POINT = np.array([0.0, 0.0])
 ENTRY_POINT = np.array([87.5, -37.5])
 CRUISE_HEIGHT = 150
 VERTICAL_SPEED = 20
+
+# 非定点垂直起飞阶段使用的垂直速度（cm/s），起飞完成后恢复为 VERTICAL_SPEED。
+FAST_TAKEOFF_VERTICAL_SPEED = 30
 
 PURSUIT_SPEED = 30
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
@@ -181,6 +184,7 @@ class Mission:
         self._vision_thread: Optional[threading.Thread] = None
         self._vision_error: Optional[BaseException] = None
         self._vision_sequence = 0
+        self._vision_h_mode = False
         self._vision_samples: Deque[
             Tuple[int, float, Optional[float], Optional[float]]
         ] = deque(maxlen=VISION_SAMPLE_BUFFER_SIZE)
@@ -250,7 +254,14 @@ class Mission:
             Iterator[Tuple[Optional[float], Optional[float]]]
         ] = None
         try:
-            offsets = track_landing_marker(CAMERA_INDEX)
+
+            def h_mode_enabled() -> bool:
+                with self._vision_lock:
+                    return self._vision_h_mode
+
+            # 追及阶段检测移动目标标记；返航后通过 _vision_h_mode 切换为
+            # 固定 H 降落标记检测，全程只打开一次摄像头。
+            offsets = track_switchable_marker(CAMERA_INDEX, h_mode_enabled)
             for x_px, y_px in offsets:
                 now = time.monotonic()
                 with self._vision_lock:
@@ -329,6 +340,16 @@ class Mission:
                     "[VISION] Marker tracker did not stop within 1s; "
                     "camera will be released when its daemon thread exits"
                 )
+
+    def enable_h_landing_vision(self) -> None:
+        """返航开始时切换到固定 H 降落标记检测，相机保持同一路开启。
+
+        H 标记的像素偏移在返航与下降阶段持续产出，但只有在返航后的
+        定点降落下降到 60cm 时才会进入飞行控制闭环。
+        """
+        with self._vision_lock:
+            self._vision_h_mode = True
+        logger.info("[VISION] Switched to home-H landing marker detection")
 
     def _raise_if_vision_failed(self):
         with self._vision_lock:

@@ -17,7 +17,11 @@ import numpy as _np
 
 globals().pop("annotations", None)
 
-__all__ = ["track_home_h_marker", "track_landing_marker"]
+__all__ = [
+    "track_home_h_marker",
+    "track_landing_marker",
+    "track_switchable_marker",
+]
 
 _FRAME_WIDTH = 256
 _FRAME_HEIGHT = 256
@@ -3639,3 +3643,51 @@ def track_landing_marker(
                 _cv2.destroyWindow(_DEBUG_WINDOW)
             except _cv2.error:
                 pass
+
+
+def track_switchable_marker(
+    camera_index: int,
+    h_mode_enabled,
+) -> _abc.Iterator[tuple[float | None, float | None]]:
+    """单个下视摄像头按需在圆形/十字标记检测与 H 标记检测之间切换。
+
+    追及阶段使用 ``_MarkerTracker`` 检测移动目标的圆形/十字标记；当
+    ``h_mode_enabled()`` 返回 True 后切换为 ``_HomeHTracker`` 检测固定
+    H 降落标记。全程只打开一次摄像头，避免在同一设备上重复打开关闭。
+
+    Yields:
+        与 ``track_landing_marker`` 相同的 ``(x_px, y_px)`` 格式；
+        ``x_px`` 向图像上方为正，``y_px`` 向图像左侧为正。
+    """
+    cap = _open_camera(camera_index)
+    capture: _LatestFrameCapture | None = None
+    try:
+        _warm_up_camera(cap)
+        capture = _LatestFrameCapture(cap)
+        capture.start()
+        marker_tracker = _MarkerTracker()
+        home_h_tracker = _HomeHTracker()
+        sequence = 0
+        while True:
+            sequence, frame, timestamp_ns = capture.read_after(sequence)
+            gray = _prepare_gray_frame(frame)
+            if gray is None:
+                yield None, None
+                continue
+            if bool(h_mode_enabled()):
+                detection = home_h_tracker.process(gray)
+            else:
+                detection = marker_tracker.process(gray, timestamp_ns)
+            if detection is None:
+                yield None, None
+            else:
+                yield (
+                    float(_FRAME_CENTER_V - detection.center_v),
+                    float(_FRAME_CENTER_U - detection.center_u),
+                )
+    finally:
+        if capture is not None:
+            capture.stop()
+        cap.release()
+        if capture is not None:
+            capture.join()

@@ -3,6 +3,11 @@
 本入口会直连真实飞控、单雷达和相机并执行两次起飞与两次降落。运行前
 必须确认 ``server_ros.py`` 及其他 ``FC_Server`` 已关闭，并清空追及
 路线、移动平台和返航区域。任务二不控制任何数字输出通道。
+
+起飞采用非定点垂直起飞（90 cm 一键离地后垂直爬升至 150 cm），
+该阶段垂直速度设为 30 cm/s。返航开始时切换到 H 降落点检测，
+下降至 60 cm 后以 30 像素阈值完成视觉校准，再在该点定点降落，
+降落阶段垂直速度设为 15 cm/s。相机全程保持开启，不重复开关。
 """
 
 import math
@@ -50,6 +55,8 @@ ESCORT_MAX_X = 357.5
 ESCORT_SPEED_MIDPOINT = 10.0
 ESCORT_STABLE_SECONDS = 4.0
 ESCORT_GATE_TIMEOUT_SECONDS = 90.0
+# 稳定伴飞 4 秒后先下降到该中间高度；经过门控点后继续下降到最终降落高度。
+TARGET_DESCENT_INTERMEDIATE_HEIGHT = 100.0
 TARGET_LANDING_HEIGHT = 25.0
 TARGET_OFFSET_START_HEIGHT = 50.0
 TARGET_OFFSET_FINAL_X_PX = -30.0
@@ -259,8 +266,9 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                 velocity_y,
             )
 
-        final_velocity = self.moving_target_descent.follow_and_descend(
-            target_height=TARGET_LANDING_HEIGHT,
+        # 阶段1：稳定伴飞 4 秒后先下降到中间高度，不要求先经过门控点。
+        self.moving_target_descent.follow_and_descend(
+            target_height=TARGET_DESCENT_INTERMEDIATE_HEIGHT,
             stabilize_seconds=ESCORT_STABLE_SECONDS,
             stabilize_timeout=ESCORT_GATE_TIMEOUT_SECONDS,
             hover_seconds=0.0,
@@ -269,11 +277,36 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
             descent_timeout=TARGET_DESCENT_TIMEOUT_SECONDS,
             on_descent_start=self.signals.send_target_descent_started,
+            pre_descent_max_error_px=TARGET_DETECTION_PIXEL_THRESHOLD,
+            velocity_predictor=predict_target_velocity,
+            horizontal_command_guard=apply_escort_boundary,
+        )
+        logger.info(
+            "[MISSION2] Reached intermediate descent height {:.0f}cm; "
+            "waiting for route gate before continuing descent",
+            TARGET_DESCENT_INTERMEDIATE_HEIGHT,
+        )
+
+        # 阶段2：经过门控点 (207.5,-187.5) 后继续下降到最终降落高度。
+        # 沿用阶段1伴飞器的目标速度估计（不重置），目标速度不会突变。
+        final_velocity = self.moving_target_descent.follow_and_descend(
+            target_height=TARGET_LANDING_HEIGHT,
+            stabilize_seconds=0.0,
+            stabilize_timeout=ESCORT_GATE_TIMEOUT_SECONDS,
+            hover_seconds=0.0,
+            initial_target_velocity=(
+                self.moving_target_descent.estimated_target_velocity
+            ),
+            height_tolerance=descent_test.HEIGHT_TOLERANCE,
+            height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
+            descent_timeout=TARGET_DESCENT_TIMEOUT_SECONDS,
+            on_descent_start=None,
             pre_descent_gate=self._route_gate_is_open,
             pre_descent_max_error_px=TARGET_DETECTION_PIXEL_THRESHOLD,
             velocity_predictor=predict_target_velocity,
             target_offset_provider=self._low_altitude_target_offset.offset,
             horizontal_command_guard=apply_escort_boundary,
+            reset_estimator=False,
         )
         logger.info(
             "[MISSION2] Reached target landing height; estimated target "
@@ -282,7 +315,6 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             final_velocity[1],
         )
 
-        self._stop_vision_tracker()
         land_on_target_and_confirm_lock(
             self.fc,
             self.navi,
@@ -323,6 +355,8 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
 
     def _return_home_and_land(self) -> None:
         self.signals.send_return_started()
+        # 返航开始时切换到 H 降落点检测；相机保持全程开启。
+        self.enable_h_landing_vision()
         self.navi.set_navigation_speed(RETURN_SPEED)
         if not self.navi.navigation_to_waypoint(
             mission_base.TAKEOFF_POINT,
@@ -330,11 +364,10 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         ):
             raise RuntimeError("Failed to return to initial takeoff point")
         self.signals.send_landing_started()
-        self._finish_at_takeoff_point()
+        self._visual_h_landing_at_takeoff()
 
     def _recover_home_after_expected_failure(self, reason: str) -> None:
         logger.error("[MISSION2] Safe return requested: {}", reason)
-        self._stop_vision_tracker()
         self.navi.navigation_stop_here()
         if not self.fc.state.unlock.value:
             self.set_fleet_status(
@@ -421,10 +454,11 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         self.signals.send_takeoff_started()
 
         try:
-            navi.pointing_takeoff(
-                mission_base.TAKEOFF_POINT,
+            navi.set_vertical_speed(mission_base.FAST_TAKEOFF_VERTICAL_SPEED)
+            navi.fast_non_pointing_takeoff(
                 target_height=CRUISE_HEIGHT,
             )
+            navi.set_vertical_speed(VERTICAL_SPEED)
             self._ground_commands.complete(takeoff_command)
         except Exception:
             self._ground_commands.fail(takeoff_command, error_code=1)
