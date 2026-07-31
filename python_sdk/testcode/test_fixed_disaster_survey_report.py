@@ -18,7 +18,7 @@ class FixedDisasterSurveyTests(unittest.TestCase):
 
     def test_default_report_contains_water_and_wildfire(self):
         state = build_survey_state()
-        self.assertEqual(int(SurveyFlags.COMPLETE), state.survey_flags)
+        self.assertTrue(state.survey_flags & int(SurveyFlags.COMPLETE))
         self.assertEqual((1, 1, 2), (
             state.wildfire_event_id,
             state.wildfire_row,

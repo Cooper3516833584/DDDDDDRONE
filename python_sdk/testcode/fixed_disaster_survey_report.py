@@ -53,13 +53,19 @@ def build_survey_state(
     terrain = [int(TerrainCode.FIELD)] * (GRID_ROWS * GRID_COLS)
     terrain[water[0] * GRID_COLS + water[1]] = int(TerrainCode.RIVER)
     terrain[fire[0] * GRID_COLS + fire[1]] = int(TerrainCode.WILDFIRE)
+    cell_positions_cm = tuple(
+        (int((col + 0.5) * GRID_SIZE_CM), int((row + 0.5) * GRID_SIZE_CM))
+        for row in range(GRID_ROWS)
+        for col in range(GRID_COLS)
+    )
     return SurveyState(
         survey_revision=1,
-        survey_flags=int(SurveyFlags.COMPLETE),
+        survey_flags=int(SurveyFlags.COMPLETE | SurveyFlags.ABSOLUTE_POSITIONS),
         wildfire_event_id=1,
         wildfire_row=fire[0],
         wildfire_col=fire[1],
         terrain_codes=tuple(terrain),
+        cell_positions_cm=cell_positions_cm,
     )
 
 
