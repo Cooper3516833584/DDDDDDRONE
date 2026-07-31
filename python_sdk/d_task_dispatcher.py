@@ -180,6 +180,7 @@ class Dispatcher:
             if not safe:
                 self.stop_event.wait(0.5)
                 return not self.stop_event.is_set()
+            fc.set_indicator_led(0, 0, 255)
             LOG.info("D-task dispatcher ready; waiting for mission selection")
             while not self.stop_event.is_set():
                 command = node.command_queue.receive(timeout=0.2)

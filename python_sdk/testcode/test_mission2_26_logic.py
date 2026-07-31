@@ -150,10 +150,10 @@ def test_pursuit_speed_schedule() -> None:
 
 
 def test_route_pass_gate() -> None:
-    gate = RoutePassGate()
+    gate = RoutePassGate(radius=40.0)
     assert not gate.update(ARC_END[0], ARC_END[1])
-    assert not gate.update(ARC_END[0] - 8.0, ARC_END[1])
-    assert gate.update(ARC_END[0] - 0.1, ARC_END[1])
+    assert not gate.update(ARC_END[0] - 40.1, ARC_END[1])
+    assert gate.update(ARC_END[0] - 39.9, ARC_END[1])
     assert gate.update(0.0, 0.0)
 
     invalid_gate = RoutePassGate()

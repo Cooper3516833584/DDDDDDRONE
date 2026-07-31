@@ -24,13 +24,16 @@ from fleet_bus.trace_buffer import TraceSamplingOptions
 import mission1_26 as mission1
 import mission1_26_base as mission_base
 import mission1_26_visual_descent_test as descent_test
+from moving_target_descent import (
+    MovingTargetDescentConfig,
+    MovingTargetDescentController,
+)
 from mission2_26_logic import (
     ARC_END,
     ClockwiseArcVelocityPredictor,
     LowAltitudeTargetOffset,
     PURSUIT_SLOWDOWN_POINT,
     PursuitSpeedSchedule,
-    ROUTE_GATE_RADIUS,
     RoutePassGate,
     build_pursuit_trajectory,
     land_on_target_and_confirm_lock,
@@ -55,6 +58,12 @@ ESCORT_MAX_X = 357.5
 ESCORT_SPEED_MIDPOINT = 12.0
 ESCORT_STABLE_SECONDS = 4.0
 ESCORT_GATE_TIMEOUT_SECONDS = 90.0
+# 任务二专用：保留 12cm/s 初始估计，估计器合速度最多 15cm/s，
+# 视觉控制实际输出最多 20cm/s。任务一仍使用共享默认配置。
+TASK2_ESTIMATOR_SPEED_LIMIT = 15.0
+TASK2_OUTPUT_SPEED_LIMIT = 20.0
+# 目标仍可稳定识别时允许在圆弧终点附近提前进入最终下降。
+TARGET_DESCENT_GATE_RADIUS = 40.0
 # 稳定伴飞 4 秒后先下降到该中间高度；经过门控点后继续下降到最终降落高度。
 TARGET_DESCENT_INTERMEDIATE_HEIGHT = 100.0
 TARGET_LANDING_HEIGHT = 25.0
@@ -114,7 +123,19 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         super().__init__(*args, **kwargs)
         self.signals = Mission2Signals(self)
         self._digital_output_enabled = False
-        self._route_gate = RoutePassGate(radius=ROUTE_GATE_RADIUS)
+        self.moving_target_descent = MovingTargetDescentController(
+            fc=self.fc,
+            navi=self.navi,
+            stop_event=self.stop_event,
+            latest_vision_sample=self._latest_vision_sample,
+            raise_if_vision_failed=self._raise_if_vision_failed,
+            record_callback=self._record_moving_descent,
+            config=MovingTargetDescentConfig(
+                estimator_speed_limit=TASK2_ESTIMATOR_SPEED_LIMIT,
+                horizontal_command_limit=TASK2_OUTPUT_SPEED_LIMIT,
+            ),
+        )
+        self._route_gate = RoutePassGate(radius=TARGET_DESCENT_GATE_RADIUS)
         self._arc_velocity_predictor = ClockwiseArcVelocityPredictor(
             position_tolerance=ARC_VELOCITY_POSITION_TOLERANCE,
         )
