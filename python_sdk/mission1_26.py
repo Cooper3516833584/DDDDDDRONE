@@ -456,8 +456,7 @@ class MovingTargetVisualDescentMission(
             "[MISSION1] Hovering {:.1f}s after takeoff before pursuit",
             HOVER_BEFORE_PURSUIT_SECONDS,
         )
-        if not self.stop_event.wait(HOVER_BEFORE_PURSUIT_SECONDS):
-            raise RuntimeError("Mission stopped during hover before pursuit")
+        time.sleep(HOVER_BEFORE_PURSUIT_SECONDS)
         self.fc.set_indicator_led(0, 0, 0)
 
         logger.info(
