@@ -117,6 +117,8 @@ class MissionOperationState:
     COMPLETED = 11
     STOPPED = 12
     FAULT = 13
+    # MISSION1 only: digital output 0 is off and the payload is released.
+    MISSION1_DROP_COMPLETED = 14
 
 
 FLEET_TRACE_DRAIN_TIMEOUT_SECONDS = 6.0
@@ -177,6 +179,7 @@ class MissionFleetStateProvider:
             MissionOperationState.TAKEOFF,
             MissionOperationState.HOVERING,
             MissionOperationState.ESCORTING,
+            MissionOperationState.MISSION1_DROP_COMPLETED,
             MissionOperationState.RETURNING_HOME,
             MissionOperationState.LANDING_HOME,
         ):

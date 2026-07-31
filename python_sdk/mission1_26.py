@@ -69,7 +69,6 @@ class MissionGroundStationSignals:
 
     TAKEOFF_SIGNAL_RECEIVED = 2
     DROP_STARTED = 6
-    DROP_COMPLETED = 7
 
     def __init__(self, mission: "MovingTargetVisualDescentMission") -> None:
         self._mission = mission
@@ -99,7 +98,10 @@ class MissionGroundStationSignals:
         self._send("drop_started", self.DROP_STARTED)
 
     def send_drop_completed(self) -> None:
-        self._send("drop_completed", self.DROP_COMPLETED)
+        self._send(
+            "drop_completed",
+            mission1.MissionOperationState.MISSION1_DROP_COMPLETED,
+        )
 
     def send_return_started(self) -> None:
         self._send(
@@ -482,9 +484,9 @@ class MovingTargetVisualDescentMission(
             pos_thres=PURSUIT_POSITION_THRESHOLD,
         ):
             raise RuntimeError("Failed to start task 1 pursuit trajectory")
-        self.signals.send_escort_started()
 
         self._wait_until_target_detected_on_trajectory()
+        self.signals.send_escort_started()
         self._perform_target_action()
 
         # 返航开始时切换到 H 降落点检测；相机保持全程开启。

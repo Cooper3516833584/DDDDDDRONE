@@ -100,12 +100,12 @@ class FakeNavigation:
 
 
 class FakeMission:
-    def __init__(self, pose_ready):
+    def __init__(self, pose_ready, operation_state=MissionOperationState.READY):
         self.pose_ready = pose_ready
+        self.operation_state = operation_state
 
-    @staticmethod
-    def fleet_status():
-        return MissionOperationState.READY, 0
+    def fleet_status(self):
+        return self.operation_state, 0
 
     def fleet_pose_ready(self):
         return self.pose_ready
@@ -189,6 +189,22 @@ class MissionFleetPoseReportingTests(unittest.TestCase):
         mission.set_fleet_status(MissionOperationState.TAKEOFF)
 
         self.assertTrue(mission.fleet_pose_ready())
+
+    def test_drop_completed_state_remains_busy_during_low_hover(self):
+        provider = MissionFleetStateProvider(
+            FakeFlightController(),
+            FakeNavigation(),
+            FakeMission(
+                pose_ready=True,
+                operation_state=(
+                    MissionOperationState.MISSION1_DROP_COMPLETED
+                ),
+            ),
+        )
+
+        state = provider()
+
+        self.assertTrue(state.node_flags & int(NodeFlags.BUSY))
 
 
 if __name__ == "__main__":
