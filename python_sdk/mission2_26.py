@@ -79,14 +79,14 @@ LOCKED_DWELL_SECONDS = 5.0
 PLATFORM_RETAKEOFF_HEIGHT = 30
 PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS = 15.0
 RETAKEOFF_SUCCEEDED_STATE_HOLD_SECONDS = 1.0
-TASK2_H_LANDING_HEIGHT = 30.0
+TASK2_H_LANDING_HEIGHT = 40.0
 TASK2_H_LANDING_HEIGHT_TOLERANCE = 5.0
 TASK2_H_LANDING_VERTICAL_SPEED = 25.0
-TASK2_H_LANDING_ALIGNMENT_TIMEOUT_SECONDS = 8.0
+TASK2_H_LANDING_ALIGNMENT_TIMEOUT_SECONDS = 5.0
 TASK2_H_LANDING_MAX_CONTROL_HEIGHT = 90.0
 
 TASK2_ARC_START = (312.5, -112.5)
-TASK2_PURSUIT_DIRECT_SEGMENTS = 4
+TASK2_PURSUIT_DIRECT_SEGMENTS = 2
 
 
 def build_task2_pursuit_trajectory(
@@ -488,7 +488,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             descent_test.H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING
         )
         descent_test.H_LANDING_HEIGHT = TASK2_H_LANDING_HEIGHT
-        # A 5cm tolerance keeps the accepted 30cm approach height at or above
+        # A 5cm tolerance keeps the accepted approach height at or above
         # the inherited 25cm minimum for horizontal visual control.
         descent_test.H_LANDING_HEIGHT_TOLERANCE = (
             TASK2_H_LANDING_HEIGHT_TOLERANCE
