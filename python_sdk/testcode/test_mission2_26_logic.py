@@ -26,6 +26,7 @@ from mission2_26_logic import (  # noqa: E402
     land_on_target_and_confirm_lock,
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
+    straight_return_axis_limits,
 )
 from mission2_26_safety import EscortXBoundaryVelocityGuard  # noqa: E402
 
@@ -64,6 +65,32 @@ def test_pursuit_trajectory_geometry() -> None:
     assert arc_points[1][0] > arc_points[0][0]
     assert arc_points[1][1] < arc_points[0][1]
     assert trajectory[-1][0] < trajectory[-2][0]
+
+
+def test_straight_return_axis_limits() -> None:
+    x_limit, y_limit = straight_return_axis_limits(
+        237.5,
+        -187.5,
+        0.0,
+        0.0,
+        30.0,
+    )
+    assert math.isclose(math.hypot(x_limit, y_limit), 30.0)
+    assert math.isclose(x_limit / y_limit, 237.5 / 187.5)
+    assert straight_return_axis_limits(100.0, 0.0, 0.0, 0.0, 30.0) == (
+        30.0,
+        0.0,
+    )
+    assert straight_return_axis_limits(0.0, 0.0, 0.0, 0.0, 30.0) == (
+        0.0,
+        0.0,
+    )
+    try:
+        straight_return_axis_limits(0.0, 0.0, 1.0, 1.0, 0.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Non-positive straight-return speed was accepted")
 
 
 def test_clockwise_arc_velocity_prediction() -> None:
@@ -363,6 +390,7 @@ def test_locked_red_led_dwell_and_cleanup() -> None:
 
 def main() -> None:
     test_pursuit_trajectory_geometry()
+    test_straight_return_axis_limits()
     test_clockwise_arc_velocity_prediction()
     test_low_altitude_target_offset()
     test_escort_x_boundary_velocity_guard()

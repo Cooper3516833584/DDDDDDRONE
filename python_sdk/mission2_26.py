@@ -39,6 +39,7 @@ from mission2_26_logic import (
     land_on_target_and_confirm_lock,
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
+    straight_return_axis_limits,
 )
 from visual_target_descent import PreDescentTimeoutError
 
@@ -48,6 +49,9 @@ VERTICAL_SPEED = 20.0
 PURSUIT_SPEED = 35.0
 PURSUIT_APPROACH_SPEED = 15.0
 RETURN_SPEED = 30.0
+RETURN_POSITION_THRESHOLD = 10.0
+RETURN_SETTLE_SECONDS = 0.5
+RETURN_TIMEOUT_SECONDS = 45.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
 ESCORT_ENTRY_PIXEL_RADIUS = 80.0
@@ -468,10 +472,39 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         # 返航开始时切换到 H 降落点检测；相机保持全程开启。
         self.enable_h_landing_vision()
         self.navi.set_navigation_speed(RETURN_SPEED)
-        if not self.navi.navigation_to_waypoint(
-            mission_base.TAKEOFF_POINT,
-            wait=True,
-        ):
+        self.navi.switch_pid("navi")
+        target_x = float(mission_base.TAKEOFF_POINT[0])
+        target_y = float(mission_base.TAKEOFF_POINT[1])
+        return_distance = math.hypot(
+            target_x - float(self.navi.current_x),
+            target_y - float(self.navi.current_y),
+        )
+        if return_distance > RETURN_POSITION_THRESHOLD:
+            x_limit, y_limit = straight_return_axis_limits(
+                self.navi.current_x,
+                self.navi.current_y,
+                target_x,
+                target_y,
+                RETURN_SPEED,
+            )
+            self.navi.navi_x_pid.output_limits = (-x_limit, x_limit)
+            self.navi.navi_y_pid.output_limits = (-y_limit, y_limit)
+            logger.info(
+                "[MISSION2] Straight return from ({:.1f}, {:.1f})cm; "
+                "axis limits=({:.1f}, {:.1f})cm/s",
+                self.navi.current_x,
+                self.navi.current_y,
+                x_limit,
+                y_limit,
+            )
+        self.navi.direct_set_waypoint(mission_base.TAKEOFF_POINT)
+        return_succeeded = self.navi.wait_for_waypoint(
+            time_thres=RETURN_SETTLE_SECONDS,
+            pos_thres=RETURN_POSITION_THRESHOLD,
+            timeout=RETURN_TIMEOUT_SECONDS,
+        )
+        self.navi.set_navigation_speed(RETURN_SPEED)
+        if not return_succeeded:
             raise RuntimeError("Failed to return to initial takeoff point")
         self.signals.send_landing_started()
         self._visual_h_landing_at_takeoff()

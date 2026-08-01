@@ -111,6 +111,34 @@ class _Navigation:
         return True
 
 
+class _ReturnNavigation:
+    def __init__(self):
+        self.calls = []
+        self.current_x = 237.5
+        self.current_y = -187.5
+        self.navi_x_pid = types.SimpleNamespace(output_limits=None)
+        self.navi_y_pid = types.SimpleNamespace(output_limits=None)
+
+    def set_navigation_speed(self, speed):
+        self.calls.append(("set_navigation_speed", speed))
+
+    def switch_pid(self, name):
+        self.calls.append(("switch_pid", name))
+
+    def direct_set_waypoint(self, point):
+        self.calls.append(("direct_set_waypoint", tuple(point)))
+
+    def wait_for_waypoint(self, **kwargs):
+        self.calls.append(("wait_for_waypoint", kwargs))
+        return True
+
+    @staticmethod
+    def navigation_to_waypoint(*_args, **_kwargs):
+        raise AssertionError(
+            "Task 2 return must not generate an intermediate trajectory"
+        )
+
+
 class _Logger:
     def __getattr__(self, _name):
         return lambda *_args, **_kwargs: None
@@ -403,6 +431,89 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertLess(
             events.index("target_locked"),
             events.index("retakeoff_started"),
+        )
+
+    def test_return_uses_one_fixed_takeoff_waypoint(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        method = _method(mission, "_return_home_and_land")
+        extracted = ast.ClassDef(
+            name="ExtractedTask2",
+            bases=[],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "RETURN_SPEED": 30.0,
+            "RETURN_POSITION_THRESHOLD": 10.0,
+            "RETURN_SETTLE_SECONDS": 0.5,
+            "RETURN_TIMEOUT_SECONDS": 45.0,
+            "straight_return_axis_limits": (
+                lambda current_x, current_y, target_x, target_y, speed: (
+                    speed
+                    * abs(target_x - current_x)
+                    / math.hypot(
+                        target_x - current_x,
+                        target_y - current_y,
+                    ),
+                    speed
+                    * abs(target_y - current_y)
+                    / math.hypot(
+                        target_x - current_x,
+                        target_y - current_y,
+                    ),
+                )
+            ),
+            "math": math,
+            "logger": _Logger(),
+            "mission_base": types.SimpleNamespace(TAKEOFF_POINT=(0.0, 0.0)),
+        }
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+
+        task = namespace["ExtractedTask2"]()
+        task.navi = _ReturnNavigation()
+        task.signals = types.SimpleNamespace(
+            send_return_started=lambda: None,
+            send_landing_started=lambda: None,
+        )
+        task.enable_h_landing_vision = lambda: None
+        task._visual_h_landing_at_takeoff = lambda: None
+
+        task._return_home_and_land()
+
+        self.assertEqual(
+            [
+                ("set_navigation_speed", 30.0),
+                ("switch_pid", "navi"),
+                ("direct_set_waypoint", (0.0, 0.0)),
+                (
+                    "wait_for_waypoint",
+                    {
+                        "time_thres": 0.5,
+                        "pos_thres": 10.0,
+                        "timeout": 45.0,
+                    },
+                ),
+                ("set_navigation_speed", 30.0),
+            ],
+            task.navi.calls,
+        )
+        distance = math.hypot(237.5, 187.5)
+        self.assertEqual(
+            (
+                -30.0 * 237.5 / distance,
+                30.0 * 237.5 / distance,
+            ),
+            task.navi.navi_x_pid.output_limits,
+        )
+        self.assertEqual(
+            (
+                -30.0 * 187.5 / distance,
+                30.0 * 187.5 / distance,
+            ),
+            task.navi.navi_y_pid.output_limits,
         )
 
     def _build_extracted_task(self, events, landing_function):
