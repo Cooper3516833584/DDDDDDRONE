@@ -69,6 +69,10 @@ H_LANDING_CENTER_CONFIRM_FRAMES = 5
 H_LANDING_APPROACH_SPEED = 15.0
 H_LANDING_CONTROL_PERIOD = 0.1
 H_LANDING_ALIGNMENT_TIMEOUT = 60.0
+# Task-specific callers may opt into descending at the current point if the
+# bounded visual-alignment window expires. The default preserves legacy fail
+# closed behavior for existing callers.
+H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING = False
 H_LANDING_MIN_CONTROL_HEIGHT = 25.0
 H_LANDING_MAX_CONTROL_HEIGHT = 75.0
 
@@ -422,7 +426,15 @@ class StaticTargetVisualDescentMission(mission1.Mission):
             navi.stop_move()
 
         if not centered:
-            raise RuntimeError("H-marker alignment was not confirmed")
+            if self.stop_event.is_set():
+                raise RuntimeError("H-marker alignment was stopped")
+            if not H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING:
+                raise RuntimeError("H-marker alignment was not confirmed")
+            logger.warning(
+                "[H-LAND] Alignment timed out after {:.1f}s; "
+                "descending at the current point",
+                H_LANDING_ALIGNMENT_TIMEOUT,
+            )
         if not self.fc.state.is_fresh(0.5) or not self.fc.state.unlock.value:
             raise RuntimeError("Flight state invalid after H visual alignment")
 
