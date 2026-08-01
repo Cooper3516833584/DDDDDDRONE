@@ -84,6 +84,14 @@ TASK2_H_LANDING_HEIGHT_TOLERANCE = 5.0
 TASK2_H_LANDING_VERTICAL_SPEED = 25.0
 TASK2_H_LANDING_ALIGNMENT_TIMEOUT_SECONDS = 5.0
 TASK2_H_LANDING_MAX_CONTROL_HEIGHT = 90.0
+# Set False to return to the previous sequential H-landing approach.
+TASK2_H_LANDING_PREALIGN_ENABLED = True
+TASK2_H_LANDING_PREALIGN_MAX_HEIGHT = 60.0
+TASK2_H_LANDING_COARSE_ERROR_PX = 60.0
+TASK2_H_LANDING_FINE_ERROR_PX = 30.0
+TASK2_H_LANDING_COARSE_SPEED = 20.0
+TASK2_H_LANDING_MEDIUM_SPEED = 12.0
+TASK2_H_LANDING_FINE_SPEED = 6.0
 
 TASK2_ARC_START = (312.5, -112.5)
 TASK2_PURSUIT_DIRECT_SEGMENTS = 2
@@ -474,6 +482,19 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         )
         if self.stop_event.wait(RETAKEOFF_SUCCEEDED_STATE_HOLD_SECONDS):
             raise RuntimeError("Task 2 stopped during retakeoff-success hold")
+
+    def _h_landing_approach_speed(self, distance_px: float) -> float:
+        if distance_px >= TASK2_H_LANDING_COARSE_ERROR_PX:
+            return TASK2_H_LANDING_COARSE_SPEED
+        if distance_px >= TASK2_H_LANDING_FINE_ERROR_PX:
+            return TASK2_H_LANDING_MEDIUM_SPEED
+        return TASK2_H_LANDING_FINE_SPEED
+
+    def _h_landing_pre_alignment_enabled(self) -> bool:
+        return TASK2_H_LANDING_PREALIGN_ENABLED
+
+    def _h_landing_pre_alignment_max_height(self) -> float:
+        return TASK2_H_LANDING_PREALIGN_MAX_HEIGHT
 
     def _visual_h_landing_at_takeoff(self) -> None:
         # The inherited routine reads this module constant directly.
