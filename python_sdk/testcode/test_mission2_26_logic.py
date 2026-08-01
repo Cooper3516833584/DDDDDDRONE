@@ -26,6 +26,7 @@ from mission2_26_logic import (  # noqa: E402
     land_on_target_and_confirm_lock,
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
+    straight_return_axis_limits,
 )
 from mission2_26_safety import EscortXBoundaryVelocityGuard  # noqa: E402
 
@@ -158,6 +159,26 @@ def test_route_pass_gate() -> None:
 
     invalid_gate = RoutePassGate()
     assert not invalid_gate.update(math.nan, ARC_END[1])
+
+
+def test_straight_return_axis_limits() -> None:
+    x_limit, y_limit = straight_return_axis_limits(
+        237.5, -187.5, 0.0, 0.0, 30.0
+    )
+    assert math.isclose(math.hypot(x_limit, y_limit), 30.0)
+    assert math.isclose(x_limit / y_limit, 237.5 / 187.5)
+    assert straight_return_axis_limits(
+        100.0, 0.0, 0.0, 0.0, 30.0
+    ) == (30.0, 0.0)
+    assert straight_return_axis_limits(
+        0.0, 0.0, 0.0, 0.0, 30.0
+    ) == (0.0, 0.0)
+    try:
+        straight_return_axis_limits(0.0, 0.0, 1.0, 1.0, 0.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Non-positive return speed was accepted")
 
 
 class _Value:
@@ -446,6 +467,7 @@ def main() -> None:
     test_escort_x_boundary_velocity_guard()
     test_pursuit_speed_schedule()
     test_route_pass_gate()
+    test_straight_return_axis_limits()
     test_platform_retakeoff_uses_live_hold_point()
     test_target_landing_confirms_lock()
     test_target_landing_height_confirmation_resets()

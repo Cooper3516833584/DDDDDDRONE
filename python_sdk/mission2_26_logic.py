@@ -166,6 +166,32 @@ def build_pursuit_trajectory(
     return points
 
 
+def straight_return_axis_limits(
+    current_x: float,
+    current_y: float,
+    target_x: float,
+    target_y: float,
+    speed: float,
+) -> Tuple[float, float]:
+    """Split a straight-line speed limit into world X/Y axis limits."""
+    values = (current_x, current_y, target_x, target_y, speed)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("Straight-return parameters must be finite")
+    speed = float(speed)
+    if speed <= 0:
+        raise ValueError("Straight-return speed must be positive")
+
+    delta_x = float(target_x) - float(current_x)
+    delta_y = float(target_y) - float(current_y)
+    distance = math.hypot(delta_x, delta_y)
+    if distance <= 1e-9:
+        return 0.0, 0.0
+    return (
+        speed * abs(delta_x) / distance,
+        speed * abs(delta_y) / distance,
+    )
+
+
 @dataclass
 class PursuitSpeedSchedule:
     """根据轨迹目标和实时位置锁存追及阶段，并给出需要切换的新速度。"""
@@ -482,4 +508,5 @@ __all__ = [
     "land_on_target_and_confirm_lock",
     "locked_red_led_dwell",
     "retakeoff_from_moving_platform",
+    "straight_return_axis_limits",
 ]
