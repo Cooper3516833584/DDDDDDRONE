@@ -72,9 +72,11 @@ class _Signals:
 
 
 class _Descent:
-    estimated_target_velocity = (12.0, 0.0)
+    def __init__(self):
+        self.calls = []
 
     def follow_and_descend(self, **kwargs):
+        self.calls.append(kwargs)
         callback = kwargs.get("on_descent_start")
         if callback is not None:
             callback()
@@ -85,16 +87,6 @@ class _Predictor:
     @staticmethod
     def predict(velocity, _sample_dt, _x, _y):
         return velocity
-
-
-class _BoundaryGuard:
-    @staticmethod
-    def is_active(_x):
-        return False
-
-    @staticmethod
-    def apply(_x, velocity_x, velocity_y):
-        return velocity_x, velocity_y
 
 
 class _Offset:
@@ -181,6 +173,34 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(8, values["ON_CAR"])
         self.assertEqual(15, values["CRUISING"])
 
+    def test_target_detection_waits_until_the_arc_is_complete(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        method = _method(
+            mission,
+            "_wait_until_target_detected_on_trajectory",
+        )
+        detection_ifs = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Call)
+                and _call_name(child) == "_stop_pursuit_trajectory"
+                for child in ast.walk(node)
+            )
+        ]
+        self.assertTrue(
+            any(
+                "route_complete"
+                in {
+                    child.id
+                    for child in ast.walk(detection_if.test)
+                    if isinstance(child, ast.Name)
+                }
+                for detection_if in detection_ifs
+            )
+        )
+
     def test_landing_reports_bracket_confirmed_lock(self):
         mission = _class(self.mission_tree, "Task2Mission")
         method = _method(mission, "_follow_descend_and_land_on_target")
@@ -232,6 +252,14 @@ class Mission2CueStateTests(unittest.TestCase):
 
         task._follow_descend_and_land_on_target()
 
+        self.assertEqual(1, len(task.moving_target_descent.calls))
+        descent_call = task.moving_target_descent.calls[0]
+        self.assertEqual(3.0, descent_call["stabilize_seconds"])
+        self.assertEqual(25.0, descent_call["target_height"])
+        self.assertNotIn("pre_descent_gate", descent_call)
+        self.assertNotIn("pre_descent_max_error_px", descent_call)
+        self.assertNotIn("horizontal_command_guard", descent_call)
+
         self.assertLess(events.index("landing_started"), events.index("land"))
         self.assertLess(events.index("land"), events.index("target_locked"))
         self.assertLess(
@@ -254,11 +282,9 @@ class Mission2CueStateTests(unittest.TestCase):
         namespace = {
             "Tuple": Tuple,
             "logger": _Logger(),
-            "TARGET_DESCENT_INTERMEDIATE_HEIGHT": 100.0,
-            "ESCORT_STABLE_SECONDS": 4.0,
-            "ESCORT_GATE_TIMEOUT_SECONDS": 90.0,
+            "ESCORT_STABLE_SECONDS": 3.0,
+            "ESCORT_STABLE_TIMEOUT_SECONDS": 90.0,
             "ESCORT_SPEED_MIDPOINT": 12.0,
-            "TARGET_DETECTION_PIXEL_THRESHOLD": 30.0,
             "TARGET_DESCENT_TIMEOUT_SECONDS": 15.0,
             "TARGET_LANDING_HEIGHT": 25.0,
             "TARGET_LANDING_LOCK_TIMEOUT_SECONDS": 20.0,
@@ -266,7 +292,6 @@ class Mission2CueStateTests(unittest.TestCase):
             "CRUISE_HEIGHT": 150.0,
             "PLATFORM_RETAKEOFF_HEIGHT": 30.0,
             "PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS": 15.0,
-            "ESCORT_MAX_X": 357.5,
             "descent_test": types.SimpleNamespace(
                 HEIGHT_TOLERANCE=5.0,
                 HEIGHT_CONFIRM_SECONDS=1.0,
@@ -284,10 +309,7 @@ class Mission2CueStateTests(unittest.TestCase):
         task.signals = _Signals(events)
         task.moving_target_descent = _Descent()
         task._arc_velocity_predictor = _Predictor()
-        task._escort_x_boundary_guard = _BoundaryGuard()
-        task._escort_x_boundary_active = False
         task._low_altitude_target_offset = _Offset()
-        task._route_gate_is_open = lambda: True
         task.navi = _Navigation()
         task.fc = object()
         task.stop_event = object()

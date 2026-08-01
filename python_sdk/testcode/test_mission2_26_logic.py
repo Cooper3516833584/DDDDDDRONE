@@ -15,8 +15,8 @@ from mission2_26_logic import (  # noqa: E402
     ARC_RADIUS,
     ARC_START,
     ClockwiseArcVelocityPredictor,
-    ENTRY_POINT,
     LowAltitudeTargetOffset,
+    PURSUIT_DIRECT_SEGMENTS,
     PURSUIT_SLOWDOWN_POINT,
     PursuitSpeedSchedule,
     ROUTE_END,
@@ -36,18 +36,29 @@ def test_pursuit_trajectory_geometry() -> None:
         arc_step_degrees=10,
     )
     assert trajectory[0] == (TAKEOFF_POINT[0], TAKEOFF_POINT[1], 150.0)
-    assert trajectory[1] == (ENTRY_POINT[0], ENTRY_POINT[1], 150.0)
-    assert trajectory[2] == (
-        PURSUIT_SLOWDOWN_POINT[0],
-        PURSUIT_SLOWDOWN_POINT[1],
+    assert trajectory[PURSUIT_DIRECT_SEGMENTS] == (
+        ARC_START[0],
+        ARC_START[1],
         150.0,
     )
-    assert trajectory[3] == (ARC_START[0], ARC_START[1], 150.0)
     assert trajectory[-2] == (ARC_END[0], ARC_END[1], 150.0)
     assert trajectory[-1] == (ROUTE_END[0], ROUTE_END[1], 150.0)
 
-    arc_points = trajectory[3:-1]
-    assert len(arc_points) == 19
+    direct_points = trajectory[: PURSUIT_DIRECT_SEGMENTS + 1]
+    assert len(direct_points) == 5
+    direct_slope = ARC_START[1] / ARC_START[0]
+    for index, (x, y, height) in enumerate(direct_points):
+        assert height == 150.0
+        if index:
+            assert math.isclose(y / x, direct_slope, abs_tol=1e-9)
+            segment_length = math.hypot(
+                x - direct_points[index - 1][0],
+                y - direct_points[index - 1][1],
+            )
+            assert segment_length < 84.0
+
+    arc_points = trajectory[PURSUIT_DIRECT_SEGMENTS:-1]
+    assert len(arc_points) == 10
     for x, y, height in arc_points:
         assert height == 150.0
         assert x >= ARC_CENTER[0] - 1e-9
@@ -61,7 +72,7 @@ def test_pursuit_trajectory_geometry() -> None:
         ARC_CENTER[0] + ARC_RADIUS,
         abs_tol=1e-9,
     )
-    assert arc_points[1][0] > arc_points[0][0]
+    assert arc_points[1][0] < arc_points[0][0]
     assert arc_points[1][1] < arc_points[0][1]
     assert trajectory[-1][0] < trajectory[-2][0]
 
@@ -77,14 +88,14 @@ def test_clockwise_arc_velocity_prediction() -> None:
 
     velocity = (10.0, 0.0)
     sample_dt = math.pi * ARC_RADIUS / 10.0 / 180.0
-    for index in range(180):
-        position_angle = math.radians(89.5 - index)
+    for index in range(90):
+        position_angle = math.radians(-0.5 - index)
         x = ARC_CENTER[0] + ARC_RADIUS * math.cos(position_angle)
         y = ARC_CENTER[1] + ARC_RADIUS * math.sin(position_angle)
         velocity = predictor.predict(velocity, sample_dt, x, y)
 
-    assert math.isclose(velocity[0], -10.0, abs_tol=1e-9)
-    assert math.isclose(velocity[1], 0.0, abs_tol=1e-9)
+    assert math.isclose(velocity[0], 0.0, abs_tol=1e-9)
+    assert math.isclose(velocity[1], -10.0, abs_tol=1e-9)
     assert math.isclose(math.hypot(*velocity), 10.0, abs_tol=1e-9)
 
 
@@ -116,32 +127,33 @@ def test_escort_x_boundary_velocity_guard() -> None:
 
 
 def test_pursuit_speed_schedule() -> None:
-    schedule = PursuitSpeedSchedule()
-    assert schedule.current_speed == 40.0
-    assert schedule.update(*ENTRY_POINT, *TAKEOFF_POINT) is None
-    assert (
-        schedule.update(
-            *PURSUIT_SLOWDOWN_POINT,
-            ENTRY_POINT[0],
-            ENTRY_POINT[1],
-        )
-        == 25.0
-    )
-    assert schedule.current_speed == 25.0
+    schedule = PursuitSpeedSchedule(initial_speed=35.0)
+    assert schedule.current_speed == 35.0
     assert (
         schedule.update(
             *ARC_START,
-            PURSUIT_SLOWDOWN_POINT[0] - 0.1,
-            PURSUIT_SLOWDOWN_POINT[1],
+            ARC_CENTER[0],
+            ARC_CENTER[1],
+        )
+        is None
+    )
+    assert schedule.current_speed == 35.0
+    assert schedule.update(*ARC_START, ARC_CENTER[0] + 0.1, -90.0) == 25.0
+    assert schedule.current_speed == 25.0
+    assert (
+        schedule.update(
+            *ARC_END,
+            ARC_START[0] - 7.6,
+            ARC_START[1],
         )
         is None
     )
     assert schedule.current_speed == 25.0
     assert (
         schedule.update(
-            *ARC_START,
-            PURSUIT_SLOWDOWN_POINT[0],
-            PURSUIT_SLOWDOWN_POINT[1],
+            *ARC_END,
+            ARC_START[0] - 7.5,
+            ARC_START[1],
         )
         == 15.0
     )

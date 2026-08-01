@@ -1,4 +1,4 @@
-"""任务二：曲线追及、移动目标伴飞降落、平台复飞和返航。
+"""任务二：直线与 90 度圆弧追及、移动目标伴飞降落、平台复飞和返航。
 
 本入口会直连真实飞控、单雷达和相机并执行两次起飞与两次降落。运行前
 必须确认 ``server_ros.py`` 及其他 ``FC_Server`` 已关闭，并清空追及
@@ -30,9 +30,9 @@ from moving_target_descent import (
 )
 from mission2_26_logic import (
     ARC_END,
+    ARC_START,
     ClockwiseArcVelocityPredictor,
     LowAltitudeTargetOffset,
-    PURSUIT_SLOWDOWN_POINT,
     PursuitSpeedSchedule,
     RoutePassGate,
     build_pursuit_trajectory,
@@ -40,32 +40,26 @@ from mission2_26_logic import (
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
 )
-from mission2_26_safety import EscortXBoundaryVelocityGuard
 from visual_target_descent import PreDescentTimeoutError
 
 
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 20.0
-PURSUIT_SPEED = 20.0
+PURSUIT_SPEED = 35.0
 PURSUIT_APPROACH_SPEED = 25.0
 PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
 RETURN_SPEED = 20.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
 ARC_VELOCITY_POSITION_TOLERANCE = 20.0
-ESCORT_MAX_X = 357.5
 
 ESCORT_SPEED_MIDPOINT = 12.0
-ESCORT_STABLE_SECONDS = 4.0
-ESCORT_GATE_TIMEOUT_SECONDS = 90.0
+ESCORT_STABLE_SECONDS = 3.0
+ESCORT_STABLE_TIMEOUT_SECONDS = 90.0
 # 任务二专用：保留 12cm/s 初始估计，估计器合速度最多 15cm/s，
 # 视觉控制实际输出最多 20cm/s。任务一仍使用共享默认配置。
 TASK2_ESTIMATOR_SPEED_LIMIT = 15.0
 TASK2_OUTPUT_SPEED_LIMIT = 20.0
-# 目标仍可稳定识别时允许在圆弧终点附近提前进入最终下降。
-TARGET_DESCENT_GATE_RADIUS = 40.0
-# 稳定伴飞 4 秒后先下降到该中间高度；经过门控点后继续下降到最终降落高度。
-TARGET_DESCENT_INTERMEDIATE_HEIGHT = 100.0
 TARGET_LANDING_HEIGHT = 25.0
 TARGET_OFFSET_START_HEIGHT = 50.0
 TARGET_OFFSET_FINAL_X_PX = -30.0
@@ -147,7 +141,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                 horizontal_command_limit=TASK2_OUTPUT_SPEED_LIMIT,
             ),
         )
-        self._route_gate = RoutePassGate(radius=TARGET_DESCENT_GATE_RADIUS)
+        self._route_gate = RoutePassGate(radius=PURSUIT_POSITION_THRESHOLD)
         self._arc_velocity_predictor = ClockwiseArcVelocityPredictor(
             position_tolerance=ARC_VELOCITY_POSITION_TOLERANCE,
         )
@@ -157,14 +151,11 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             final_x_px=TARGET_OFFSET_FINAL_X_PX,
             final_y_px=0.0,
         )
-        self._escort_x_boundary_guard = EscortXBoundaryVelocityGuard(
-            max_x=ESCORT_MAX_X,
-        )
-        self._escort_x_boundary_active = False
         self._pursuit_speed_schedule = PursuitSpeedSchedule(
             initial_speed=PURSUIT_SPEED,
             approach_speed=PURSUIT_APPROACH_SPEED,
             after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
+            point_tolerance=PURSUIT_POSITION_THRESHOLD,
         )
         self._pursuit_trajectory = build_pursuit_trajectory(
             altitude=CRUISE_HEIGHT,
@@ -229,7 +220,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         last_sequence = -1
         while not self.stop_event.is_set():
             self._update_pursuit_speed()
-            self._route_gate_is_open()
+            route_complete = self._route_gate_is_open()
             self._raise_if_vision_failed()
             sample = self._latest_vision_sample()
             if sample is not None and sample[0] != last_sequence:
@@ -244,6 +235,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                     and math.isfinite(float(y_px))
                     and math.hypot(float(x_px), float(y_px))
                     < TARGET_DETECTION_PIXEL_THRESHOLD
+                    and route_complete
                 ):
                     self._stop_pursuit_trajectory()
                     logger.info(
@@ -273,73 +265,19 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                 self.navi.current_y,
             )
 
-        def apply_escort_boundary(
-            velocity_x: int,
-            velocity_y: int,
-        ) -> Tuple[int, int]:
-            active = self._escort_x_boundary_guard.is_active(
-                self.navi.current_x
-            )
-            if active and not self._escort_x_boundary_active:
-                logger.warning(
-                    "[MISSION2-SAFETY] x={:.1f}cm exceeds {:.1f}cm; "
-                    "force escort vx to zero",
-                    self.navi.current_x,
-                    ESCORT_MAX_X,
-                )
-            elif not active and self._escort_x_boundary_active:
-                logger.info(
-                    "[MISSION2-SAFETY] x returned within boundary; "
-                    "release escort vx guard"
-                )
-            self._escort_x_boundary_active = active
-            return self._escort_x_boundary_guard.apply(
-                self.navi.current_x,
-                velocity_x,
-                velocity_y,
-            )
-
-        # 阶段1：稳定伴飞 4 秒后先下降到中间高度，不要求先经过门控点。
-        self.moving_target_descent.follow_and_descend(
-            target_height=TARGET_DESCENT_INTERMEDIATE_HEIGHT,
+        # 连续伴飞 3 秒后直接执行单段视觉下降，不再等待位置门控。
+        final_velocity = self.moving_target_descent.follow_and_descend(
+            target_height=TARGET_LANDING_HEIGHT,
             stabilize_seconds=ESCORT_STABLE_SECONDS,
-            stabilize_timeout=ESCORT_GATE_TIMEOUT_SECONDS,
+            stabilize_timeout=ESCORT_STABLE_TIMEOUT_SECONDS,
             hover_seconds=0.0,
             initial_target_velocity=(ESCORT_SPEED_MIDPOINT, 0.0),
             height_tolerance=descent_test.HEIGHT_TOLERANCE,
             height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
             descent_timeout=TARGET_DESCENT_TIMEOUT_SECONDS,
             on_descent_start=self.signals.send_target_descent_started,
-            pre_descent_max_error_px=TARGET_DETECTION_PIXEL_THRESHOLD,
-            velocity_predictor=predict_target_velocity,
-            horizontal_command_guard=apply_escort_boundary,
-        )
-        logger.info(
-            "[MISSION2] Reached intermediate descent height {:.0f}cm; "
-            "waiting for route gate before continuing descent",
-            TARGET_DESCENT_INTERMEDIATE_HEIGHT,
-        )
-
-        # 阶段2：经过门控点 (207.5,-187.5) 后继续下降到最终降落高度。
-        # 沿用阶段1伴飞器的目标速度估计（不重置），目标速度不会突变。
-        final_velocity = self.moving_target_descent.follow_and_descend(
-            target_height=TARGET_LANDING_HEIGHT,
-            stabilize_seconds=0.0,
-            stabilize_timeout=ESCORT_GATE_TIMEOUT_SECONDS,
-            hover_seconds=0.0,
-            initial_target_velocity=(
-                self.moving_target_descent.estimated_target_velocity
-            ),
-            height_tolerance=descent_test.HEIGHT_TOLERANCE,
-            height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
-            descent_timeout=TARGET_DESCENT_TIMEOUT_SECONDS,
-            on_descent_start=None,
-            pre_descent_gate=self._route_gate_is_open,
-            pre_descent_max_error_px=TARGET_DETECTION_PIXEL_THRESHOLD,
             velocity_predictor=predict_target_velocity,
             target_offset_provider=self._low_altitude_target_offset.offset,
-            horizontal_command_guard=apply_escort_boundary,
-            reset_estimator=False,
         )
         logger.info(
             "[MISSION2] Reached target landing height; estimated target "
@@ -508,6 +446,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             initial_speed=PURSUIT_SPEED,
             approach_speed=PURSUIT_APPROACH_SPEED,
             after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
+            point_tolerance=PURSUIT_POSITION_THRESHOLD,
         )
         navi.set_navigation_speed(PURSUIT_SPEED)
         navi.switch_pid("navi")
@@ -520,12 +459,13 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         self.signals.send_pursuit_started()
         logger.info(
             "[MISSION2] Pursuit trajectory started with {} points; "
-            "speed {}cm/s, then {}cm/s toward {}, then {}cm/s",
+            "speed {}cm/s, then {}cm/s after x>237.5cm, then "
+            "{}cm/s on 90-degree arc from {}",
             len(self._pursuit_trajectory),
             PURSUIT_SPEED,
             PURSUIT_APPROACH_SPEED,
-            PURSUIT_SLOWDOWN_POINT,
             PURSUIT_AFTER_SLOWDOWN_SPEED,
+            ARC_START,
         )
 
         try:
