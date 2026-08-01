@@ -243,7 +243,7 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(80.0, values["ESCORT_ENTRY_PIXEL_RADIUS"])
         self.assertEqual(9.0, values["ESCORT_INITIAL_ESTIMATED_SPEED"])
         self.assertEqual(40.0, values["TARGET_DESCENT_GATE_RADIUS"])
-        self.assertEqual(15.0, values["PURSUIT_APPROACH_SPEED"])
+        self.assertEqual(18.0, values["PURSUIT_APPROACH_SPEED"])
         self.assertEqual(5.0, values["LOCKED_DWELL_SECONDS"])
         self.assertEqual(75.0, values["TASK2_H_LANDING_HEIGHT"])
         self.assertEqual(
@@ -325,6 +325,38 @@ class Mission2CueStateTests(unittest.TestCase):
             calls["send_escort_started"],
             calls["_follow_descend_and_land_on_target"],
         )
+
+    def test_straight_pursuit_continues_outside_arc_start_boundary(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        method = _method(mission, "_wait_for_pursuit_to_arc_start")
+        extracted = ast.ClassDef(
+            name="ExtractedTask2",
+            bases=[],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "math": math,
+            "logger": _Logger(),
+            "TASK2_ARC_START": (312.5, -112.5),
+        }
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+
+        switches = []
+        task = namespace["ExtractedTask2"]()
+        task.navi = types.SimpleNamespace(
+            traj_running_event=types.SimpleNamespace(is_set=lambda: False),
+            current_x=250.0,
+            current_y=-50.0,
+            switch_pid=switches.append,
+        )
+
+        task._wait_for_pursuit_to_arc_start()
+
+        self.assertEqual(["hover"], switches)
 
     def test_target_wait_estimates_before_entering_80px_radius(self):
         mission = _class(self.mission_tree, "Task2Mission")

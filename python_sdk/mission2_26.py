@@ -48,7 +48,7 @@ from visual_target_descent import PreDescentTimeoutError
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 20.0
 PURSUIT_SPEED = 35.0
-PURSUIT_APPROACH_SPEED = 15.0
+PURSUIT_APPROACH_SPEED = 18.0
 RETURN_SPEED = 30.0
 RETURN_POSITION_THRESHOLD = 10.0
 RETURN_SETTLE_SECONDS = 0.5
@@ -277,17 +277,12 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
 
         current_x = float(self.navi.current_x)
         current_y = float(self.navi.current_y)
-        distance = math.hypot(
-            current_x - TASK2_ARC_START[0],
-            current_y - TASK2_ARC_START[1],
-        )
-        if not math.isfinite(distance) or distance > PURSUIT_POSITION_THRESHOLD:
-            raise TargetNotFoundError(
-                "Straight pursuit ended before reaching the arc start"
-            )
+        if not all(math.isfinite(value) for value in (current_x, current_y)):
+            raise RuntimeError("Navigation pose is invalid after straight pursuit")
         self.navi.switch_pid("hover")
         logger.info(
-            "[MISSION2] Reached arc start {}; hovering at ({:.1f}, {:.1f})cm",
+            "[MISSION2] Straight pursuit ended near {}; "
+            "continuing from ({:.1f}, {:.1f})cm",
             TASK2_ARC_START,
             current_x,
             current_y,
