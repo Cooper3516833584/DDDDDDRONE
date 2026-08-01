@@ -150,7 +150,7 @@ class Mission2Signals(mission1.MissionGroundStationSignals):
     def send_retakeoff_succeeded(self) -> None:
         self._send(
             "task2_retakeoff_succeeded",
-            mission_base.MissionOperationState.CRUISING,
+            mission_base.MissionOperationState.RETAKEOFF_SUCCEEDED,
         )
 
 

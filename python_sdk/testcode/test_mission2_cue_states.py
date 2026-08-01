@@ -162,6 +162,7 @@ class Mission2CueStateTests(unittest.TestCase):
             LANDING_ON_CAR=7,
             ON_CAR=8,
             CRUISING=15,
+            RETAKEOFF_SUCCEEDED=16,
         )
         namespace = {
             "mission1": types.SimpleNamespace(
@@ -187,7 +188,7 @@ class Mission2CueStateTests(unittest.TestCase):
             getattr(signals, method_name)()
 
         self.assertEqual(
-            [15, 15, 5, 7, 8, 3, 15],
+            [15, 15, 5, 7, 8, 3, 16],
             [state for _name, state in mission.events],
         )
 
@@ -203,6 +204,7 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(7, values["LANDING_ON_CAR"])
         self.assertEqual(8, values["ON_CAR"])
         self.assertEqual(15, values["CRUISING"])
+        self.assertEqual(16, values["RETAKEOFF_SUCCEEDED"])
 
     def test_task2_route_is_local_straight_to_arc_start(self):
         function = next(
