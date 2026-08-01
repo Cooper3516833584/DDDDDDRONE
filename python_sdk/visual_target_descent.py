@@ -39,6 +39,10 @@ class PreDescentTimeoutError(RuntimeError):
     """Raised when stable visual follow or its external gate times out."""
 
 
+class LowAltitudeAlignmentError(RuntimeError):
+    """Raised when a low-altitude landing must climb and realign."""
+
+
 class VisualTargetDescentController:
     """复用视觉水平修正的指定高度下降和不锁桨接地控制器。"""
 
@@ -173,6 +177,117 @@ class VisualTargetDescentController:
             filtered,
             int(command[0]),
             int(command[1]),
+        )
+
+    def _landing_horizontal_command(
+        self,
+        vel_x: int,
+        vel_y: int,
+        height: float,
+        taper_height: float,
+        freeze_height: float,
+        low_altitude_speed_limit: float,
+    ) -> Tuple[int, int]:
+        """Reduce visual authority with height and freeze it near ground."""
+        height = float(height)
+        if height <= freeze_height:
+            return 0, 0
+        if height >= taper_height:
+            ratio = 1.0
+        else:
+            ratio = (height - freeze_height) / (
+                taper_height - freeze_height
+            )
+        ratio = min(max(ratio, 0.0), 1.0)
+        command = np.asarray([vel_x, vel_y], dtype=float) * ratio
+        speed_limit = low_altitude_speed_limit + ratio * (
+            self.horizontal_speed_limit - low_altitude_speed_limit
+        )
+        speed = float(np.linalg.norm(command))
+        if speed > speed_limit:
+            command *= speed_limit / speed
+        rounded = np.rint(command).astype(int)
+        return int(rounded[0]), int(rounded[1])
+
+    def _confirm_final_alignment(
+        self,
+        max_error_px: float,
+        confirm_frames: int,
+        timeout: float,
+        command_guard: HorizontalCommandGuard,
+    ) -> None:
+        """Confirm distinct centered frames before entering ground effect."""
+        started_at = time.monotonic()
+        filtered = np.zeros(2, dtype=float)
+        last_sequence: Optional[int] = None
+        centered_frames = 0
+        lost_started_at: Optional[float] = None
+        aligned = False
+        self._start_override(keep_height=True)
+        try:
+            while time.monotonic() - started_at <= timeout:
+                now = time.monotonic()
+                self._validate_flight_state()
+                sample = self._fresh_sample(now)
+                if sample is None:
+                    centered_frames = 0
+                    if lost_started_at is None:
+                        lost_started_at = now
+                    self._update_override(0, 0)
+                    if now - lost_started_at > self.vision_loss_timeout:
+                        raise LowAltitudeAlignmentError(
+                            "H marker was lost before final descent"
+                        )
+                    self.stop_event.wait(self.control_period)
+                    continue
+
+                lost_started_at = None
+                sequence, _captured_at, x_px, y_px = sample
+                if sequence == last_sequence:
+                    self._update_override(0, 0)
+                    self.stop_event.wait(self.control_period)
+                    continue
+                last_sequence = sequence
+                distance_px = float(np.hypot(x_px, y_px))
+                if distance_px <= max_error_px:
+                    centered_frames += 1
+                    self._update_override(0, 0)
+                    if centered_frames >= confirm_frames:
+                        aligned = True
+                        break
+                else:
+                    centered_frames = 0
+                    filtered, vel_x, vel_y = self._next_horizontal_velocity(
+                        np.zeros(2, dtype=float),
+                        filtered,
+                        x_px,
+                        y_px,
+                    )
+                    vel_x, vel_y = command_guard(vel_x, vel_y)
+                    self._update_override(vel_x, vel_y)
+                self.stop_event.wait(self.control_period)
+        except BaseException:
+            if not self.navi._stop_velocity_override(
+                restore_hover=True,
+                hover_height=float(self.navi.current_height),
+            ):
+                logger.error(
+                    "[VISUAL-LANDING] Failed to restore hover after "
+                    "final-alignment abort"
+                )
+            raise
+
+        if not self.navi._stop_velocity_override(
+            restore_hover=True,
+            hover_height=float(self.navi.current_height),
+        ):
+            raise RuntimeError(
+                "Final alignment completed but hover was not restored"
+            )
+        if aligned:
+            return
+        raise LowAltitudeAlignmentError(
+            "H marker was not centered before final descent"
         )
 
     def _record(
@@ -615,6 +730,13 @@ class VisualTargetDescentController:
         touchdown_height_range: float = 1.5,
         final_descent_timeout: float = 8.0,
         dwell_seconds: float = 5.0,
+        final_alignment_max_error_px: float = 12.0,
+        final_alignment_confirm_frames: int = 5,
+        final_alignment_timeout: float = 6.0,
+        horizontal_taper_height: float = 30.0,
+        horizontal_freeze_height: float = 16.0,
+        low_altitude_horizontal_speed_limit: float = 3.0,
+        frozen_error_abort_px: float = 30.0,
     ) -> None:
         """
         视觉修正下降并组合确认接地；接地后保持解锁、零速度并短暂停留。
@@ -634,6 +756,12 @@ class VisualTargetDescentController:
                 touchdown_height_range,
                 final_descent_timeout,
                 dwell_seconds,
+                final_alignment_max_error_px,
+                final_alignment_timeout,
+                horizontal_taper_height,
+                horizontal_freeze_height,
+                low_altitude_horizontal_speed_limit,
+                frozen_error_abort_px,
             ],
             dtype=float,
         )
@@ -649,6 +777,12 @@ class VisualTargetDescentController:
             touchdown_confirm_time,
             touchdown_height_range,
             final_descent_timeout,
+            final_alignment_max_error_px,
+            final_alignment_timeout,
+            horizontal_taper_height,
+            horizontal_freeze_height,
+            low_altitude_horizontal_speed_limit,
+            frozen_error_abort_px,
         ) <= 0:
             raise ValueError("Visual landing parameters must be greater than 0")
         if dwell_seconds < 0:
@@ -656,6 +790,26 @@ class VisualTargetDescentController:
         if approach_height <= touchdown_alt_thres:
             raise ValueError(
                 "approach_height must be above touchdown_alt_thres"
+            )
+        if not isinstance(final_alignment_confirm_frames, int):
+            raise ValueError("final_alignment_confirm_frames must be int")
+        if final_alignment_confirm_frames <= 0:
+            raise ValueError(
+                "final_alignment_confirm_frames must be greater than 0"
+            )
+        if not (
+            touchdown_alt_thres
+            < horizontal_freeze_height
+            < approach_height
+            < horizontal_taper_height
+        ):
+            raise ValueError(
+                "Landing heights must satisfy touchdown < freeze < "
+                "approach < taper"
+            )
+        if low_altitude_horizontal_speed_limit > self.horizontal_speed_limit:
+            raise ValueError(
+                "Low-altitude speed limit must not exceed controller limit"
             )
         if final_descent_speed > 30:
             raise ValueError("final_descent_speed must not exceed 30cm/s")
@@ -665,12 +819,33 @@ class VisualTargetDescentController:
             )
 
         base = self._validate_base_velocity(base_velocity)
+
+        def landing_command_guard(
+            vel_x: int,
+            vel_y: int,
+        ) -> Tuple[int, int]:
+            return self._landing_horizontal_command(
+                vel_x,
+                vel_y,
+                float(self.navi.current_height),
+                float(horizontal_taper_height),
+                float(horizontal_freeze_height),
+                float(low_altitude_horizontal_speed_limit),
+            )
+
         self.descend_to_height(
             target_height=float(approach_height),
             hover_seconds=0.0,
             base_velocity=base_velocity,
             height_confirm_time=float(approach_height_confirm_time),
             timeout=float(approach_timeout),
+            horizontal_command_guard=landing_command_guard,
+        )
+        self._confirm_final_alignment(
+            max_error_px=float(final_alignment_max_error_px),
+            confirm_frames=final_alignment_confirm_frames,
+            timeout=float(final_alignment_timeout),
+            command_guard=landing_command_guard,
         )
 
         filtered = base.copy()
@@ -696,8 +871,12 @@ class VisualTargetDescentController:
                 if now - started_at > final_descent_timeout:
                     raise RuntimeError("Visual final descent timeout")
 
+                current_height = float(self.navi.current_height)
+                frozen_horizontal = bool(
+                    current_height <= horizontal_freeze_height
+                )
                 offset = self._fresh_offset(now)
-                if offset is None:
+                if offset is None and not frozen_horizontal:
                     if lost_started_at is None:
                         lost_started_at = now
                         logger.warning(
@@ -713,23 +892,40 @@ class VisualTargetDescentController:
                         0,
                     )
                     if now - lost_started_at > self.vision_loss_timeout:
-                        raise RuntimeError(
+                        raise LowAltitudeAlignmentError(
                             "Marker was not reacquired during final descent"
                         )
                     self.stop_event.wait(self.control_period)
                     continue
 
-                if lost_started_at is not None:
+                if lost_started_at is not None and offset is not None:
                     lost_started_at = None
                     logger.info(
                         "[VISUAL-LANDING] Marker reacquired; resume final descent"
                     )
-                filtered, vel_x, vel_y = self._next_horizontal_velocity(
-                    base,
-                    filtered,
-                    offset[0],
-                    offset[1],
-                )
+                if frozen_horizontal:
+                    vel_x = 0
+                    vel_y = 0
+                    if (
+                        offset is not None
+                        and float(np.hypot(offset[0], offset[1]))
+                        > frozen_error_abort_px
+                    ):
+                        raise LowAltitudeAlignmentError(
+                            "H-marker error exceeded the frozen-zone limit"
+                        )
+                else:
+                    if offset is None:
+                        raise RuntimeError(
+                            "Visual landing reached an invalid vision state"
+                        )
+                    filtered, vel_x, vel_y = self._next_horizontal_velocity(
+                        base,
+                        filtered,
+                        offset[0],
+                        offset[1],
+                    )
+                    vel_x, vel_y = landing_command_guard(vel_x, vel_y)
 
                 alt_now = float(self.fc.state.alt_add.value)
                 vel_z_now = abs(float(self.fc.state.vel_z.value))
@@ -838,3 +1034,42 @@ class VisualTargetDescentController:
             )
             self.stop_event.wait(min(0.1, self.control_period))
         logger.info("[VISUAL-LANDING] Unlocked ground dwell completed")
+
+    def land_and_lock(
+        self,
+        lock_timeout: float = 4.0,
+        **landing_kwargs,
+    ) -> None:
+        """Perform controlled visual touchdown and lock only after confirmation."""
+        lock_timeout = float(lock_timeout)
+        if not np.isfinite(lock_timeout) or lock_timeout <= 0:
+            raise ValueError("lock_timeout must be finite and positive")
+        if "dwell_seconds" in landing_kwargs:
+            raise ValueError("land_and_lock controls dwell_seconds")
+
+        self.land_without_lock(dwell_seconds=0.0, **landing_kwargs)
+        self._validate_flight_state(require_pose=False)
+        touchdown_alt_thres = float(
+            landing_kwargs.get("touchdown_alt_thres", 12.0)
+        )
+        touchdown_vertical_speed_thres = float(
+            landing_kwargs.get("touchdown_vertical_speed_thres", 2.5)
+        )
+        alt_now = float(self.fc.state.alt_add.value)
+        vel_z_now = abs(float(self.fc.state.vel_z.value))
+        if (
+            alt_now > touchdown_alt_thres
+            or vel_z_now > touchdown_vertical_speed_thres
+        ):
+            raise RuntimeError(
+                "Touchdown state changed before lock; refusing to lock"
+            )
+
+        self.fc.lock()
+        try:
+            locked = self.fc.wait_for_lock(timeout_s=lock_timeout)
+        except TypeError:
+            locked = self.fc.wait_for_lock(lock_timeout)
+        if not locked:
+            raise RuntimeError("Touchdown was confirmed but lock was not")
+        logger.info("[VISUAL-LANDING] Touchdown confirmed and motors locked")

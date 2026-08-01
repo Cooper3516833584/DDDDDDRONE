@@ -35,7 +35,10 @@ from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
 import mission1_26_base as mission1
-from visual_target_descent import VisualTargetDescentController
+from visual_target_descent import (
+    LowAltitudeAlignmentError,
+    VisualTargetDescentController,
+)
 
 
 START_COMMAND = "s"
@@ -58,8 +61,7 @@ HEIGHT_TOLERANCE = 5.0
 HEIGHT_CONFIRM_SECONDS = 0.4
 MAX_VISUAL_DESCENT_RECORDS = 3000
 
-# 返航定点降落：以 60cm 高度视觉对准 H 标记后再定点降落。
-# 参数与 test_fast_non_pointing_takeoff_radar.py 验证的降落逻辑一致。
+# 返航精准降落：60cm 对准 H，视觉下降后在低空冻结横向修正并确认接地。
 H_LANDING_VERTICAL_SPEED = 15.0
 H_LANDING_HEIGHT = 60.0
 H_LANDING_HEIGHT_TOLERANCE = 8.0
@@ -71,6 +73,25 @@ H_LANDING_CONTROL_PERIOD = 0.1
 H_LANDING_ALIGNMENT_TIMEOUT = 60.0
 H_LANDING_MIN_CONTROL_HEIGHT = 25.0
 H_LANDING_MAX_CONTROL_HEIGHT = 75.0
+H_LANDING_APPROACH_HEIGHT = 22.0
+H_LANDING_APPROACH_VERTICAL_SPEED = 10.0
+H_LANDING_FINAL_DESCENT_SPEED = 6.0
+H_LANDING_FINAL_ALIGNMENT_THRESHOLD = 12.0
+H_LANDING_FINAL_ALIGNMENT_FRAMES = 10
+H_LANDING_FINAL_ALIGNMENT_TIMEOUT = 6.0
+H_LANDING_HORIZONTAL_TAPER_HEIGHT = 30.0
+H_LANDING_HORIZONTAL_FREEZE_HEIGHT = 16.0
+H_LANDING_LOW_ALTITUDE_SPEED_LIMIT = 3.0
+H_LANDING_FROZEN_ERROR_ABORT_THRESHOLD = 30.0
+H_LANDING_TOUCHDOWN_ALT_THRESHOLD = 8.0
+H_LANDING_TOUCHDOWN_VERTICAL_SPEED_THRESHOLD = 2.5
+H_LANDING_TOUCHDOWN_CONFIRM_SECONDS = 0.6
+H_LANDING_TOUCHDOWN_HEIGHT_RANGE = 1.5
+H_LANDING_FINAL_DESCENT_TIMEOUT = 8.0
+H_LANDING_LOCK_TIMEOUT = 4.0
+H_LANDING_RETRY_HEIGHT = 30.0
+H_LANDING_RETRY_HEIGHT_TIMEOUT = 6.0
+H_LANDING_MAX_ATTEMPTS = 2
 
 
 def wait_for_terminal_start_command(
@@ -309,11 +330,11 @@ class StaticTargetVisualDescentMission(mission1.Mission):
             return None
 
     def _visual_h_landing_at_takeoff(self) -> None:
-        """返航后以 60cm 高度视觉对准 H 标记，再在该点调用定点降落。
+        """返航后对准 H，并以分段视觉控制下降、确认接地后锁桨。
 
         H 标记的视觉判断自返航时（enable_h_landing_vision）已经开始，
         但只有下降到 60cm 进入本方法后，H 偏移才实际影响飞行控制。
-        本阶段垂直速度设为 15cm/s。
+        进入地效区前逐步降低横向修正，低于冻结高度后只垂直下降。
         """
         navi = self.navi
         if self.stop_event.is_set():
@@ -346,6 +367,7 @@ class StaticTargetVisualDescentMission(mission1.Mission):
 
         centered = False
         centered_frames = 0
+        last_vision_sequence = -1
         deadline = time.monotonic() + H_LANDING_ALIGNMENT_TIMEOUT
         try:
             while time.monotonic() < deadline:
@@ -388,6 +410,11 @@ class StaticTargetVisualDescentMission(mission1.Mission):
                     continue
 
                 x_px, y_px = sample[2], sample[3]
+                sequence = int(sample[0])
+                if sequence == last_vision_sequence:
+                    self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                    continue
+                last_vision_sequence = sequence
                 if x_px is None or y_px is None:
                     centered_frames = 0
                     self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
@@ -426,11 +453,73 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         if not self.fc.state.is_fresh(0.5) or not self.fc.state.unlock.value:
             raise RuntimeError("Flight state invalid after H visual alignment")
 
-        landing_point = navi.current_point
-        if not navi.pointing_landing(landing_point):
-            raise RuntimeError(
-                "Pointing landing was not confirmed after H alignment"
-            )
+        navi.set_vertical_speed(H_LANDING_APPROACH_VERTICAL_SPEED)
+        for attempt in range(1, H_LANDING_MAX_ATTEMPTS + 1):
+            try:
+                self.visual_descent.land_and_lock(
+                    lock_timeout=H_LANDING_LOCK_TIMEOUT,
+                    base_velocity=(0.0, 0.0),
+                    approach_height=H_LANDING_APPROACH_HEIGHT,
+                    approach_timeout=H_LANDING_HEIGHT_TIMEOUT,
+                    approach_height_confirm_time=0.3,
+                    final_descent_speed=H_LANDING_FINAL_DESCENT_SPEED,
+                    touchdown_alt_thres=(
+                        H_LANDING_TOUCHDOWN_ALT_THRESHOLD
+                    ),
+                    touchdown_vertical_speed_thres=(
+                        H_LANDING_TOUCHDOWN_VERTICAL_SPEED_THRESHOLD
+                    ),
+                    touchdown_confirm_time=(
+                        H_LANDING_TOUCHDOWN_CONFIRM_SECONDS
+                    ),
+                    touchdown_height_range=(
+                        H_LANDING_TOUCHDOWN_HEIGHT_RANGE
+                    ),
+                    final_descent_timeout=(
+                        H_LANDING_FINAL_DESCENT_TIMEOUT
+                    ),
+                    final_alignment_max_error_px=(
+                        H_LANDING_FINAL_ALIGNMENT_THRESHOLD
+                    ),
+                    final_alignment_confirm_frames=(
+                        H_LANDING_FINAL_ALIGNMENT_FRAMES
+                    ),
+                    final_alignment_timeout=(
+                        H_LANDING_FINAL_ALIGNMENT_TIMEOUT
+                    ),
+                    horizontal_taper_height=(
+                        H_LANDING_HORIZONTAL_TAPER_HEIGHT
+                    ),
+                    horizontal_freeze_height=(
+                        H_LANDING_HORIZONTAL_FREEZE_HEIGHT
+                    ),
+                    low_altitude_horizontal_speed_limit=(
+                        H_LANDING_LOW_ALTITUDE_SPEED_LIMIT
+                    ),
+                    frozen_error_abort_px=(
+                        H_LANDING_FROZEN_ERROR_ABORT_THRESHOLD
+                    ),
+                )
+                return
+            except LowAltitudeAlignmentError:
+                if attempt >= H_LANDING_MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "[H-LAND] Low-altitude alignment became unsafe; "
+                    "climb to {}cm and retry ({}/{})",
+                    H_LANDING_RETRY_HEIGHT,
+                    attempt + 1,
+                    H_LANDING_MAX_ATTEMPTS,
+                )
+                navi.set_height(H_LANDING_RETRY_HEIGHT)
+                navi.keep_height_flag = True
+                if not navi.wait_for_height(
+                    height_thres=H_LANDING_HEIGHT_TOLERANCE,
+                    timeout=H_LANDING_RETRY_HEIGHT_TIMEOUT,
+                ):
+                    raise RuntimeError(
+                        "Failed to reach H-landing retry height"
+                    )
 
     def run(self) -> None:
         navi = self.navi

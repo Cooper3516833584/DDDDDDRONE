@@ -116,6 +116,32 @@ class _Navigation:
         return True
 
 
+class _ReturnNavigation:
+    def __init__(self):
+        self.calls = []
+        self.current_x = 287.5
+        self.current_y = -187.5
+        self.navi_x_pid = types.SimpleNamespace(output_limits=None)
+        self.navi_y_pid = types.SimpleNamespace(output_limits=None)
+
+    def set_navigation_speed(self, speed):
+        self.calls.append(("set_navigation_speed", speed))
+
+    def switch_pid(self, name):
+        self.calls.append(("switch_pid", name))
+
+    def direct_set_waypoint(self, point):
+        self.calls.append(("direct_set_waypoint", tuple(point)))
+
+    def wait_for_waypoint(self, **kwargs):
+        self.calls.append(("wait_for_waypoint", kwargs))
+        return True
+
+    @staticmethod
+    def navigation_to_waypoint(*_args, **_kwargs):
+        raise AssertionError("Task 2 return must not generate an intermediate trajectory")
+
+
 class _Logger:
     def __getattr__(self, _name):
         return lambda *_args, **_kwargs: None
@@ -238,6 +264,156 @@ class Mission2CueStateTests(unittest.TestCase):
             events.index("target_locked"),
             events.index("retakeoff_started"),
         )
+
+    def test_return_uses_one_fixed_takeoff_waypoint(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        method = _method(mission, "_return_home_and_land")
+        extracted = ast.ClassDef(
+            name="ExtractedTask2",
+            bases=[],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "RETURN_SPEED": 20.0,
+            "RETURN_POSITION_THRESHOLD": 10.0,
+            "RETURN_SETTLE_SECONDS": 0.5,
+            "RETURN_TIMEOUT_SECONDS": 45.0,
+            "RETURN_MIN_CROSS_TRACK_SPEED": 2.0,
+            "math": __import__("math"),
+            "logger": _Logger(),
+            "mission_base": types.SimpleNamespace(TAKEOFF_POINT=(0.0, 0.0)),
+        }
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+
+        task = namespace["ExtractedTask2"]()
+        task.navi = _ReturnNavigation()
+        task.signals = types.SimpleNamespace(
+            send_return_started=lambda: None,
+            send_landing_started=lambda: None,
+        )
+        task.enable_h_landing_vision = lambda: None
+        task._visual_h_landing_at_takeoff = lambda: None
+
+        task._return_home_and_land()
+
+        self.assertEqual(
+            [
+                ("set_navigation_speed", 20.0),
+                ("switch_pid", "navi"),
+                ("direct_set_waypoint", (0.0, 0.0)),
+                (
+                    "wait_for_waypoint",
+                    {
+                        "time_thres": 0.5,
+                        "pos_thres": 10.0,
+                        "timeout": 45.0,
+                    },
+                ),
+                ("set_navigation_speed", 20.0),
+            ],
+            task.navi.calls,
+        )
+        distance = (287.5 ** 2 + 187.5 ** 2) ** 0.5
+        self.assertEqual(
+            (
+                -20.0 * 287.5 / distance,
+                20.0 * 287.5 / distance,
+            ),
+            task.navi.navi_x_pid.output_limits,
+        )
+        self.assertEqual(
+            (
+                -20.0 * 187.5 / distance,
+                20.0 * 187.5 / distance,
+            ),
+            task.navi.navi_y_pid.output_limits,
+        )
+
+    def test_fixed_route_search_stops_after_first_segment_detection(self):
+        task, calls = self._build_fixed_route_search([(4.0, -2.0)])
+
+        self.assertEqual((4.0, -2.0), task._search_target_on_fixed_route())
+        self.assertEqual(
+            [
+                ("speed", 20.0),
+                ("trajectory", [(87.5, -37.5, 150.0),
+                                (287.5, -37.5, 150.0)]),
+                ("wait", True),
+            ],
+            calls,
+        )
+
+    def test_fixed_route_search_reaches_c_before_waiting(self):
+        task, calls = self._build_fixed_route_search(
+            [None, None],
+            c_target=(1.0, 3.0),
+        )
+
+        self.assertEqual((1.0, 3.0), task._search_target_on_fixed_route())
+        self.assertEqual(
+            [
+                ("speed", 20.0),
+                ("trajectory", [(87.5, -37.5, 150.0),
+                                (287.5, -37.5, 150.0)]),
+                ("wait", True),
+                ("turn_velocity",),
+                ("speed", 20.0),
+                ("trajectory", [(287.5, -187.5, 100.0)]),
+                ("wait", False),
+                ("wait_at_c",),
+            ],
+            calls,
+        )
+
+    def _build_fixed_route_search(self, route_targets, c_target=None):
+        mission = _class(self.mission_tree, "Task2Mission")
+        method = _method(mission, "_search_target_on_fixed_route")
+        extracted = ast.ClassDef(
+            name="ExtractedTask2Search",
+            bases=[],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {"PURSUIT_SPEED": 20.0, "Tuple": Tuple}
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+
+        calls = []
+        task = namespace["ExtractedTask2Search"]()
+        task._fixed_route = [
+            (87.5, -37.5, 150.0),
+            (287.5, -37.5, 150.0),
+            (287.5, -187.5, 100.0),
+        ]
+        task.navi = types.SimpleNamespace(
+            set_navigation_speed=lambda speed: calls.append(("speed", speed))
+        )
+        task._start_fixed_trajectory = (
+            lambda points: calls.append(("trajectory", points))
+        )
+        targets = iter(route_targets)
+
+        def wait_for_target_or_end(*, update_speed=False):
+            calls.append(("wait", update_speed))
+            return next(targets)
+
+        task._wait_for_target_or_trajectory_end = wait_for_target_or_end
+        task._wait_for_non_positive_turn_velocity = (
+            lambda: calls.append(("turn_velocity",))
+        )
+
+        def wait_at_c():
+            calls.append(("wait_at_c",))
+            return c_target
+
+        task._wait_for_target_at_c = wait_at_c
+        return task, calls
 
     def _build_extracted_task(self, events, landing_function):
         mission = _class(self.mission_tree, "Task2Mission")

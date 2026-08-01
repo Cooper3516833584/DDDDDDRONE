@@ -17,15 +17,21 @@ from mission2_26_logic import (  # noqa: E402
     ClockwiseArcVelocityPredictor,
     ENTRY_POINT,
     LowAltitudeTargetOffset,
+    NonPositiveXVelocityConfirmation,
     PURSUIT_SLOWDOWN_POINT,
     PursuitSpeedSchedule,
     ROUTE_END,
     RoutePassGate,
     TAKEOFF_POINT,
+    TASK2_FIXED_C_POINT,
+    TASK2_FIXED_TURN_POINT,
+    Task2CPointPassGate,
     build_pursuit_trajectory,
+    build_task2_fixed_route,
     land_on_target_and_confirm_lock,
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
+    task2_deceleration_speed,
 )
 from mission2_26_safety import EscortXBoundaryVelocityGuard  # noqa: E402
 
@@ -64,6 +70,40 @@ def test_pursuit_trajectory_geometry() -> None:
     assert arc_points[1][0] > arc_points[0][0]
     assert arc_points[1][1] < arc_points[0][1]
     assert trajectory[-1][0] < trajectory[-2][0]
+
+
+def test_task2_fixed_route_geometry() -> None:
+    assert build_task2_fixed_route() == [
+        (ENTRY_POINT[0], ENTRY_POINT[1], 150.0),
+        (TASK2_FIXED_TURN_POINT[0], TASK2_FIXED_TURN_POINT[1], 150.0),
+        (TASK2_FIXED_C_POINT[0], TASK2_FIXED_C_POINT[1], 100.0),
+    ]
+
+
+def test_task2_deceleration_speed() -> None:
+    assert task2_deceleration_speed(200.0) == 20.0
+    assert task2_deceleration_speed(207.5) == 20.0
+    assert task2_deceleration_speed(247.5) == 12.5
+    assert task2_deceleration_speed(287.5) == 5.0
+    assert task2_deceleration_speed(300.0) == 5.0
+
+
+def test_non_positive_x_velocity_confirmation() -> None:
+    confirmation = NonPositiveXVelocityConfirmation(confirm_seconds=0.2)
+    assert not confirmation.update(0.0, 287.5, 1.0)
+    assert not confirmation.update(0.2, 287.5, 0.0)
+    assert confirmation.update(0.4, 287.5, -0.1)
+
+    assert not confirmation.update(0.5, 279.9, -0.1)
+    assert not confirmation.update(0.6, 287.5, -0.1)
+    assert confirmation.update(0.8, 287.5, 0.0)
+
+
+def test_task2_c_point_pass_gate() -> None:
+    gate = Task2CPointPassGate()
+    assert not gate.update(287.5, -187.4)
+    assert gate.update(287.5, -187.5)
+    assert gate.update(0.0, 0.0)
 
 
 def test_clockwise_arc_velocity_prediction() -> None:
@@ -363,6 +403,10 @@ def test_locked_red_led_dwell_and_cleanup() -> None:
 
 def main() -> None:
     test_pursuit_trajectory_geometry()
+    test_task2_fixed_route_geometry()
+    test_task2_deceleration_speed()
+    test_non_positive_x_velocity_confirmation()
+    test_task2_c_point_pass_gate()
     test_clockwise_arc_velocity_prediction()
     test_low_altitude_target_offset()
     test_escort_x_boundary_velocity_guard()

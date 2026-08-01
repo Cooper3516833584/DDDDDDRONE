@@ -1,4 +1,4 @@
-"""任务二：曲线追及、移动目标伴飞降落、平台复飞和返航。
+"""任务二：固定路线搜索、移动目标伴飞降落、平台复飞和返航。
 
 本入口会直连真实飞控、单雷达和相机并执行两次起飞与两次降落。运行前
 必须确认 ``server_ros.py`` 及其他 ``FC_Server`` 已关闭，并清空追及
@@ -29,16 +29,18 @@ from moving_target_descent import (
     MovingTargetDescentController,
 )
 from mission2_26_logic import (
-    ARC_END,
     ClockwiseArcVelocityPredictor,
     LowAltitudeTargetOffset,
+    NonPositiveXVelocityConfirmation,
     PURSUIT_SLOWDOWN_POINT,
-    PursuitSpeedSchedule,
-    RoutePassGate,
-    build_pursuit_trajectory,
+    TASK2_FIXED_C_POINT,
+    TASK2_FIXED_TURN_POINT,
+    Task2CPointPassGate,
+    build_task2_fixed_route,
     land_on_target_and_confirm_lock,
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
+    task2_deceleration_speed,
 )
 from mission2_26_safety import EscortXBoundaryVelocityGuard
 from visual_target_descent import PreDescentTimeoutError
@@ -47,11 +49,16 @@ from visual_target_descent import PreDescentTimeoutError
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 20.0
 PURSUIT_SPEED = 20.0
-PURSUIT_APPROACH_SPEED = 25.0
-PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
+PURSUIT_TURN_SPEED = 5.0
 RETURN_SPEED = 20.0
+RETURN_POSITION_THRESHOLD = 10.0
+RETURN_SETTLE_SECONDS = 0.5
+RETURN_TIMEOUT_SECONDS = 45.0
+RETURN_MIN_CROSS_TRACK_SPEED = 2.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
+C_POINT_WAIT_TIMEOUT_SECONDS = 20.0
+TURN_X_VELOCITY_CONFIRM_TIMEOUT_SECONDS = 2.0
 ARC_VELOCITY_POSITION_TOLERANCE = 20.0
 ESCORT_MAX_X = 357.5
 
@@ -147,7 +154,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                 horizontal_command_limit=TASK2_OUTPUT_SPEED_LIMIT,
             ),
         )
-        self._route_gate = RoutePassGate(radius=TARGET_DESCENT_GATE_RADIUS)
+        self._route_gate = Task2CPointPassGate()
         self._arc_velocity_predictor = ClockwiseArcVelocityPredictor(
             position_tolerance=ARC_VELOCITY_POSITION_TOLERANCE,
         )
@@ -161,14 +168,9 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             max_x=ESCORT_MAX_X,
         )
         self._escort_x_boundary_active = False
-        self._pursuit_speed_schedule = PursuitSpeedSchedule(
-            initial_speed=PURSUIT_SPEED,
-            approach_speed=PURSUIT_APPROACH_SPEED,
-            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
-        )
-        self._pursuit_trajectory = build_pursuit_trajectory(
-            altitude=CRUISE_HEIGHT,
-            arc_step_degrees=10,
+        self._fixed_route = build_task2_fixed_route(
+            cruise_height=CRUISE_HEIGHT,
+            c_height=TARGET_DESCENT_INTERMEDIATE_HEIGHT,
         )
         self._platform_retakeoff_hold_point: Optional[
             Tuple[float, float]
@@ -184,7 +186,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             logger.info(
                 "[MISSION2] Route gate passed near {} at "
                 "({:.1f}, {:.1f})cm",
-                ARC_END,
+                TASK2_FIXED_C_POINT,
                 self.navi.current_x,
                 self.navi.current_y,
             )
@@ -201,19 +203,24 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         if self.navi.traj_running_event.is_set():
             raise RuntimeError("Pursuit trajectory did not stop in time")
 
-    def _update_pursuit_speed(self) -> None:
+    def _update_fixed_route_speed(self) -> None:
         target_x, target_y = self.navi.navigation_target
-        new_speed = self._pursuit_speed_schedule.update(
-            target_x,
-            target_y,
+        if (
+            abs(float(target_x) - TASK2_FIXED_TURN_POINT[0]) > 1e-3
+            or abs(float(target_y) - TASK2_FIXED_TURN_POINT[1]) > 1e-3
+            or self.navi.current_x < PURSUIT_SLOWDOWN_POINT[0]
+        ):
+            return
+        new_speed = task2_deceleration_speed(
             self.navi.current_x,
-            self.navi.current_y,
+            start_speed=PURSUIT_SPEED,
+            end_speed=PURSUIT_TURN_SPEED,
         )
-        if new_speed is None:
+        if abs(float(self.navi.navi_speed) - new_speed) < 0.25:
             return
         self.navi.set_navigation_speed(new_speed)
         logger.info(
-            "[MISSION2] Pursuit speed changed to {:.1f}cm/s at "
+            "[MISSION2] Fixed-route speed changed to {:.1f}cm/s at "
             "position ({:.1f}, {:.1f}); trajectory target "
             "({:.1f}, {:.1f})",
             new_speed,
@@ -223,43 +230,114 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             target_y,
         )
 
-    def _wait_until_target_detected_on_trajectory(
+    def _fresh_target_offset(self, last_sequence: int):
+        self._raise_if_vision_failed()
+        sample = self._latest_vision_sample()
+        if sample is None or sample[0] == last_sequence:
+            return last_sequence, None
+        sequence, captured_at, x_px, y_px = sample
+        if (
+            time.monotonic() - captured_at
+            <= mission_base.VISION_SAMPLE_STALE_SECONDS
+            and x_px is not None
+            and y_px is not None
+            and math.isfinite(float(x_px))
+            and math.isfinite(float(y_px))
+        ):
+            return sequence, (float(x_px), float(y_px))
+        return sequence, None
+
+    def _wait_for_target_or_trajectory_end(
         self,
-    ) -> Tuple[float, float]:
+        *,
+        update_speed: bool = False,
+    ) -> Optional[Tuple[float, float]]:
         last_sequence = -1
         while not self.stop_event.is_set():
-            self._update_pursuit_speed()
+            if update_speed:
+                self._update_fixed_route_speed()
             self._route_gate_is_open()
-            self._raise_if_vision_failed()
-            sample = self._latest_vision_sample()
-            if sample is not None and sample[0] != last_sequence:
-                sequence, captured_at, x_px, y_px = sample
-                last_sequence = sequence
-                if (
-                    time.monotonic() - captured_at
-                    <= mission_base.VISION_SAMPLE_STALE_SECONDS
-                    and x_px is not None
-                    and y_px is not None
-                    and math.isfinite(float(x_px))
-                    and math.isfinite(float(y_px))
-                    and math.hypot(float(x_px), float(y_px))
-                    < TARGET_DETECTION_PIXEL_THRESHOLD
-                ):
-                    self._stop_pursuit_trajectory()
-                    logger.info(
-                        "[MISSION2] Target detected during pursuit: "
-                        "x_px={:.2f}, y_px={:.2f}",
-                        x_px,
-                        y_px,
-                    )
-                    return float(x_px), float(y_px)
-
-            if not self.navi.traj_running_event.is_set():
-                raise TargetNotFoundError(
-                    "Pursuit trajectory finished without target detection"
+            last_sequence, offset = self._fresh_target_offset(last_sequence)
+            if offset is not None:
+                self._stop_pursuit_trajectory()
+                logger.info(
+                    "[MISSION2] Target detected during fixed route: "
+                    "x_px={:.2f}, y_px={:.2f}",
+                    offset[0],
+                    offset[1],
                 )
+                return offset
+            if not self.navi.traj_running_event.is_set():
+                return None
             self.stop_event.wait(mission_base.ESCORT_CONTROL_PERIOD)
-        raise RuntimeError("Task 2 stopped during target pursuit")
+        raise RuntimeError("Task 2 stopped during fixed-route search")
+
+    def _start_fixed_trajectory(self, points) -> None:
+        if not self.navi.navigation_follow_trajectory(
+            points,
+            wait=False,
+            pos_thres=PURSUIT_POSITION_THRESHOLD,
+        ):
+            raise RuntimeError("Failed to start task 2 fixed trajectory")
+
+    def _wait_for_non_positive_turn_velocity(self) -> None:
+        confirmation = NonPositiveXVelocityConfirmation(
+            position_tolerance=PURSUIT_POSITION_THRESHOLD,
+        )
+        deadline = time.monotonic() + TURN_X_VELOCITY_CONFIRM_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set():
+                raise RuntimeError("Task 2 stopped while confirming turn velocity")
+            if not self.fc.state.is_fresh(0.5):
+                raise RuntimeError("Flight telemetry is stale at fixed-route turn")
+            if confirmation.update(
+                time.monotonic(),
+                self.navi.current_x,
+                self.fc.state.vel_x.value,
+            ):
+                return
+            self.stop_event.wait(mission_base.ESCORT_CONTROL_PERIOD)
+        raise RuntimeError("Positive x velocity remained at fixed-route turn")
+
+    def _wait_for_target_at_c(self) -> Tuple[float, float]:
+        self.navi.navigation_stop_here()
+        self._clear_vision_samples()
+        last_sequence = -1
+        deadline = time.monotonic() + C_POINT_WAIT_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set():
+                raise RuntimeError("Task 2 stopped while waiting at C")
+            last_sequence, offset = self._fresh_target_offset(last_sequence)
+            if offset is not None:
+                logger.info(
+                    "[MISSION2] Target detected while waiting at C: "
+                    "x_px={:.2f}, y_px={:.2f}",
+                    offset[0],
+                    offset[1],
+                )
+                return offset
+            self.stop_event.wait(mission_base.ESCORT_CONTROL_PERIOD)
+        raise TargetNotFoundError(
+            "Target was not detected within {:.0f}s at C".format(
+                C_POINT_WAIT_TIMEOUT_SECONDS
+            )
+        )
+
+    def _search_target_on_fixed_route(self) -> Tuple[float, float]:
+        entry_point, turn_point, c_point = self._fixed_route
+        self.navi.set_navigation_speed(PURSUIT_SPEED)
+        self._start_fixed_trajectory([entry_point, turn_point])
+        target = self._wait_for_target_or_trajectory_end(update_speed=True)
+        if target is not None:
+            return target
+
+        self._wait_for_non_positive_turn_velocity()
+        self.navi.set_navigation_speed(PURSUIT_SPEED)
+        self._start_fixed_trajectory([c_point])
+        target = self._wait_for_target_or_trajectory_end()
+        if target is not None:
+            return target
+        return self._wait_for_target_at_c()
 
     def _follow_descend_and_land_on_target(self) -> None:
         def predict_target_velocity(
@@ -299,7 +377,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                 velocity_y,
             )
 
-        # 阶段1：稳定伴飞 4 秒后先下降到中间高度，不要求先经过门控点。
+        # 阶段1：从识别时的当前高度稳定伴飞并下降到 1m。
         self.moving_target_descent.follow_and_descend(
             target_height=TARGET_DESCENT_INTERMEDIATE_HEIGHT,
             stabilize_seconds=ESCORT_STABLE_SECONDS,
@@ -320,7 +398,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             TARGET_DESCENT_INTERMEDIATE_HEIGHT,
         )
 
-        # 阶段2：经过门控点 (207.5,-187.5) 后继续下降到最终降落高度。
+        # 阶段2：经过新固定路线 C 点后继续下降到最终降落高度。
         # 沿用阶段1伴飞器的目标速度估计（不重置），目标速度不会突变。
         final_velocity = self.moving_target_descent.follow_and_descend(
             target_height=TARGET_LANDING_HEIGHT,
@@ -392,10 +470,40 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         # 返航开始时切换到 H 降落点检测；相机保持全程开启。
         self.enable_h_landing_vision()
         self.navi.set_navigation_speed(RETURN_SPEED)
-        if not self.navi.navigation_to_waypoint(
-            mission_base.TAKEOFF_POINT,
-            wait=True,
-        ):
+        self.navi.switch_pid("navi")
+        target_x = float(mission_base.TAKEOFF_POINT[0])
+        target_y = float(mission_base.TAKEOFF_POINT[1])
+        delta_x = target_x - float(self.navi.current_x)
+        delta_y = target_y - float(self.navi.current_y)
+        return_distance = math.hypot(delta_x, delta_y)
+        if return_distance > RETURN_POSITION_THRESHOLD:
+            x_limit = max(
+                RETURN_MIN_CROSS_TRACK_SPEED,
+                RETURN_SPEED * abs(delta_x) / return_distance,
+            )
+            y_limit = max(
+                RETURN_MIN_CROSS_TRACK_SPEED,
+                RETURN_SPEED * abs(delta_y) / return_distance,
+            )
+            self.navi.navi_x_pid.output_limits = (-x_limit, x_limit)
+            self.navi.navi_y_pid.output_limits = (-y_limit, y_limit)
+            logger.info(
+                "[MISSION2] Straight return from ({:.1f}, {:.1f})cm; "
+                "axis limits=({:.1f}, {:.1f})cm/s",
+                self.navi.current_x,
+                self.navi.current_y,
+                x_limit,
+                y_limit,
+            )
+        # 固定目标为起飞点，不生成密集的中间轨迹点。
+        self.navi.direct_set_waypoint(mission_base.TAKEOFF_POINT)
+        return_succeeded = self.navi.wait_for_waypoint(
+            time_thres=RETURN_SETTLE_SECONDS,
+            pos_thres=RETURN_POSITION_THRESHOLD,
+            timeout=RETURN_TIMEOUT_SECONDS,
+        )
+        self.navi.set_navigation_speed(RETURN_SPEED)
+        if not return_succeeded:
             raise RuntimeError("Failed to return to initial takeoff point")
         self.signals.send_landing_started()
         self._visual_h_landing_at_takeoff()
@@ -504,32 +612,22 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             raise RuntimeError("Yaw stabilization was not confirmed")
 
         self._clear_vision_samples()
-        self._pursuit_speed_schedule = PursuitSpeedSchedule(
-            initial_speed=PURSUIT_SPEED,
-            approach_speed=PURSUIT_APPROACH_SPEED,
-            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
-        )
-        navi.set_navigation_speed(PURSUIT_SPEED)
+        self._route_gate = Task2CPointPassGate()
         navi.switch_pid("navi")
-        if not navi.navigation_follow_trajectory(
-            self._pursuit_trajectory,
-            wait=False,
-            pos_thres=PURSUIT_POSITION_THRESHOLD,
-        ):
-            raise RuntimeError("Failed to start task 2 pursuit trajectory")
         self.signals.send_pursuit_started()
         logger.info(
-            "[MISSION2] Pursuit trajectory started with {} points; "
-            "speed {}cm/s, then {}cm/s toward {}, then {}cm/s",
-            len(self._pursuit_trajectory),
+            "[MISSION2] Fixed route started: entry={}, turn={}, C={}; "
+            "speed {}cm/s, decelerate from x={}cm to {}cm/s at turn",
+            self._fixed_route[0],
+            self._fixed_route[1],
+            self._fixed_route[2],
             PURSUIT_SPEED,
-            PURSUIT_APPROACH_SPEED,
-            PURSUIT_SLOWDOWN_POINT,
-            PURSUIT_AFTER_SLOWDOWN_SPEED,
+            PURSUIT_SLOWDOWN_POINT[0],
+            PURSUIT_TURN_SPEED,
         )
 
         try:
-            self._wait_until_target_detected_on_trajectory()
+            self._search_target_on_fixed_route()
             self.signals.send_escort_started()
             self._follow_descend_and_land_on_target()
         except (TargetNotFoundError, PreDescentTimeoutError) as exc:

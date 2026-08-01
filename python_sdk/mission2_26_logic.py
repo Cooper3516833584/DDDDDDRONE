@@ -15,6 +15,8 @@ ARC_START = (237.5, -37.5)
 ARC_END = (237.5, -187.5)
 ROUTE_END = (87.5, -187.5)
 ROUTE_GATE_RADIUS = 7.5
+TASK2_FIXED_TURN_POINT = (287.5, -37.5)
+TASK2_FIXED_C_POINT = (287.5, -187.5)
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,100 @@ def build_pursuit_trajectory(
     points[-1] = (ARC_END[0], ARC_END[1], altitude)
     points.append((ROUTE_END[0], ROUTE_END[1], altitude))
     return points
+
+
+def build_task2_fixed_route(
+    cruise_height: float = 150.0,
+    c_height: float = 100.0,
+) -> List[Tuple[float, float, float]]:
+    """建立任务二入口、直线转角和 C 点等待的固定路线。"""
+    cruise_height = float(cruise_height)
+    c_height = float(c_height)
+    if not all(math.isfinite(value) for value in (cruise_height, c_height)):
+        raise ValueError("Task 2 fixed-route heights must be finite")
+    if cruise_height <= 0 or c_height <= 0:
+        raise ValueError("Task 2 fixed-route heights must be positive")
+    return [
+        (ENTRY_POINT[0], ENTRY_POINT[1], cruise_height),
+        (TASK2_FIXED_TURN_POINT[0], TASK2_FIXED_TURN_POINT[1], cruise_height),
+        (TASK2_FIXED_C_POINT[0], TASK2_FIXED_C_POINT[1], c_height),
+    ]
+
+
+def task2_deceleration_speed(
+    current_x: float,
+    start_speed: float = 20.0,
+    end_speed: float = 5.0,
+    start_x: float = PURSUIT_SLOWDOWN_POINT[0],
+    end_x: float = TASK2_FIXED_TURN_POINT[0],
+) -> float:
+    """给出任务二直线接近转角时的线性减速限幅。"""
+    values = (current_x, start_speed, end_speed, start_x, end_x)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("Task 2 deceleration parameters must be finite")
+    if start_speed <= 0 or end_speed <= 0 or start_speed < end_speed:
+        raise ValueError("Task 2 deceleration speeds are invalid")
+    if end_x <= start_x:
+        raise ValueError("Task 2 deceleration interval is invalid")
+
+    progress = (float(current_x) - float(start_x)) / (
+        float(end_x) - float(start_x)
+    )
+    progress = min(max(progress, 0.0), 1.0)
+    return float(start_speed) + progress * (float(end_speed) - float(start_speed))
+
+
+@dataclass
+class NonPositiveXVelocityConfirmation:
+    """确认无人机位于转角附近且 x 方向不再具有正向速度。"""
+
+    target_x: float = TASK2_FIXED_TURN_POINT[0]
+    position_tolerance: float = 7.5
+    confirm_seconds: float = 0.2
+    valid_since: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        values = (self.target_x, self.position_tolerance, self.confirm_seconds)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("X-velocity confirmation parameters must be finite")
+        if self.position_tolerance < 0 or self.confirm_seconds < 0:
+            raise ValueError(
+                "X-velocity confirmation tolerances must be non-negative"
+            )
+
+    def update(self, now: float, current_x: float, velocity_x: float) -> bool:
+        values = (now, current_x, velocity_x)
+        if not all(math.isfinite(float(value)) for value in values):
+            self.valid_since = None
+            return False
+        valid = bool(
+            abs(float(current_x) - float(self.target_x))
+            <= float(self.position_tolerance)
+            and float(velocity_x) <= 0.0
+        )
+        if not valid:
+            self.valid_since = None
+            return False
+        if self.valid_since is None:
+            self.valid_since = float(now)
+        return float(now) - self.valid_since >= float(self.confirm_seconds)
+
+
+@dataclass
+class Task2CPointPassGate:
+    """锁存无人机是否已沿负 y 方向经过任务二 C 点。"""
+
+    c_y: float = TASK2_FIXED_C_POINT[1]
+    passed: bool = False
+
+    def update(self, x: float, y: float) -> bool:
+        if self.passed:
+            return True
+        if not math.isfinite(float(x)) or not math.isfinite(float(y)):
+            return False
+        if float(y) <= float(self.c_y):
+            self.passed = True
+        return self.passed
 
 
 @dataclass
@@ -409,14 +505,20 @@ __all__ = [
     "ClockwiseArcVelocityPredictor",
     "ENTRY_POINT",
     "LowAltitudeTargetOffset",
+    "NonPositiveXVelocityConfirmation",
     "PURSUIT_SLOWDOWN_POINT",
     "PursuitSpeedSchedule",
     "ROUTE_END",
     "ROUTE_GATE_RADIUS",
     "RoutePassGate",
     "TAKEOFF_POINT",
+    "TASK2_FIXED_C_POINT",
+    "TASK2_FIXED_TURN_POINT",
+    "Task2CPointPassGate",
     "build_pursuit_trajectory",
+    "build_task2_fixed_route",
     "land_on_target_and_confirm_lock",
     "locked_red_led_dwell",
     "retakeoff_from_moving_platform",
+    "task2_deceleration_speed",
 ]
