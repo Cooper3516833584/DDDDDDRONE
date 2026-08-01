@@ -59,6 +59,10 @@ PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
 C_POINT_WAIT_TIMEOUT_SECONDS = 20.0
 TURN_X_VELOCITY_CONFIRM_TIMEOUT_SECONDS = 2.0
+FIXED_ROUTE_ENTRY_TIMEOUT_SECONDS = 15.0
+FIXED_ROUTE_TURN_TIMEOUT_SECONDS = 20.0
+FIXED_ROUTE_C_TIMEOUT_SECONDS = 15.0
+FIXED_ROUTE_ARRIVAL_SETTLE_SECONDS = 0.2
 ARC_VELOCITY_POSITION_TOLERANCE = 20.0
 ESCORT_MAX_X = 357.5
 
@@ -84,7 +88,11 @@ PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS = 15.0
 
 
 class TargetNotFoundError(RuntimeError):
-    """Raised when the pursuit trajectory ends without detecting the target."""
+    """Raised when the fixed-route search ends without detecting the target."""
+
+
+class FixedRouteError(RuntimeError):
+    """Raised when a fixed-route waypoint cannot be safely confirmed."""
 
 
 class Mission2Signals(mission1.MissionGroundStationSignals):
@@ -192,17 +200,6 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             )
         return is_open
 
-    def _stop_pursuit_trajectory(self) -> None:
-        self.navi.navigation_stop_here()
-        deadline = time.monotonic() + 0.5
-        while (
-            self.navi.traj_running_event.is_set()
-            and time.monotonic() < deadline
-        ):
-            self.stop_event.wait(0.02)
-        if self.navi.traj_running_event.is_set():
-            raise RuntimeError("Pursuit trajectory did not stop in time")
-
     def _update_fixed_route_speed(self) -> None:
         target_x, target_y = self.navi.navigation_target
         if (
@@ -247,19 +244,31 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             return sequence, (float(x_px), float(y_px))
         return sequence, None
 
-    def _wait_for_target_or_trajectory_end(
+    def _wait_for_target_or_waypoint(
         self,
+        target,
         *,
+        timeout: float,
         update_speed: bool = False,
+        require_height: bool = False,
     ) -> Optional[Tuple[float, float]]:
         last_sequence = -1
-        while not self.stop_event.is_set():
+        arrived_since = None
+        deadline = time.monotonic() + float(timeout)
+        target_x = float(target[0])
+        target_y = float(target[1])
+        target_height = float(target[2]) if len(target) > 2 else None
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set():
+                raise RuntimeError("Task 2 stopped during fixed-route search")
+            if not self.navi.pose_is_fresh():
+                raise FixedRouteError("Navigation pose became stale on fixed route")
             if update_speed:
                 self._update_fixed_route_speed()
             self._route_gate_is_open()
             last_sequence, offset = self._fresh_target_offset(last_sequence)
             if offset is not None:
-                self._stop_pursuit_trajectory()
+                self.navi.navigation_stop_here()
                 logger.info(
                     "[MISSION2] Target detected during fixed route: "
                     "x_px={:.2f}, y_px={:.2f}",
@@ -267,41 +276,88 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                     offset[1],
                 )
                 return offset
-            if not self.navi.traj_running_event.is_set():
-                return None
+
+            horizontal_arrived = bool(
+                math.hypot(
+                    float(self.navi.current_x) - target_x,
+                    float(self.navi.current_y) - target_y,
+                )
+                <= PURSUIT_POSITION_THRESHOLD
+            )
+            height_arrived = bool(
+                not require_height
+                or (
+                    target_height is not None
+                    and abs(float(self.navi.current_height) - target_height)
+                    <= descent_test.HEIGHT_TOLERANCE
+                )
+            )
+            now = time.monotonic()
+            if horizontal_arrived and height_arrived:
+                if arrived_since is None:
+                    arrived_since = now
+                elif now - arrived_since >= FIXED_ROUTE_ARRIVAL_SETTLE_SECONDS:
+                    logger.info(
+                        "[MISSION2] Fixed waypoint confirmed at "
+                        "({:.1f}, {:.1f}, {:.1f})cm",
+                        self.navi.current_x,
+                        self.navi.current_y,
+                        self.navi.current_height,
+                    )
+                    return None
+            else:
+                arrived_since = None
             self.stop_event.wait(mission_base.ESCORT_CONTROL_PERIOD)
-        raise RuntimeError("Task 2 stopped during fixed-route search")
+        raise FixedRouteError(
+            "Fixed waypoint timed out: target=({}, {}, {}), "
+            "current=({:.1f}, {:.1f}, {:.1f})".format(
+                target_x,
+                target_y,
+                target_height,
+                self.navi.current_x,
+                self.navi.current_y,
+                self.navi.current_height,
+            )
+        )
 
-    def _start_fixed_trajectory(self, points) -> None:
-        if not self.navi.navigation_follow_trajectory(
-            points,
-            wait=False,
-            pos_thres=PURSUIT_POSITION_THRESHOLD,
-        ):
-            raise RuntimeError("Failed to start task 2 fixed trajectory")
+    def _set_fixed_waypoint(self, point) -> None:
+        self.navi.direct_set_waypoint(point)
+        logger.info("[MISSION2] Fixed waypoint set to {}", point)
 
-    def _wait_for_non_positive_turn_velocity(self) -> None:
+    def _wait_for_non_positive_turn_velocity(
+        self,
+    ) -> Optional[Tuple[float, float]]:
         confirmation = NonPositiveXVelocityConfirmation(
             position_tolerance=PURSUIT_POSITION_THRESHOLD,
         )
+        last_sequence = -1
         deadline = time.monotonic() + TURN_X_VELOCITY_CONFIRM_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             if self.stop_event.is_set():
                 raise RuntimeError("Task 2 stopped while confirming turn velocity")
             if not self.fc.state.is_fresh(0.5):
                 raise RuntimeError("Flight telemetry is stale at fixed-route turn")
+            last_sequence, offset = self._fresh_target_offset(last_sequence)
+            if offset is not None:
+                self.navi.navigation_stop_here()
+                logger.info(
+                    "[MISSION2] Target detected while confirming turn velocity: "
+                    "x_px={:.2f}, y_px={:.2f}",
+                    offset[0],
+                    offset[1],
+                )
+                return offset
             if confirmation.update(
                 time.monotonic(),
                 self.navi.current_x,
                 self.fc.state.vel_x.value,
             ):
-                return
+                return None
             self.stop_event.wait(mission_base.ESCORT_CONTROL_PERIOD)
-        raise RuntimeError("Positive x velocity remained at fixed-route turn")
+        raise FixedRouteError("Positive x velocity remained at fixed-route turn")
 
     def _wait_for_target_at_c(self) -> Tuple[float, float]:
         self.navi.navigation_stop_here()
-        self._clear_vision_samples()
         last_sequence = -1
         deadline = time.monotonic() + C_POINT_WAIT_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
@@ -326,15 +382,34 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
     def _search_target_on_fixed_route(self) -> Tuple[float, float]:
         entry_point, turn_point, c_point = self._fixed_route
         self.navi.set_navigation_speed(PURSUIT_SPEED)
-        self._start_fixed_trajectory([entry_point, turn_point])
-        target = self._wait_for_target_or_trajectory_end(update_speed=True)
+        self._set_fixed_waypoint(entry_point)
+        target = self._wait_for_target_or_waypoint(
+            entry_point,
+            timeout=FIXED_ROUTE_ENTRY_TIMEOUT_SECONDS,
+        )
         if target is not None:
             return target
 
-        self._wait_for_non_positive_turn_velocity()
+        self._set_fixed_waypoint(turn_point)
+        target = self._wait_for_target_or_waypoint(
+            turn_point,
+            timeout=FIXED_ROUTE_TURN_TIMEOUT_SECONDS,
+            update_speed=True,
+        )
+        if target is not None:
+            return target
+
+        target = self._wait_for_non_positive_turn_velocity()
+        if target is not None:
+            return target
         self.navi.set_navigation_speed(PURSUIT_SPEED)
-        self._start_fixed_trajectory([c_point])
-        target = self._wait_for_target_or_trajectory_end()
+        # One 3D setpoint starts negative-y travel and descent together.
+        self._set_fixed_waypoint(c_point)
+        target = self._wait_for_target_or_waypoint(
+            c_point,
+            timeout=FIXED_ROUTE_C_TIMEOUT_SECONDS,
+            require_height=True,
+        )
         if target is not None:
             return target
         return self._wait_for_target_at_c()
@@ -630,7 +705,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             self._search_target_on_fixed_route()
             self.signals.send_escort_started()
             self._follow_descend_and_land_on_target()
-        except (TargetNotFoundError, PreDescentTimeoutError) as exc:
+        except (FixedRouteError, TargetNotFoundError, PreDescentTimeoutError) as exc:
             self._recover_home_after_expected_failure(str(exc))
             raise RuntimeError(
                 "Task 2 ended after a safe failure return"

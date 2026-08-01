@@ -147,6 +147,25 @@ class _Logger:
         return lambda *_args, **_kwargs: None
 
 
+class _FakeTime:
+    now = 0.0
+
+    @classmethod
+    def monotonic(cls):
+        return cls.now
+
+
+class _RouteStopEvent:
+    @staticmethod
+    def is_set():
+        return False
+
+    @staticmethod
+    def wait(seconds):
+        _FakeTime.now += float(seconds)
+        return False
+
+
 class Mission2CueStateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -340,16 +359,15 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(
             [
                 ("speed", 20.0),
-                ("trajectory", [(87.5, -37.5, 150.0),
-                                (237.5, -87.5, 150.0)]),
-                ("wait", True),
+                ("waypoint", (87.5, -37.5, 150.0)),
+                ("wait", (87.5, -37.5, 150.0), 15.0, False, False),
             ],
             calls,
         )
 
     def test_fixed_route_search_reaches_c_before_waiting(self):
         task, calls = self._build_fixed_route_search(
-            [None, None],
+            [None, None, None],
             c_target=(1.0, 3.0),
         )
 
@@ -357,16 +375,78 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(
             [
                 ("speed", 20.0),
-                ("trajectory", [(87.5, -37.5, 150.0),
-                                (237.5, -87.5, 150.0)]),
-                ("wait", True),
+                ("waypoint", (87.5, -37.5, 150.0)),
+                ("wait", (87.5, -37.5, 150.0), 15.0, False, False),
+                ("waypoint", (237.5, -87.5, 150.0)),
+                ("wait", (237.5, -87.5, 150.0), 20.0, True, False),
                 ("turn_velocity",),
                 ("speed", 20.0),
-                ("trajectory", [(237.5, -187.5, 100.0)]),
-                ("wait", False),
+                ("waypoint", (237.5, -187.5, 100.0)),
+                ("wait", (237.5, -187.5, 100.0), 15.0, False, True),
                 ("wait_at_c",),
             ],
             calls,
+        )
+
+    def test_c_waypoint_requires_horizontal_and_height_arrival(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        method = _method(mission, "_wait_for_target_or_waypoint")
+        extracted = ast.ClassDef(
+            name="ExtractedTask2Wait",
+            bases=[],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        class FixedRouteError(RuntimeError):
+            pass
+
+        namespace = {
+            "FixedRouteError": FixedRouteError,
+            "FIXED_ROUTE_ARRIVAL_SETTLE_SECONDS": 0.2,
+            "PURSUIT_POSITION_THRESHOLD": 7.5,
+            "Optional": __import__("typing").Optional,
+            "Tuple": Tuple,
+            "descent_test": types.SimpleNamespace(HEIGHT_TOLERANCE=5.0),
+            "logger": _Logger(),
+            "math": __import__("math"),
+            "mission_base": types.SimpleNamespace(ESCORT_CONTROL_PERIOD=0.05),
+            "time": _FakeTime,
+        }
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+
+        task = namespace["ExtractedTask2Wait"]()
+        task.stop_event = _RouteStopEvent()
+        task.navi = types.SimpleNamespace(
+            current_x=237.5,
+            current_y=-187.5,
+            current_height=120.0,
+            pose_is_fresh=lambda: True,
+            navigation_stop_here=lambda: None,
+        )
+        task._route_gate_is_open = lambda: True
+        task._fresh_target_offset = lambda sequence: (sequence, None)
+        task._update_fixed_route_speed = lambda: None
+
+        _FakeTime.now = 0.0
+        with self.assertRaises(FixedRouteError):
+            task._wait_for_target_or_waypoint(
+                (237.5, -187.5, 100.0),
+                timeout=0.3,
+                require_height=True,
+            )
+
+        task.navi.current_height = 103.0
+        _FakeTime.now = 0.0
+        self.assertIsNone(
+            task._wait_for_target_or_waypoint(
+                (237.5, -187.5, 100.0),
+                timeout=0.5,
+                require_height=True,
+            )
         )
 
     def _build_fixed_route_search(self, route_targets, c_target=None):
@@ -381,7 +461,13 @@ class Mission2CueStateTests(unittest.TestCase):
         )
         module = ast.Module(body=[extracted], type_ignores=[])
         ast.fix_missing_locations(module)
-        namespace = {"PURSUIT_SPEED": 20.0, "Tuple": Tuple}
+        namespace = {
+            "PURSUIT_SPEED": 20.0,
+            "FIXED_ROUTE_ENTRY_TIMEOUT_SECONDS": 15.0,
+            "FIXED_ROUTE_TURN_TIMEOUT_SECONDS": 20.0,
+            "FIXED_ROUTE_C_TIMEOUT_SECONDS": 15.0,
+            "Tuple": Tuple,
+        }
         exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
 
         calls = []
@@ -394,18 +480,26 @@ class Mission2CueStateTests(unittest.TestCase):
         task.navi = types.SimpleNamespace(
             set_navigation_speed=lambda speed: calls.append(("speed", speed))
         )
-        task._start_fixed_trajectory = (
-            lambda points: calls.append(("trajectory", points))
+        task._set_fixed_waypoint = (
+            lambda point: calls.append(("waypoint", point))
         )
         targets = iter(route_targets)
 
-        def wait_for_target_or_end(*, update_speed=False):
-            calls.append(("wait", update_speed))
+        def wait_for_target_or_waypoint(
+            point,
+            *,
+            timeout,
+            update_speed=False,
+            require_height=False,
+        ):
+            calls.append(
+                ("wait", point, timeout, update_speed, require_height)
+            )
             return next(targets)
 
-        task._wait_for_target_or_trajectory_end = wait_for_target_or_end
+        task._wait_for_target_or_waypoint = wait_for_target_or_waypoint
         task._wait_for_non_positive_turn_velocity = (
-            lambda: calls.append(("turn_velocity",))
+            lambda: calls.append(("turn_velocity",)) or None
         )
 
         def wait_at_c():
