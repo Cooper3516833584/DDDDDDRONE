@@ -64,7 +64,7 @@ class SimulatedAirStateProvider:
             vz_cm_s=0,
             battery_cV=1600,
             operation_state=0,
-            pose_quality=100,
+            pose_quality=4,
             error_code=0,
         )
 
@@ -136,8 +136,11 @@ def main():
     finally:
         node.close()
         print(
-            "Air pose simulator stopped; trace_samples={} write_failures={}".format(
+            "Air pose simulator stopped; trace_samples={} sample_errors={} "
+            "last_sample_error={} write_failures={}".format(
                 node.trace_buffer.recorded_samples,
+                node.trace_sampler.sample_errors,
+                node.trace_sampler.last_error,
                 node.write_failures,
             ),
             flush=True,
