@@ -1,9 +1,9 @@
 """
 任务一：移动目标视觉伴飞、同步下降、抛投、返航与定点降落。
 
-追及路径与任务二保持一致：直线 + 右侧顺时针半圆弧 + 末段直线的
-曲线追及轨迹，非阻塞调用，速度按 初始->接近->减速后 三段调度。
-发现移动目标后，连续有效伴飞 10 秒，
+追及路径为起飞点直飞右侧圆弧顶点，再沿原顺时针圆弧到终点并保持原末段直线，
+非阻塞调用，速度按 35 cm/s、越过 x=237.5 后 25 cm/s、圆弧上 15 cm/s 调度。
+发现移动目标后，连续有效伴飞 2 秒，
 在同一视觉速度接管内从 150 cm 下降到 40 cm，并继续伴飞 0.5 秒。
 
 起飞采用非定点垂直起飞（90 cm 一键离地后垂直爬升至 150 cm），
@@ -36,18 +36,19 @@ from fleet_bus.trace_buffer import TraceSamplingOptions
 import mission1_26_base as mission1
 import mission1_26_visual_descent_test as descent_test
 from mission2_26_logic import (
+    ARC_CENTER,
     ARC_END,
-    PURSUIT_SLOWDOWN_POINT,
-    PursuitSpeedSchedule,
+    ARC_RADIUS,
+    ROUTE_END,
     ROUTE_GATE_RADIUS,
     RoutePassGate,
-    build_pursuit_trajectory,
+    TAKEOFF_POINT,
 )
 from moving_target_descent import MovingTargetDescentController
 
 
 DESCENT_TARGET_HEIGHT = 40.0
-STABILIZE_SECONDS = 10.0
+STABILIZE_SECONDS = 2.0
 STABILIZE_TIMEOUT_SECONDS = 20.0
 # 特殊抛投后，缩短低空伴飞以避免下落货物遮挡移动目标标记。
 LOW_HOVER_SECONDS = 0.5
@@ -60,15 +61,63 @@ INITIAL_TARGET_VELOCITY = (3.6, 0.0)
 # 起飞后、开始追及前的悬停时间（秒）。
 HOVER_BEFORE_PURSUIT_SECONDS = 2.5
 
-# 追及轨迹与速度规划，与任务二保持一致：直线 + 右侧顺时针半圆弧 +
-# 末段直线，非阻塞调用，速度按 初始->接近->减速后 三段调度。
-PURSUIT_SPEED = 20.0
+# 起飞点直飞圆弧顶点，再沿原顺时针圆弧下半段和末段直线追及。
+PURSUIT_ARC_VERTEX = (312.5, -112.5)
+PURSUIT_X_SLOWDOWN = 237.5
+PURSUIT_SPEED = 35.0
 PURSUIT_APPROACH_SPEED = 25.0
-PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
+PURSUIT_ARC_SPEED = 15.0
 PURSUIT_POSITION_THRESHOLD = 7.5
+PURSUIT_DIRECT_SEGMENTS = 4
 
 # 完成抛投并恢复巡航高度后的水平返航速度（cm/s）。
 RETURN_SPEED = 40.0
+
+
+def build_mission1_pursuit_trajectory(
+    altitude: float,
+    arc_step_degrees: int = 10,
+) -> List[Tuple[float, float, float]]:
+    """Build the task-1 route from takeoff to the arc vertex and onward."""
+    altitude = float(altitude)
+    arc_step_degrees = int(arc_step_degrees)
+    if not math.isfinite(altitude):
+        raise ValueError("altitude must be finite")
+    if arc_step_degrees <= 0 or 90 % arc_step_degrees:
+        raise ValueError(
+            "arc_step_degrees must be a positive divisor of 90"
+        )
+
+    points = [(TAKEOFF_POINT[0], TAKEOFF_POINT[1], altitude)]
+    # Keep each direct-flight waypoint within the navigation point timeout.
+    for segment in range(1, PURSUIT_DIRECT_SEGMENTS + 1):
+        progress = float(segment) / float(PURSUIT_DIRECT_SEGMENTS)
+        points.append(
+            (
+                TAKEOFF_POINT[0]
+                + (PURSUIT_ARC_VERTEX[0] - TAKEOFF_POINT[0]) * progress,
+                TAKEOFF_POINT[1]
+                + (PURSUIT_ARC_VERTEX[1] - TAKEOFF_POINT[1]) * progress,
+                altitude,
+            )
+        )
+    points[-1] = (PURSUIT_ARC_VERTEX[0], PURSUIT_ARC_VERTEX[1], altitude)
+    for angle_degrees in range(
+        -arc_step_degrees,
+        -91,
+        -arc_step_degrees,
+    ):
+        angle = math.radians(float(angle_degrees))
+        points.append(
+            (
+                float(ARC_CENTER[0] + ARC_RADIUS * math.cos(angle)),
+                float(ARC_CENTER[1] + ARC_RADIUS * math.sin(angle)),
+                altitude,
+            )
+        )
+    points[-1] = (ARC_END[0], ARC_END[1], altitude)
+    points.append((ROUTE_END[0], ROUTE_END[1], altitude))
+    return points
 
 
 class MissionGroundStationSignals:
@@ -150,14 +199,9 @@ class MovingTargetVisualDescentMission(
             raise_if_vision_failed=self._raise_if_vision_failed,
             record_callback=self._record_moving_descent,
         )
-        # 追及轨迹与速度规划与任务二保持一致。
         self._route_gate = RoutePassGate(radius=ROUTE_GATE_RADIUS)
-        self._pursuit_speed_schedule = PursuitSpeedSchedule(
-            initial_speed=PURSUIT_SPEED,
-            approach_speed=PURSUIT_APPROACH_SPEED,
-            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
-        )
-        self._pursuit_trajectory = build_pursuit_trajectory(
+        self._pursuit_speed_stage = 0
+        self._pursuit_trajectory = build_mission1_pursuit_trajectory(
             altitude=float(mission1.CRUISE_HEIGHT),
             arc_step_degrees=10,
         )
@@ -194,12 +238,31 @@ class MovingTargetVisualDescentMission(
 
     def _update_pursuit_speed(self) -> None:
         target_x, target_y = self.navi.navigation_target
-        new_speed = self._pursuit_speed_schedule.update(
-            target_x,
-            target_y,
-            self.navi.current_x,
-            self.navi.current_y,
-        )
+        current_x = float(self.navi.current_x)
+        current_y = float(self.navi.current_y)
+        if not all(
+            math.isfinite(value)
+            for value in (target_x, target_y, current_x, current_y)
+        ):
+            return
+
+        new_speed = None
+        if (
+            self._pursuit_speed_stage == 0
+            and current_x > PURSUIT_X_SLOWDOWN
+        ):
+            self._pursuit_speed_stage = 1
+            new_speed = PURSUIT_APPROACH_SPEED
+        if (
+            self._pursuit_speed_stage == 1
+            and math.hypot(
+                current_x - PURSUIT_ARC_VERTEX[0],
+                current_y - PURSUIT_ARC_VERTEX[1],
+            )
+            <= PURSUIT_POSITION_THRESHOLD
+        ):
+            self._pursuit_speed_stage = 2
+            new_speed = PURSUIT_ARC_SPEED
         if new_speed is None:
             return
         self.navi.set_navigation_speed(new_speed)
@@ -499,19 +562,17 @@ class MovingTargetVisualDescentMission(
 
         logger.info(
             "[MISSION1] Pursuit trajectory started with {} points; "
-            "speed {}cm/s, then {}cm/s toward {}, then {}cm/s",
+            "speed {}cm/s, then {}cm/s after x>{}cm, then "
+            "{}cm/s on arc from {}",
             len(self._pursuit_trajectory),
             PURSUIT_SPEED,
             PURSUIT_APPROACH_SPEED,
-            PURSUIT_SLOWDOWN_POINT,
-            PURSUIT_AFTER_SLOWDOWN_SPEED,
+            PURSUIT_X_SLOWDOWN,
+            PURSUIT_ARC_SPEED,
+            PURSUIT_ARC_VERTEX,
         )
         self._clear_vision_samples()
-        self._pursuit_speed_schedule = PursuitSpeedSchedule(
-            initial_speed=PURSUIT_SPEED,
-            approach_speed=PURSUIT_APPROACH_SPEED,
-            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
-        )
+        self._pursuit_speed_stage = 0
         navi.set_navigation_speed(PURSUIT_SPEED)
         navi.switch_pid("navi")
         if not navi.navigation_follow_trajectory(
