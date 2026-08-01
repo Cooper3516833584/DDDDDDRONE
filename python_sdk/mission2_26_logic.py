@@ -11,11 +11,10 @@ ENTRY_POINT = (87.5, -37.5)
 PURSUIT_SLOWDOWN_POINT = (207.5, -37.5)
 ARC_CENTER = (237.5, -112.5)
 ARC_RADIUS = 75.0
-ARC_START = (312.5, -112.5)
+ARC_START = (237.5, -37.5)
 ARC_END = (237.5, -187.5)
 ROUTE_END = (87.5, -187.5)
 ROUTE_GATE_RADIUS = 7.5
-PURSUIT_DIRECT_SEGMENTS = 4
 
 
 @dataclass(frozen=True)
@@ -139,36 +138,29 @@ def build_pursuit_trajectory(
     altitude: float = 150.0,
     arc_step_degrees: int = 10,
 ) -> List[Tuple[float, float, float]]:
-    """建立起飞点直达弧顶、顺时针 90 度圆弧和末段直线轨迹。"""
+    """建立直线、右侧顺时针半圆和末段直线组成的追及轨迹。"""
     altitude = float(altitude)
     arc_step_degrees = int(arc_step_degrees)
     if not math.isfinite(altitude):
         raise ValueError("altitude must be finite")
-    if arc_step_degrees <= 0 or 90 % arc_step_degrees:
-        raise ValueError("arc_step_degrees must be a positive divisor of 90")
+    if arc_step_degrees <= 0 or 180 % arc_step_degrees:
+        raise ValueError("arc_step_degrees must be a positive divisor of 180")
 
-    points = [(TAKEOFF_POINT[0], TAKEOFF_POINT[1], altitude)]
-    for segment in range(1, PURSUIT_DIRECT_SEGMENTS + 1):
-        progress = float(segment) / float(PURSUIT_DIRECT_SEGMENTS)
-        points.append(
-            (
-                TAKEOFF_POINT[0]
-                + (ARC_START[0] - TAKEOFF_POINT[0]) * progress,
-                TAKEOFF_POINT[1]
-                + (ARC_START[1] - TAKEOFF_POINT[1]) * progress,
-                altitude,
-            )
-        )
-    points[-1] = (ARC_START[0], ARC_START[1], altitude)
-    for angle_degrees in range(
-        -arc_step_degrees,
-        -91,
-        -arc_step_degrees,
-    ):
+    points = [
+        (TAKEOFF_POINT[0], TAKEOFF_POINT[1], altitude),
+        (ENTRY_POINT[0], ENTRY_POINT[1], altitude),
+        (
+            PURSUIT_SLOWDOWN_POINT[0],
+            PURSUIT_SLOWDOWN_POINT[1],
+            altitude,
+        ),
+    ]
+    for angle_degrees in range(90, -91, -arc_step_degrees):
         angle = math.radians(float(angle_degrees))
         x = ARC_CENTER[0] + ARC_RADIUS * math.cos(angle)
         y = ARC_CENTER[1] + ARC_RADIUS * math.sin(angle)
         points.append((float(x), float(y), altitude))
+    points[3] = (ARC_START[0], ARC_START[1], altitude)
     points[-1] = (ARC_END[0], ARC_END[1], altitude)
     points.append((ROUTE_END[0], ROUTE_END[1], altitude))
     return points
@@ -181,7 +173,7 @@ class PursuitSpeedSchedule:
     initial_speed: float = 40.0
     approach_speed: float = 25.0
     after_slowdown_speed: float = 15.0
-    point_tolerance: float = ROUTE_GATE_RADIUS
+    point_tolerance: float = 1e-3
     stage: int = 0
 
     @property
@@ -208,16 +200,19 @@ class PursuitSpeedSchedule:
             for value in (target_x, target_y, current_x, current_y)
         ):
             return None
-        if self.stage == 0 and current_x > ARC_CENTER[0]:
+        at_slowdown_point = bool(
+            math.hypot(
+                target_x - PURSUIT_SLOWDOWN_POINT[0],
+                target_y - PURSUIT_SLOWDOWN_POINT[1],
+            )
+            <= float(self.point_tolerance)
+        )
+        if self.stage == 0 and at_slowdown_point:
             self.stage = 1
             return self.current_speed
         if (
             self.stage == 1
-            and math.hypot(
-                current_x - ARC_START[0],
-                current_y - ARC_START[1],
-            )
-            <= float(self.point_tolerance)
+            and current_x >= PURSUIT_SLOWDOWN_POINT[0]
         ):
             self.stage = 2
             return self.current_speed
@@ -415,7 +410,6 @@ __all__ = [
     "ENTRY_POINT",
     "LowAltitudeTargetOffset",
     "PURSUIT_SLOWDOWN_POINT",
-    "PURSUIT_DIRECT_SEGMENTS",
     "PursuitSpeedSchedule",
     "ROUTE_END",
     "ROUTE_GATE_RADIUS",

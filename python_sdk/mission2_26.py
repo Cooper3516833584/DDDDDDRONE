@@ -13,7 +13,7 @@
 import math
 import threading
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from loguru import logger
 
@@ -29,13 +29,14 @@ from moving_target_descent import (
     MovingTargetDescentController,
 )
 from mission2_26_logic import (
+    ARC_CENTER,
     ARC_END,
-    ARC_START,
+    ARC_RADIUS,
     ClockwiseArcVelocityPredictor,
     LowAltitudeTargetOffset,
-    PursuitSpeedSchedule,
+    ROUTE_END,
     RoutePassGate,
-    build_pursuit_trajectory,
+    TAKEOFF_POINT,
     land_on_target_and_confirm_lock,
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
@@ -46,9 +47,9 @@ from visual_target_descent import PreDescentTimeoutError
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 20.0
 PURSUIT_SPEED = 35.0
-PURSUIT_APPROACH_SPEED = 25.0
+PURSUIT_APPROACH_SPEED = 15.0
 PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
-RETURN_SPEED = 20.0
+RETURN_SPEED = 30.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
 ARC_VELOCITY_POSITION_TOLERANCE = 20.0
@@ -68,6 +69,54 @@ TARGET_LANDING_LOCK_TIMEOUT_SECONDS = 20.0
 LOCKED_DWELL_SECONDS = 5.0
 PLATFORM_RETAKEOFF_HEIGHT = 30
 PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS = 15.0
+
+TASK2_ARC_START = (312.5, -112.5)
+TASK2_PURSUIT_DIRECT_SEGMENTS = 4
+
+
+def build_task2_pursuit_trajectory(
+    altitude: float,
+    arc_step_degrees: int = 10,
+) -> List[Tuple[float, float, float]]:
+    """Build the task-2 straight approach and clockwise 90-degree arc."""
+    altitude = float(altitude)
+    arc_step_degrees = int(arc_step_degrees)
+    if not math.isfinite(altitude):
+        raise ValueError("altitude must be finite")
+    if arc_step_degrees <= 0 or 90 % arc_step_degrees:
+        raise ValueError(
+            "arc_step_degrees must be a positive divisor of 90"
+        )
+
+    points = [(TAKEOFF_POINT[0], TAKEOFF_POINT[1], altitude)]
+    for segment in range(1, TASK2_PURSUIT_DIRECT_SEGMENTS + 1):
+        progress = float(segment) / float(TASK2_PURSUIT_DIRECT_SEGMENTS)
+        points.append(
+            (
+                TAKEOFF_POINT[0]
+                + (TASK2_ARC_START[0] - TAKEOFF_POINT[0]) * progress,
+                TAKEOFF_POINT[1]
+                + (TASK2_ARC_START[1] - TAKEOFF_POINT[1]) * progress,
+                altitude,
+            )
+        )
+    points[-1] = (TASK2_ARC_START[0], TASK2_ARC_START[1], altitude)
+    for angle_degrees in range(
+        -arc_step_degrees,
+        -91,
+        -arc_step_degrees,
+    ):
+        angle = math.radians(float(angle_degrees))
+        points.append(
+            (
+                float(ARC_CENTER[0] + ARC_RADIUS * math.cos(angle)),
+                float(ARC_CENTER[1] + ARC_RADIUS * math.sin(angle)),
+                altitude,
+            )
+        )
+    points[-1] = (ARC_END[0], ARC_END[1], altitude)
+    points.append((ROUTE_END[0], ROUTE_END[1], altitude))
+    return points
 
 
 class TargetNotFoundError(RuntimeError):
@@ -143,6 +192,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         )
         self._route_gate = RoutePassGate(radius=PURSUIT_POSITION_THRESHOLD)
         self._arc_velocity_predictor = ClockwiseArcVelocityPredictor(
+            start=TASK2_ARC_START,
             position_tolerance=ARC_VELOCITY_POSITION_TOLERANCE,
         )
         self._low_altitude_target_offset = LowAltitudeTargetOffset(
@@ -151,13 +201,8 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             final_x_px=TARGET_OFFSET_FINAL_X_PX,
             final_y_px=0.0,
         )
-        self._pursuit_speed_schedule = PursuitSpeedSchedule(
-            initial_speed=PURSUIT_SPEED,
-            approach_speed=PURSUIT_APPROACH_SPEED,
-            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
-            point_tolerance=PURSUIT_POSITION_THRESHOLD,
-        )
-        self._pursuit_trajectory = build_pursuit_trajectory(
+        self._pursuit_speed_stage = 0
+        self._pursuit_trajectory = build_task2_pursuit_trajectory(
             altitude=CRUISE_HEIGHT,
             arc_step_degrees=10,
         )
@@ -194,12 +239,28 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
 
     def _update_pursuit_speed(self) -> None:
         target_x, target_y = self.navi.navigation_target
-        new_speed = self._pursuit_speed_schedule.update(
-            target_x,
-            target_y,
-            self.navi.current_x,
-            self.navi.current_y,
-        )
+        current_x = float(self.navi.current_x)
+        current_y = float(self.navi.current_y)
+        if not all(
+            math.isfinite(value)
+            for value in (target_x, target_y, current_x, current_y)
+        ):
+            return
+
+        new_speed = None
+        if self._pursuit_speed_stage == 0 and current_x > ARC_CENTER[0]:
+            self._pursuit_speed_stage = 1
+            new_speed = PURSUIT_APPROACH_SPEED
+        if (
+            self._pursuit_speed_stage == 1
+            and math.hypot(
+                current_x - TASK2_ARC_START[0],
+                current_y - TASK2_ARC_START[1],
+            )
+            <= PURSUIT_POSITION_THRESHOLD
+        ):
+            self._pursuit_speed_stage = 2
+            new_speed = PURSUIT_AFTER_SLOWDOWN_SPEED
         if new_speed is None:
             return
         self.navi.set_navigation_speed(new_speed)
@@ -442,12 +503,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             raise RuntimeError("Yaw stabilization was not confirmed")
 
         self._clear_vision_samples()
-        self._pursuit_speed_schedule = PursuitSpeedSchedule(
-            initial_speed=PURSUIT_SPEED,
-            approach_speed=PURSUIT_APPROACH_SPEED,
-            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
-            point_tolerance=PURSUIT_POSITION_THRESHOLD,
-        )
+        self._pursuit_speed_stage = 0
         navi.set_navigation_speed(PURSUIT_SPEED)
         navi.switch_pid("navi")
         if not navi.navigation_follow_trajectory(
@@ -465,7 +521,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             PURSUIT_SPEED,
             PURSUIT_APPROACH_SPEED,
             PURSUIT_AFTER_SLOWDOWN_SPEED,
-            ARC_START,
+            TASK2_ARC_START,
         )
 
         try:

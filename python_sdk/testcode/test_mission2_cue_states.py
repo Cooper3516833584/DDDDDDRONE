@@ -1,8 +1,9 @@
 import ast
+import math
 import types
 import unittest
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 
 
 SDK_DIR = Path(__file__).resolve().parents[1]
@@ -172,6 +173,49 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(7, values["LANDING_ON_CAR"])
         self.assertEqual(8, values["ON_CAR"])
         self.assertEqual(15, values["CRUISING"])
+
+    def test_task2_route_is_local_straight_then_90_degree_arc(self):
+        function = next(
+            node
+            for node in self.mission_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "build_task2_pursuit_trajectory"
+        )
+        namespace = {
+            "math": math,
+            "List": List,
+            "Tuple": Tuple,
+            "TAKEOFF_POINT": (0.0, 0.0),
+            "TASK2_ARC_START": (312.5, -112.5),
+            "TASK2_PURSUIT_DIRECT_SEGMENTS": 4,
+            "ARC_CENTER": (237.5, -112.5),
+            "ARC_RADIUS": 75.0,
+            "ARC_END": (237.5, -187.5),
+            "ROUTE_END": (87.5, -187.5),
+        }
+        module = ast.Module(body=[function], type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+        trajectory = namespace["build_task2_pursuit_trajectory"](150.0, 10)
+
+        direct = trajectory[:5]
+        self.assertEqual((0.0, 0.0, 150.0), direct[0])
+        self.assertEqual((312.5, -112.5, 150.0), direct[-1])
+        slope = -112.5 / 312.5
+        for x, y, _height in direct[1:]:
+            self.assertTrue(math.isclose(y / x, slope, abs_tol=1e-9))
+
+        arc = trajectory[4:-1]
+        self.assertEqual(10, len(arc))
+        self.assertEqual((237.5, -187.5, 150.0), arc[-1])
+        for x, y, _height in arc:
+            self.assertTrue(
+                math.isclose(
+                    math.hypot(x - 237.5, y + 112.5),
+                    75.0,
+                    abs_tol=1e-9,
+                )
+            )
 
     def test_target_detection_waits_until_the_arc_is_complete(self):
         mission = _class(self.mission_tree, "Task2Mission")
