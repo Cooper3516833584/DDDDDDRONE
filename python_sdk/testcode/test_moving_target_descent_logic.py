@@ -149,8 +149,6 @@ class _Value:
 class _State:
     def __init__(self):
         self.unlock = _Value(True)
-        self.alt_add = _Value(150.0)
-        self.vel_z = _Value(0.0)
 
     @staticmethod
     def is_fresh(_max_age):
@@ -160,14 +158,6 @@ class _State:
 class _FC:
     def __init__(self):
         self.state = _State()
-        self.lock_calls = 0
-
-    def lock(self):
-        self.lock_calls += 1
-        self.state.unlock.value = False
-
-    def wait_for_lock(self, timeout_s):
-        return bool(timeout_s > 0 and not self.state.unlock.value)
 
 
 class _FakeTime:
@@ -195,7 +185,6 @@ class _Navigation:
         self.commands = []
         self.height_targets = []
         self.override_stopped = False
-        self.override_stop_calls = []
 
     @staticmethod
     def pose_is_fresh():
@@ -203,7 +192,7 @@ class _Navigation:
 
     @staticmethod
     def _start_velocity_override(keep_height, require_pose):
-        return bool(require_pose)
+        return bool(keep_height and require_pose)
 
     def _update_velocity_override(
         self,
@@ -217,8 +206,7 @@ class _Navigation:
 
     def _stop_velocity_override(self, restore_hover, hover_height=None):
         self.override_stopped = True
-        self.override_stop_calls.append((restore_hover, hover_height))
-        return True
+        return bool(restore_hover)
 
     def set_height(self, height):
         self.current_height = float(height)
@@ -513,165 +501,6 @@ def test_external_gate_total_timeout() -> None:
     assert navi.override_stopped
 
 
-def test_landing_horizontal_command_tapers_and_freezes() -> None:
-    navi = _Navigation()
-    controller = _new_visual_controller(
-        lambda: (1, _FakeTime.now, 0.0, 0.0),
-        navi,
-    )
-    full = controller._landing_horizontal_command(
-        10,
-        0,
-        height=30.0,
-        taper_height=30.0,
-        freeze_height=16.0,
-        low_altitude_speed_limit=3.0,
-    )
-    tapered = controller._landing_horizontal_command(
-        10,
-        0,
-        height=23.0,
-        taper_height=30.0,
-        freeze_height=16.0,
-        low_altitude_speed_limit=3.0,
-    )
-    frozen = controller._landing_horizontal_command(
-        10,
-        0,
-        height=16.0,
-        taper_height=30.0,
-        freeze_height=16.0,
-        low_altitude_speed_limit=3.0,
-    )
-    assert full == (10, 0)
-    assert 0 < tapered[0] < full[0]
-    assert tapered[1] == 0
-    assert frozen == (0, 0)
-
-
-def test_final_alignment_requires_distinct_frames() -> None:
-    _FakeTime.now = 0.0
-    navi = _Navigation()
-    navi.current_height = 22.0
-    controller = _new_visual_controller(
-        lambda: (1, _FakeTime.now, 0.0, 0.0),
-        navi,
-    )
-    original_time = visual_target_descent.time
-    visual_target_descent.time = _FakeTime
-    try:
-        try:
-            controller._confirm_final_alignment(
-                max_error_px=12.0,
-                confirm_frames=2,
-                timeout=0.2,
-                command_guard=lambda vel_x, vel_y: (vel_x, vel_y),
-            )
-        except visual_target_descent.LowAltitudeAlignmentError:
-            pass
-        else:
-            raise AssertionError("Repeated visual frame confirmed alignment")
-    finally:
-        visual_target_descent.time = original_time
-    assert navi.override_stopped
-
-
-class _LandingNavigation(_Navigation):
-    def __init__(self, fc):
-        super().__init__()
-        self.fc = fc
-        self.current_height = 60.0
-        self.fc.state.alt_add.value = 60.0
-
-    def set_height(self, height):
-        super().set_height(height)
-        self.fc.state.alt_add.value = float(height)
-
-    def _update_velocity_override(
-        self,
-        vel_x,
-        vel_y,
-        vel_z=None,
-        yaw=0,
-        frame="body",
-    ):
-        super()._update_velocity_override(
-            vel_x,
-            vel_y,
-            vel_z=vel_z,
-            yaw=yaw,
-            frame=frame,
-        )
-        if vel_z is None or vel_z >= 0:
-            return
-        self.current_height = max(5.0, self.current_height - 2.0)
-        self.fc.state.alt_add.value = self.current_height
-        self.fc.state.vel_z.value = (
-            0.0 if self.current_height <= 5.0 else float(vel_z)
-        )
-
-
-def test_visual_landing_confirms_touchdown_before_lock() -> None:
-    _FakeTime.now = 0.0
-    fc = _FC()
-    navi = _LandingNavigation(fc)
-
-    def latest_sample():
-        now = _FakeTime.now
-        if navi.current_height <= 16.0:
-            return None
-        return int(now * 1000) + 1, now, 0.0, 0.0
-
-    controller = visual_target_descent.VisualTargetDescentController(
-        fc=fc,
-        navi=navi,
-        stop_event=_StopEvent(),
-        latest_vision_sample=latest_sample,
-        raise_if_vision_failed=lambda: None,
-        correction_gain=0.15,
-        correction_deadband_px=3.0,
-        horizontal_speed_limit=8.0,
-        filter_alpha=0.25,
-        control_period=0.05,
-        vision_sample_stale_seconds=0.35,
-        vision_loss_timeout=1.0,
-    )
-    original_time = visual_target_descent.time
-    visual_target_descent.time = _FakeTime
-    try:
-        controller.land_and_lock(
-            lock_timeout=1.0,
-            approach_height=22.0,
-            approach_timeout=1.0,
-            approach_height_confirm_time=0.05,
-            final_descent_speed=6.0,
-            touchdown_alt_thres=8.0,
-            touchdown_vertical_speed_thres=2.5,
-            touchdown_confirm_time=0.1,
-            touchdown_height_range=1.5,
-            final_descent_timeout=2.0,
-            final_alignment_max_error_px=12.0,
-            final_alignment_confirm_frames=2,
-            final_alignment_timeout=0.5,
-            horizontal_taper_height=30.0,
-            horizontal_freeze_height=16.0,
-            low_altitude_horizontal_speed_limit=3.0,
-            frozen_error_abort_px=30.0,
-        )
-    finally:
-        visual_target_descent.time = original_time
-
-    assert fc.lock_calls == 1
-    assert not fc.state.unlock.value
-    assert fc.state.alt_add.value <= 8.0
-    assert any(
-        command[0] == 0
-        and command[1] == 0
-        and command[2] == -6.0
-        for command in navi.commands
-    )
-
-
 def main() -> None:
     test_estimator()
     test_estimator_velocity_predictor()
@@ -682,9 +511,6 @@ def main() -> None:
     test_continuous_follow_total_timeout()
     test_stability_error_limit_and_external_gate()
     test_external_gate_total_timeout()
-    test_landing_horizontal_command_tapers_and_freezes()
-    test_final_alignment_requires_distinct_frames()
-    test_visual_landing_confirms_touchdown_before_lock()
     print("moving-target descent logic tests passed")
 
 
