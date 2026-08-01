@@ -166,6 +166,19 @@ def build_pursuit_trajectory(
     return points
 
 
+def build_pursuit_trajectory_to_b(
+    altitude: float = 150.0,
+    arc_step_degrees: int = 10,
+) -> List[Tuple[float, float, float]]:
+    """建立仅到 B 点的追及轨迹，供任务二的 C 点补救分支使用。"""
+    points = build_pursuit_trajectory(
+        altitude=altitude,
+        arc_step_degrees=arc_step_degrees,
+    )
+    b_point = (ARC_START[0], ARC_START[1], float(altitude))
+    return points[: points.index(b_point) + 1]
+
+
 @dataclass
 class PursuitSpeedSchedule:
     """根据轨迹目标和实时位置锁存追及阶段，并给出需要切换的新速度。"""
@@ -416,6 +429,7 @@ __all__ = [
     "RoutePassGate",
     "TAKEOFF_POINT",
     "build_pursuit_trajectory",
+    "build_pursuit_trajectory_to_b",
     "land_on_target_and_confirm_lock",
     "locked_red_led_dwell",
     "retakeoff_from_moving_platform",
