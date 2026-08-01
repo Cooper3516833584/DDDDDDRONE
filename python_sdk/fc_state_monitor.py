@@ -10,14 +10,14 @@ Two connection modes are supported:
 1. Client mode (default) -- connect to an already-running FC_Server
    (e.g. server_ros.py) on the onboard computer via TCP.
    Example:
-       python python_sdk/fc_state_monitor.py
-       python python_sdk/fc_state_monitor.py --host 192.168.31.176
+       python fc_state_monitor.py
+       python fc_state_monitor.py --host 192.168.31.176
 
 2. Direct serial mode -- open the flight-controller serial port directly.
    Use this only when server_ros.py is NOT running.
    Example:
-       python python_sdk/fc_state_monitor.py --direct --fc-port COM5
-       python python_sdk/fc_state_monitor.py --direct --allow-auto-port
+       python fc_state_monitor.py --direct --fc-port COM5
+       python fc_state_monitor.py --direct --allow-auto-port
 """
 
 import argparse
