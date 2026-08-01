@@ -333,6 +333,12 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         """Maximum height at which descent-time H correction is allowed."""
         return H_LANDING_MAX_CONTROL_HEIGHT
 
+    def _h_landing_final_visual_descent_config(
+        self,
+    ) -> Optional[Tuple[float, float, float]]:
+        """Return (height, tolerance, timeout) for an optional H final descent."""
+        return None
+
     def _move_toward_h_marker(
         self,
         x_px: float,
@@ -556,8 +562,37 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         if not self.fc.state.is_fresh(0.5) or not self.fc.state.unlock.value:
             raise RuntimeError("Flight state invalid after H visual alignment")
 
+        final_visual_descent = self._h_landing_final_visual_descent_config()
+        approach_height = 35.0
+        if final_visual_descent is not None:
+            target_height, height_tolerance, timeout = final_visual_descent
+            values = (target_height, height_tolerance, timeout)
+            if (
+                not all(math.isfinite(float(value)) for value in values)
+                or target_height < H_LANDING_MIN_CONTROL_HEIGHT
+                or height_tolerance <= 0
+                or timeout <= 0
+            ):
+                raise RuntimeError("Invalid H visual final-descent configuration")
+            logger.info(
+                "[H-LAND] Continue visual correction down to {:.1f}cm",
+                target_height,
+            )
+            self.visual_descent.descend_to_height(
+                target_height=float(target_height),
+                hover_seconds=0.0,
+                base_velocity=(0.0, 0.0),
+                height_tolerance=float(height_tolerance),
+                height_confirm_time=HEIGHT_CONFIRM_SECONDS,
+                timeout=float(timeout),
+            )
+            approach_height = float(target_height)
+
         landing_point = navi.current_point
-        if not navi.pointing_landing(landing_point):
+        if not navi.pointing_landing(
+            landing_point,
+            approach_height=approach_height,
+        ):
             raise RuntimeError(
                 "Pointing landing was not confirmed after H alignment"
             )

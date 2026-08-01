@@ -92,6 +92,11 @@ TASK2_H_LANDING_FINE_ERROR_PX = 30.0
 TASK2_H_LANDING_COARSE_SPEED = 20.0
 TASK2_H_LANDING_MEDIUM_SPEED = 12.0
 TASK2_H_LANDING_FINE_SPEED = 6.0
+# Set False to hand off directly to pointing_landing after H alignment.
+TASK2_H_LANDING_FINAL_VISUAL_DESCENT_ENABLED = True
+TASK2_H_LANDING_FINAL_VISUAL_DESCENT_HEIGHT = 25.0
+TASK2_H_LANDING_FINAL_VISUAL_DESCENT_HEIGHT_TOLERANCE = 3.0
+TASK2_H_LANDING_FINAL_VISUAL_DESCENT_TIMEOUT_SECONDS = 12.0
 
 TASK2_ARC_START = (312.5, -112.5)
 TASK2_PURSUIT_DIRECT_SEGMENTS = 2
@@ -495,6 +500,17 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
 
     def _h_landing_pre_alignment_max_height(self) -> float:
         return TASK2_H_LANDING_PREALIGN_MAX_HEIGHT
+
+    def _h_landing_final_visual_descent_config(
+        self,
+    ) -> Optional[Tuple[float, float, float]]:
+        if not TASK2_H_LANDING_FINAL_VISUAL_DESCENT_ENABLED:
+            return None
+        return (
+            TASK2_H_LANDING_FINAL_VISUAL_DESCENT_HEIGHT,
+            TASK2_H_LANDING_FINAL_VISUAL_DESCENT_HEIGHT_TOLERANCE,
+            TASK2_H_LANDING_FINAL_VISUAL_DESCENT_TIMEOUT_SECONDS,
+        )
 
     def _visual_h_landing_at_takeoff(self) -> None:
         # The inherited routine reads this module constant directly.
