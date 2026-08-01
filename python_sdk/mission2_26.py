@@ -6,7 +6,7 @@
 
 起飞采用非定点垂直起飞（90 cm 一键离地后垂直爬升至 150 cm），
 该阶段垂直速度设为 30 cm/s。返航开始时切换到 H 降落点检测，
-下降至 60 cm 后以 30 像素阈值完成视觉校准，再在该点定点降落，
+下降至 75 cm 后以 30 像素阈值完成视觉校准，再在该点定点降落，
 降落阶段垂直速度设为 15 cm/s。相机全程保持开启，不重复开关。
 """
 
@@ -46,7 +46,7 @@ from visual_target_descent import PreDescentTimeoutError
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 20.0
 PURSUIT_SPEED = 35.0
-PURSUIT_APPROACH_SPEED = 15.0
+PURSUIT_APPROACH_SPEED = 20.0
 RETURN_SPEED = 30.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
@@ -68,9 +68,10 @@ TARGET_OFFSET_START_HEIGHT = 50.0
 TARGET_OFFSET_FINAL_X_PX = -30.0
 TARGET_DESCENT_TIMEOUT_SECONDS = 15.0
 TARGET_LANDING_LOCK_TIMEOUT_SECONDS = 20.0
-LOCKED_DWELL_SECONDS = 5.0
+LOCKED_DWELL_SECONDS = 3.0
 PLATFORM_RETAKEOFF_HEIGHT = 30
 PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS = 15.0
+TASK2_H_LANDING_HEIGHT = 75.0
 
 TASK2_ARC_START = (312.5, -112.5)
 TASK2_PURSUIT_DIRECT_SEGMENTS = 4
@@ -457,11 +458,14 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             hold_point,
         )
 
-        self.navi.set_yaw(0)
-        if not self.navi.wait_for_yaw():
-            raise RuntimeError(
-                "Yaw stabilization was not confirmed after platform retakeoff"
-            )
+    def _visual_h_landing_at_takeoff(self) -> None:
+        # The inherited routine reads this module constant directly.
+        original_height = descent_test.H_LANDING_HEIGHT
+        descent_test.H_LANDING_HEIGHT = TASK2_H_LANDING_HEIGHT
+        try:
+            super()._visual_h_landing_at_takeoff()
+        finally:
+            descent_test.H_LANDING_HEIGHT = original_height
 
     def _return_home_and_land(self) -> None:
         self.signals.send_return_started()
@@ -469,7 +473,11 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         self.enable_h_landing_vision()
         self.navi.set_navigation_speed(RETURN_SPEED)
         if not self.navi.navigation_to_waypoint(
-            mission_base.TAKEOFF_POINT,
+            (
+                mission_base.TAKEOFF_POINT[0],
+                mission_base.TAKEOFF_POINT[1],
+                CRUISE_HEIGHT,
+            ),
             wait=True,
         ):
             raise RuntimeError("Failed to return to initial takeoff point")

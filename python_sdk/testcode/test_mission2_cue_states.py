@@ -216,6 +216,42 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(80.0, values["ESCORT_ENTRY_PIXEL_RADIUS"])
         self.assertEqual(9.0, values["ESCORT_INITIAL_ESTIMATED_SPEED"])
         self.assertEqual(40.0, values["TARGET_DESCENT_GATE_RADIUS"])
+        self.assertEqual(20.0, values["PURSUIT_APPROACH_SPEED"])
+        self.assertEqual(3.0, values["LOCKED_DWELL_SECONDS"])
+        self.assertEqual(75.0, values["TASK2_H_LANDING_HEIGHT"])
+
+    def test_task2_h_landing_height_override_is_restored(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        method = _method(mission, "_visual_h_landing_at_takeoff")
+        extracted = ast.ClassDef(
+            name="ExtractedTask2",
+            bases=[ast.Name(id="BaseMission", ctx=ast.Load())],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        class BaseMission:
+            def _visual_h_landing_at_takeoff(self):
+                self.observed_height = descent.H_LANDING_HEIGHT
+                raise RuntimeError("alignment failed")
+
+        descent = types.SimpleNamespace(H_LANDING_HEIGHT=60.0)
+        namespace = {
+            "BaseMission": BaseMission,
+            "descent_test": descent,
+            "TASK2_H_LANDING_HEIGHT": 75.0,
+        }
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+        task = namespace["ExtractedTask2"]()
+
+        with self.assertRaisesRegex(RuntimeError, "alignment failed"):
+            task._visual_h_landing_at_takeoff()
+
+        self.assertEqual(75.0, task.observed_height)
+        self.assertEqual(60.0, descent.H_LANDING_HEIGHT)
 
     def test_escort_starts_after_arc_start_and_80px_wait(self):
         mission = _class(self.mission_tree, "Task2Mission")
@@ -428,7 +464,7 @@ class Mission2CueStateTests(unittest.TestCase):
             "TARGET_LANDING_HEIGHT": 25.0,
             "ARC_END": (237.5, -187.5),
             "TARGET_LANDING_LOCK_TIMEOUT_SECONDS": 20.0,
-            "LOCKED_DWELL_SECONDS": 5.0,
+            "LOCKED_DWELL_SECONDS": 3.0,
             "CRUISE_HEIGHT": 150.0,
             "PLATFORM_RETAKEOFF_HEIGHT": 30.0,
             "PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS": 15.0,
