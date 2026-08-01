@@ -83,10 +83,16 @@ class TargetNotFoundError(RuntimeError):
 class Mission2Signals(mission1.MissionGroundStationSignals):
     """任务二新增阶段的通信占位和 FleetBus 状态映射。"""
 
+    def send_takeoff_succeeded(self) -> None:
+        self._send(
+            "task2_cruise_height_reached",
+            mission_base.MissionOperationState.CRUISING,
+        )
+
     def send_pursuit_started(self) -> None:
         self._send(
             "task2_pursuit_started",
-            mission_base.MissionOperationState.HOVERING,
+            mission_base.MissionOperationState.CRUISING,
         )
 
     def send_target_descent_started(self) -> None:
@@ -98,7 +104,13 @@ class Mission2Signals(mission1.MissionGroundStationSignals):
     def send_target_locked(self) -> None:
         self._send(
             "task2_target_locked",
-            mission_base.MissionOperationState.HOVERING,
+            mission_base.MissionOperationState.ON_CAR,
+        )
+
+    def send_target_landing_started(self) -> None:
+        self._send(
+            "task2_target_landing_started",
+            mission_base.MissionOperationState.LANDING_ON_CAR,
         )
 
     def send_retakeoff_started(self) -> None:
@@ -110,7 +122,7 @@ class Mission2Signals(mission1.MissionGroundStationSignals):
     def send_retakeoff_succeeded(self) -> None:
         self._send(
             "task2_retakeoff_succeeded",
-            mission_base.MissionOperationState.HOVERING,
+            mission_base.MissionOperationState.CRUISING,
         )
 
 
@@ -336,6 +348,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             final_velocity[1],
         )
 
+        self.signals.send_target_landing_started()
         land_on_target_and_confirm_lock(
             self.fc,
             self.navi,

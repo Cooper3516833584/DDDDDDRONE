@@ -112,6 +112,8 @@ class MissionOperationState:
     TAKEOFF = 3
     HOVERING = 4
     ESCORTING = 5
+    LANDING_ON_CAR = 7
+    ON_CAR = 8
     RETURNING_HOME = 9
     LANDING_HOME = 10
     COMPLETED = 11
@@ -119,7 +121,7 @@ class MissionOperationState:
     FAULT = 13
     # MISSION1 only: digital output 0 is off and the payload is released.
     MISSION1_DROP_COMPLETED = 14
-    # MISSION1 only: pursuit trajectory is running before target acquisition.
+    # Pursuit or cruise-height flight before target acquisition.
     CRUISING = 15
 
 
@@ -183,6 +185,8 @@ class MissionFleetStateProvider:
             MissionOperationState.HOVERING,
             MissionOperationState.CRUISING,
             MissionOperationState.ESCORTING,
+            MissionOperationState.LANDING_ON_CAR,
+            MissionOperationState.ON_CAR,
             MissionOperationState.MISSION1_DROP_COMPLETED,
             MissionOperationState.RETURNING_HOME,
             MissionOperationState.LANDING_HOME,

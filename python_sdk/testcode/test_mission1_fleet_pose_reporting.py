@@ -222,6 +222,24 @@ class MissionFleetPoseReportingTests(unittest.TestCase):
 
         self.assertTrue(state.node_flags & int(NodeFlags.BUSY))
 
+    def test_target_landing_states_remain_busy(self):
+        for operation_state in (
+            MissionOperationState.LANDING_ON_CAR,
+            MissionOperationState.ON_CAR,
+        ):
+            provider = MissionFleetStateProvider(
+                FakeFlightController(),
+                FakeNavigation(),
+                FakeMission(
+                    pose_ready=True,
+                    operation_state=operation_state,
+                ),
+            )
+
+            state = provider()
+
+            self.assertTrue(state.node_flags & int(NodeFlags.BUSY))
+
 
 if __name__ == "__main__":
     unittest.main()
