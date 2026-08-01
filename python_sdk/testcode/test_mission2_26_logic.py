@@ -23,7 +23,6 @@ from mission2_26_logic import (  # noqa: E402
     RoutePassGate,
     TAKEOFF_POINT,
     build_pursuit_trajectory,
-    build_pursuit_trajectory_to_b,
     land_on_target_and_confirm_lock,
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
@@ -65,15 +64,6 @@ def test_pursuit_trajectory_geometry() -> None:
     assert arc_points[1][0] > arc_points[0][0]
     assert arc_points[1][1] < arc_points[0][1]
     assert trajectory[-1][0] < trajectory[-2][0]
-
-
-def test_task2_pursuit_trajectory_stops_at_b() -> None:
-    trajectory = build_pursuit_trajectory_to_b(
-        altitude=150.0,
-        arc_step_degrees=10,
-    )
-    assert trajectory[-1] == (ARC_START[0], ARC_START[1], 150.0)
-    assert (ARC_END[0], ARC_END[1], 150.0) not in trajectory
 
 
 def test_clockwise_arc_velocity_prediction() -> None:
@@ -373,7 +363,6 @@ def test_locked_red_led_dwell_and_cleanup() -> None:
 
 def main() -> None:
     test_pursuit_trajectory_geometry()
-    test_task2_pursuit_trajectory_stops_at_b()
     test_clockwise_arc_velocity_prediction()
     test_low_altitude_target_offset()
     test_escort_x_boundary_velocity_guard()

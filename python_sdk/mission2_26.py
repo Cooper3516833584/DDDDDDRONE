@@ -1,4 +1,4 @@
-"""任务二：追及、移动目标伴飞降落、平台复飞和返航。
+"""任务二：曲线追及、移动目标伴飞降落、平台复飞和返航。
 
 本入口会直连真实飞控、单雷达和相机并执行两次起飞与两次降落。运行前
 必须确认 ``server_ros.py`` 及其他 ``FC_Server`` 已关闭，并清空追及
@@ -30,13 +30,12 @@ from moving_target_descent import (
 )
 from mission2_26_logic import (
     ARC_END,
-    ARC_START,
     ClockwiseArcVelocityPredictor,
     LowAltitudeTargetOffset,
     PURSUIT_SLOWDOWN_POINT,
     PursuitSpeedSchedule,
     RoutePassGate,
-    build_pursuit_trajectory_to_b,
+    build_pursuit_trajectory,
     land_on_target_and_confirm_lock,
     locked_red_led_dwell,
     retakeoff_from_moving_platform,
@@ -53,7 +52,6 @@ PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
 RETURN_SPEED = 20.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
-C_POINT_SEARCH_TIMEOUT_SECONDS = 20.0
 ARC_VELOCITY_POSITION_TOLERANCE = 20.0
 ESCORT_MAX_X = 357.5
 
@@ -168,7 +166,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             approach_speed=PURSUIT_APPROACH_SPEED,
             after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
         )
-        self._pursuit_trajectory = build_pursuit_trajectory_to_b(
+        self._pursuit_trajectory = build_pursuit_trajectory(
             altitude=CRUISE_HEIGHT,
             arc_step_degrees=10,
         )
@@ -257,56 +255,11 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                     return float(x_px), float(y_px)
 
             if not self.navi.traj_running_event.is_set():
-                return self._wait_for_target_at_c()
+                raise TargetNotFoundError(
+                    "Pursuit trajectory finished without target detection"
+                )
             self.stop_event.wait(mission_base.ESCORT_CONTROL_PERIOD)
         raise RuntimeError("Task 2 stopped during target pursuit")
-
-    def _wait_for_target_at_c(self) -> Tuple[float, float]:
-        logger.warning(
-            "[MISSION2] Target not detected by B {}; navigate directly "
-            "to C {} and scan for up to {:.0f}s",
-            ARC_START,
-            ARC_END,
-            C_POINT_SEARCH_TIMEOUT_SECONDS,
-        )
-        if not self.navi.navigation_to_waypoint(ARC_END, wait=True):
-            raise RuntimeError("Failed to reach C for target search")
-
-        self._clear_vision_samples()
-        last_sequence = -1
-        deadline = time.monotonic() + C_POINT_SEARCH_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            if self.stop_event.is_set():
-                raise RuntimeError("Task 2 stopped during target search at C")
-            self._raise_if_vision_failed()
-            sample = self._latest_vision_sample()
-            if sample is not None and sample[0] != last_sequence:
-                sequence, captured_at, x_px, y_px = sample
-                last_sequence = sequence
-                if (
-                    time.monotonic() - captured_at
-                    <= mission_base.VISION_SAMPLE_STALE_SECONDS
-                    and x_px is not None
-                    and y_px is not None
-                    and math.isfinite(float(x_px))
-                    and math.isfinite(float(y_px))
-                    and math.hypot(float(x_px), float(y_px))
-                    < TARGET_DETECTION_PIXEL_THRESHOLD
-                ):
-                    logger.info(
-                        "[MISSION2] Target detected while waiting at C: "
-                        "x_px={:.2f}, y_px={:.2f}",
-                        x_px,
-                        y_px,
-                    )
-                    return float(x_px), float(y_px)
-            self.stop_event.wait(mission_base.ESCORT_CONTROL_PERIOD)
-
-        raise TargetNotFoundError(
-            "Target was not detected within {:.0f}s at C".format(
-                C_POINT_SEARCH_TIMEOUT_SECONDS
-            )
-        )
 
     def _follow_descend_and_land_on_target(self) -> None:
         def predict_target_velocity(
