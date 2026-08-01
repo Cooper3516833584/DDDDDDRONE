@@ -7,7 +7,8 @@
 起飞采用非定点垂直起飞（90 cm 一键离地后垂直爬升至 150 cm），
 该阶段垂直速度设为 30 cm/s。返航开始时切换到 H 降落点检测，
 下降至 75 cm 后以 30 像素阈值完成视觉校准，再在该点定点降落，
-降落阶段垂直速度设为 15 cm/s。相机全程保持开启，不重复开关。
+降落阶段垂直速度设为 15 cm/s。目标点降落低于 13 cm 持续 0.4 s
+后主动锁桨，确认锁桨 5 s 后复飞。相机全程保持开启，不重复开关。
 """
 
 import math
@@ -68,7 +69,9 @@ TARGET_OFFSET_START_HEIGHT = 50.0
 TARGET_OFFSET_FINAL_X_PX = -30.0
 TARGET_DESCENT_TIMEOUT_SECONDS = 15.0
 TARGET_LANDING_LOCK_TIMEOUT_SECONDS = 20.0
-LOCKED_DWELL_SECONDS = 3.0
+TARGET_DIRECT_LOCK_HEIGHT = 13.0
+TARGET_DIRECT_LOCK_CONFIRM_SECONDS = 0.4
+LOCKED_DWELL_SECONDS = 5.0
 PLATFORM_RETAKEOFF_HEIGHT = 30
 PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS = 15.0
 TASK2_H_LANDING_HEIGHT = 75.0
@@ -430,6 +433,8 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             self.fc,
             self.navi,
             lock_timeout=TARGET_LANDING_LOCK_TIMEOUT_SECONDS,
+            direct_lock_height=TARGET_DIRECT_LOCK_HEIGHT,
+            direct_lock_confirm_seconds=TARGET_DIRECT_LOCK_CONFIRM_SECONDS,
         )
         self.signals.send_target_locked()
         logger.info("[MISSION2] Target landing confirmed motor lock")

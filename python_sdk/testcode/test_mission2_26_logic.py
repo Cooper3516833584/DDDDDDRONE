@@ -184,6 +184,8 @@ class _FC:
         self.state = _State()
         self.takeoff_calls = []
         self.land_calls = 0
+        self.lock_calls = 0
+        self.wait_for_lock_calls = []
         self.stabilize_calls = 0
         self.led_calls = []
         self.on_hold_pos = None
@@ -217,7 +219,11 @@ class _FC:
     def land(self):
         self.land_calls += 1
 
+    def lock(self):
+        self.lock_calls += 1
+
     def wait_for_lock(self, timeout_s):
+        self.wait_for_lock_calls.append(float(timeout_s))
         self.state.unlock.value = False
         return timeout_s > 0
 
@@ -299,11 +305,15 @@ def test_target_landing_confirms_lock() -> None:
     fc = _FC()
     fc.state.unlock.value = True
     navi = _Navigation()
+    navi.current_height = 12.0
+    clock = _LandingClock()
     land_on_target_and_confirm_lock(
         fc,
         navi,
         lock_timeout=20.0,
         mode_settle_seconds=0.0,
+        clock=clock.monotonic,
+        wait=clock.wait,
     )
     assert navi.stop_here_calls == 1
     assert not navi.navigation_flag
@@ -311,7 +321,75 @@ def test_target_landing_confirms_lock() -> None:
     assert fc.state.mode.value == fc.PROGRAM_MODE
     assert fc.stabilize_calls == 1
     assert fc.land_calls == 1
+    assert fc.lock_calls == 1
+    assert len(fc.wait_for_lock_calls) == 1
+    assert clock.now >= 0.4
     assert not fc.state.unlock.value
+
+
+class _LandingClock:
+    def __init__(self, on_wait=None):
+        self.now = 0.0
+        self.on_wait = on_wait
+
+    def monotonic(self):
+        return self.now
+
+    def wait(self, seconds):
+        self.now += float(seconds)
+        if self.on_wait is not None:
+            self.on_wait(self.now)
+
+
+def test_target_landing_height_confirmation_resets() -> None:
+    fc = _FC()
+    fc.state.unlock.value = True
+    navi = _Navigation()
+    navi.current_height = 12.0
+
+    def update_height(now):
+        navi.current_height = 13.0 if 0.2 <= now < 0.3 else 12.0
+
+    clock = _LandingClock(on_wait=update_height)
+    land_on_target_and_confirm_lock(
+        fc,
+        navi,
+        lock_timeout=20.0,
+        mode_settle_seconds=0.0,
+        direct_lock_height=13.0,
+        direct_lock_confirm_seconds=0.4,
+        poll_interval=0.05,
+        clock=clock.monotonic,
+        wait=clock.wait,
+    )
+
+    assert fc.lock_calls == 1
+    assert len(fc.wait_for_lock_calls) == 1
+    assert clock.now >= 0.7
+
+
+def test_target_landing_accepts_automatic_lock() -> None:
+    fc = _FC()
+    fc.state.unlock.value = True
+    navi = _Navigation()
+    navi.current_height = 30.0
+
+    def update_lock_state(now):
+        if now >= 0.1:
+            fc.state.unlock.value = False
+
+    clock = _LandingClock(on_wait=update_lock_state)
+    land_on_target_and_confirm_lock(
+        fc,
+        navi,
+        lock_timeout=20.0,
+        mode_settle_seconds=0.0,
+        clock=clock.monotonic,
+        wait=clock.wait,
+    )
+
+    assert fc.lock_calls == 0
+    assert len(fc.wait_for_lock_calls) == 1
 
 
 class _FakeClock:
@@ -370,6 +448,8 @@ def main() -> None:
     test_route_pass_gate()
     test_platform_retakeoff_uses_live_hold_point()
     test_target_landing_confirms_lock()
+    test_target_landing_height_confirmation_resets()
+    test_target_landing_accepts_automatic_lock()
     test_locked_red_led_dwell_and_cleanup()
     print("mission2 logic tests passed")
 

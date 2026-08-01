@@ -229,8 +229,13 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(9.0, values["ESCORT_INITIAL_ESTIMATED_SPEED"])
         self.assertEqual(40.0, values["TARGET_DESCENT_GATE_RADIUS"])
         self.assertEqual(15.0, values["PURSUIT_APPROACH_SPEED"])
-        self.assertEqual(3.0, values["LOCKED_DWELL_SECONDS"])
+        self.assertEqual(5.0, values["LOCKED_DWELL_SECONDS"])
         self.assertEqual(75.0, values["TASK2_H_LANDING_HEIGHT"])
+        self.assertEqual(13.0, values["TARGET_DIRECT_LOCK_HEIGHT"])
+        self.assertEqual(
+            0.4,
+            values["TARGET_DIRECT_LOCK_CONFIRM_SECONDS"],
+        )
 
     def test_task2_h_landing_height_override_is_restored(self):
         mission = _class(self.mission_tree, "Task2Mission")
@@ -518,7 +523,9 @@ class Mission2CueStateTests(unittest.TestCase):
             "TARGET_LANDING_HEIGHT": 25.0,
             "ARC_END": (237.5, -187.5),
             "TARGET_LANDING_LOCK_TIMEOUT_SECONDS": 20.0,
-            "LOCKED_DWELL_SECONDS": 3.0,
+            "TARGET_DIRECT_LOCK_HEIGHT": 13.0,
+            "TARGET_DIRECT_LOCK_CONFIRM_SECONDS": 0.4,
+            "LOCKED_DWELL_SECONDS": 5.0,
             "CRUISE_HEIGHT": 150.0,
             "PLATFORM_RETAKEOFF_HEIGHT": 30.0,
             "PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS": 15.0,

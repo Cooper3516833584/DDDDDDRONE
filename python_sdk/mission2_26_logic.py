@@ -357,19 +357,82 @@ def land_on_target_and_confirm_lock(
     navi,
     lock_timeout: float = 20.0,
     mode_settle_seconds: float = 0.1,
+    direct_lock_height: float = 13.0,
+    direct_lock_confirm_seconds: float = 0.4,
+    poll_interval: float = 0.05,
+    clock: Optional[Callable[[], float]] = None,
+    wait: Optional[Callable[[float], None]] = None,
 ) -> None:
-    """退出导航后调用一键降落，并要求新鲜遥测确认锁桨。"""
+    """一键降落时低于门限持续指定时间则锁桨，并确认锁桨反馈。"""
+    values = (
+        lock_timeout,
+        mode_settle_seconds,
+        direct_lock_height,
+        direct_lock_confirm_seconds,
+        poll_interval,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("Target-landing lock parameters must be finite")
+    if (
+        float(lock_timeout) <= 0
+        or float(mode_settle_seconds) < 0
+        or float(direct_lock_height) < 0
+        or float(direct_lock_confirm_seconds) <= 0
+        or float(poll_interval) <= 0
+    ):
+        raise ValueError("Target-landing lock parameters are out of range")
+
+    monotonic = time.monotonic if clock is None else clock
+    wait_fn = time.sleep if wait is None else wait
     navi.navigation_stop_here()
     navi.navigation_flag = False
     navi.keep_height_flag = False
     fc.set_flight_mode(fc.PROGRAM_MODE)
     if mode_settle_seconds > 0:
-        time.sleep(float(mode_settle_seconds))
+        wait_fn(float(mode_settle_seconds))
     fc.stablize()
     fc.land()
-    if not fc.wait_for_lock(timeout_s=float(lock_timeout)):
+
+    deadline = monotonic() + float(lock_timeout)
+    below_height_since: Optional[float] = None
+    while fc.state.unlock.value:
+        now = monotonic()
+        if now >= deadline:
+            fc.land()
+            raise RuntimeError("One-key target landing did not confirm motor lock")
+
+        height_is_valid = False
+        if fc.state.is_fresh(0.5):
+            try:
+                current_height = float(navi.current_height)
+            except (TypeError, ValueError):
+                current_height = float("nan")
+            height_is_valid = math.isfinite(current_height)
+
+        if (
+            height_is_valid
+            and current_height < float(direct_lock_height)
+        ):
+            if below_height_since is None:
+                below_height_since = now
+            elif (
+                now - below_height_since
+                >= float(direct_lock_confirm_seconds)
+            ):
+                fc.lock()
+                break
+        else:
+            below_height_since = None
+
+        wait_fn(min(float(poll_interval), max(0.0, deadline - now)))
+
+    remaining_lock_timeout = max(0.0, deadline - monotonic())
+    if (
+        fc.state.unlock.value
+        and remaining_lock_timeout <= 0
+    ) or not fc.wait_for_lock(timeout_s=remaining_lock_timeout):
         fc.land()
-        raise RuntimeError("One-key target landing did not confirm motor lock")
+        raise RuntimeError("Target landing did not confirm motor lock")
     if not fc.state.is_fresh(0.5):
         raise RuntimeError(
             "Flight-controller telemetry became stale after target landing"
