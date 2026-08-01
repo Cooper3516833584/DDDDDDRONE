@@ -35,7 +35,7 @@ def build_parser():
 
 
 class SimulatedAirStateProvider:
-    """Generate a bounded circular FIELD-frame pose without touching hardware."""
+    """Generate a bounded circular node-local pose without touching hardware."""
 
     def __init__(self, state_type, node_flags):
         self._state_type = state_type
@@ -47,8 +47,10 @@ class SimulatedAirStateProvider:
         angular_rate = 0.25
         angle = angular_rate * elapsed_s
         radius_cm = 70.0
-        x_cm = 125.0 + radius_cm * math.cos(angle)
-        y_cm = 150.0 + radius_cm * math.sin(angle)
+        # The configured +90 degree frame rotation maps this local circle to a
+        # FIELD-frame circle centred on (125, 150) cm.
+        x_cm = 37.5 + radius_cm * math.cos(angle)
+        y_cm = -12.5 + radius_cm * math.sin(angle)
         vx_cm_s = -radius_cm * angular_rate * math.sin(angle)
         vy_cm_s = radius_cm * angular_rate * math.cos(angle)
         return self._state_type(
