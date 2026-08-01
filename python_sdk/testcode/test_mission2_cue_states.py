@@ -119,7 +119,7 @@ class _Navigation:
 class _ReturnNavigation:
     def __init__(self):
         self.calls = []
-        self.current_x = 287.5
+        self.current_x = 237.5
         self.current_y = -187.5
         self.navi_x_pid = types.SimpleNamespace(output_limits=None)
         self.navi_y_pid = types.SimpleNamespace(output_limits=None)
@@ -317,11 +317,11 @@ class Mission2CueStateTests(unittest.TestCase):
             ],
             task.navi.calls,
         )
-        distance = (287.5 ** 2 + 187.5 ** 2) ** 0.5
+        distance = (237.5 ** 2 + 187.5 ** 2) ** 0.5
         self.assertEqual(
             (
-                -20.0 * 287.5 / distance,
-                20.0 * 287.5 / distance,
+                -20.0 * 237.5 / distance,
+                20.0 * 237.5 / distance,
             ),
             task.navi.navi_x_pid.output_limits,
         )
@@ -341,7 +341,7 @@ class Mission2CueStateTests(unittest.TestCase):
             [
                 ("speed", 20.0),
                 ("trajectory", [(87.5, -37.5, 150.0),
-                                (287.5, -37.5, 150.0)]),
+                                (237.5, -87.5, 150.0)]),
                 ("wait", True),
             ],
             calls,
@@ -358,11 +358,11 @@ class Mission2CueStateTests(unittest.TestCase):
             [
                 ("speed", 20.0),
                 ("trajectory", [(87.5, -37.5, 150.0),
-                                (287.5, -37.5, 150.0)]),
+                                (237.5, -87.5, 150.0)]),
                 ("wait", True),
                 ("turn_velocity",),
                 ("speed", 20.0),
-                ("trajectory", [(287.5, -187.5, 100.0)]),
+                ("trajectory", [(237.5, -187.5, 100.0)]),
                 ("wait", False),
                 ("wait_at_c",),
             ],
@@ -388,8 +388,8 @@ class Mission2CueStateTests(unittest.TestCase):
         task = namespace["ExtractedTask2Search"]()
         task._fixed_route = [
             (87.5, -37.5, 150.0),
-            (287.5, -37.5, 150.0),
-            (287.5, -187.5, 100.0),
+            (237.5, -87.5, 150.0),
+            (237.5, -187.5, 100.0),
         ]
         task.navi = types.SimpleNamespace(
             set_navigation_speed=lambda speed: calls.append(("speed", speed))

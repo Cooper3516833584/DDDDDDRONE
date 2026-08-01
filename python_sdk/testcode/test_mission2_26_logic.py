@@ -83,26 +83,26 @@ def test_task2_fixed_route_geometry() -> None:
 def test_task2_deceleration_speed() -> None:
     assert task2_deceleration_speed(200.0) == 20.0
     assert task2_deceleration_speed(207.5) == 20.0
-    assert task2_deceleration_speed(247.5) == 12.5
-    assert task2_deceleration_speed(287.5) == 5.0
-    assert task2_deceleration_speed(300.0) == 5.0
+    assert task2_deceleration_speed(222.5) == 12.5
+    assert task2_deceleration_speed(237.5) == 5.0
+    assert task2_deceleration_speed(250.0) == 5.0
 
 
 def test_non_positive_x_velocity_confirmation() -> None:
     confirmation = NonPositiveXVelocityConfirmation(confirm_seconds=0.2)
-    assert not confirmation.update(0.0, 287.5, 1.0)
-    assert not confirmation.update(0.2, 287.5, 0.0)
-    assert confirmation.update(0.4, 287.5, -0.1)
+    assert not confirmation.update(0.0, 237.5, 1.0)
+    assert not confirmation.update(0.2, 237.5, 0.0)
+    assert confirmation.update(0.4, 237.5, -0.1)
 
-    assert not confirmation.update(0.5, 279.9, -0.1)
-    assert not confirmation.update(0.6, 287.5, -0.1)
-    assert confirmation.update(0.8, 287.5, 0.0)
+    assert not confirmation.update(0.5, 229.9, -0.1)
+    assert not confirmation.update(0.6, 237.5, -0.1)
+    assert confirmation.update(0.8, 237.5, 0.0)
 
 
 def test_task2_c_point_pass_gate() -> None:
     gate = Task2CPointPassGate()
-    assert not gate.update(287.5, -187.4)
-    assert gate.update(287.5, -187.5)
+    assert not gate.update(237.5, -187.4)
+    assert gate.update(237.5, -187.5)
     assert gate.update(0.0, 0.0)
 
 
