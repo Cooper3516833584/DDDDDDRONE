@@ -111,6 +111,18 @@ class _Navigation:
         return True
 
 
+class _ReturnNavigation:
+    def __init__(self):
+        self.calls = []
+
+    def set_navigation_speed(self, speed):
+        self.calls.append(("set_navigation_speed", speed))
+
+    def navigation_to_waypoint(self, point, wait=True):
+        self.calls.append(("navigation_to_waypoint", tuple(point), wait))
+        return True
+
+
 class _Logger:
     def __getattr__(self, _name):
         return lambda *_args, **_kwargs: None
@@ -216,7 +228,7 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(80.0, values["ESCORT_ENTRY_PIXEL_RADIUS"])
         self.assertEqual(9.0, values["ESCORT_INITIAL_ESTIMATED_SPEED"])
         self.assertEqual(40.0, values["TARGET_DESCENT_GATE_RADIUS"])
-        self.assertEqual(20.0, values["PURSUIT_APPROACH_SPEED"])
+        self.assertEqual(15.0, values["PURSUIT_APPROACH_SPEED"])
         self.assertEqual(3.0, values["LOCKED_DWELL_SECONDS"])
         self.assertEqual(75.0, values["TASK2_H_LANDING_HEIGHT"])
 
@@ -439,6 +451,48 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertLess(
             events.index("target_locked"),
             events.index("retakeoff_started"),
+        )
+
+    def test_return_uses_cruise_height_takeoff_waypoint(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        method = _method(mission, "_return_home_and_land")
+        extracted = ast.ClassDef(
+            name="ExtractedTask2",
+            bases=[],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "RETURN_SPEED": 30.0,
+            "CRUISE_HEIGHT": 150.0,
+            "mission_base": types.SimpleNamespace(TAKEOFF_POINT=(0.0, 0.0)),
+        }
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+
+        task = namespace["ExtractedTask2"]()
+        task.navi = _ReturnNavigation()
+        task.signals = types.SimpleNamespace(
+            send_return_started=lambda: None,
+            send_landing_started=lambda: None,
+        )
+        task.enable_h_landing_vision = lambda: None
+        task._visual_h_landing_at_takeoff = lambda: None
+
+        task._return_home_and_land()
+
+        self.assertEqual(
+            [
+                ("set_navigation_speed", 30.0),
+                (
+                    "navigation_to_waypoint",
+                    (0.0, 0.0, 150.0),
+                    True,
+                ),
+            ],
+            task.navi.calls,
         )
 
     def _build_extracted_task(self, events, landing_function):
