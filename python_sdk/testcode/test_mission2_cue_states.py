@@ -114,29 +114,13 @@ class _Navigation:
 class _ReturnNavigation:
     def __init__(self):
         self.calls = []
-        self.current_x = 237.5
-        self.current_y = -187.5
-        self.navi_x_pid = types.SimpleNamespace(output_limits=None)
-        self.navi_y_pid = types.SimpleNamespace(output_limits=None)
 
     def set_navigation_speed(self, speed):
         self.calls.append(("set_navigation_speed", speed))
 
-    def switch_pid(self, name):
-        self.calls.append(("switch_pid", name))
-
-    def direct_set_waypoint(self, point):
-        self.calls.append(("direct_set_waypoint", tuple(point)))
-
-    def wait_for_waypoint(self, **kwargs):
-        self.calls.append(("wait_for_waypoint", kwargs))
+    def navigation_to_waypoint(self, point, wait=True):
+        self.calls.append(("navigation_to_waypoint", tuple(point), wait))
         return True
-
-    @staticmethod
-    def navigation_to_waypoint(*_args, **_kwargs):
-        raise AssertionError(
-            "Task 2 return must not generate an intermediate trajectory"
-        )
 
 
 class _Logger:
@@ -246,6 +230,47 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(80.0, values["ESCORT_ENTRY_PIXEL_RADIUS"])
         self.assertEqual(9.0, values["ESCORT_INITIAL_ESTIMATED_SPEED"])
         self.assertEqual(40.0, values["TARGET_DESCENT_GATE_RADIUS"])
+        self.assertEqual(15.0, values["PURSUIT_APPROACH_SPEED"])
+        self.assertEqual(5.0, values["LOCKED_DWELL_SECONDS"])
+        self.assertEqual(75.0, values["TASK2_H_LANDING_HEIGHT"])
+        self.assertEqual(13.0, values["TARGET_DIRECT_LOCK_HEIGHT"])
+        self.assertEqual(
+            0.4,
+            values["TARGET_DIRECT_LOCK_CONFIRM_SECONDS"],
+        )
+
+    def test_task2_h_landing_height_override_is_restored(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        method = _method(mission, "_visual_h_landing_at_takeoff")
+        extracted = ast.ClassDef(
+            name="ExtractedTask2",
+            bases=[ast.Name(id="BaseMission", ctx=ast.Load())],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        class BaseMission:
+            def _visual_h_landing_at_takeoff(self):
+                self.observed_height = descent.H_LANDING_HEIGHT
+                raise RuntimeError("alignment failed")
+
+        descent = types.SimpleNamespace(H_LANDING_HEIGHT=60.0)
+        namespace = {
+            "BaseMission": BaseMission,
+            "descent_test": descent,
+            "TASK2_H_LANDING_HEIGHT": 75.0,
+        }
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+        task = namespace["ExtractedTask2"]()
+
+        with self.assertRaisesRegex(RuntimeError, "alignment failed"):
+            task._visual_h_landing_at_takeoff()
+
+        self.assertEqual(75.0, task.observed_height)
+        self.assertEqual(60.0, descent.H_LANDING_HEIGHT)
 
     def test_escort_starts_after_arc_start_and_80px_wait(self):
         mission = _class(self.mission_tree, "Task2Mission")
@@ -435,7 +460,7 @@ class Mission2CueStateTests(unittest.TestCase):
             events.index("retakeoff_started"),
         )
 
-    def test_return_uses_one_fixed_takeoff_waypoint(self):
+    def test_return_uses_cruise_height_takeoff_waypoint(self):
         mission = _class(self.mission_tree, "Task2Mission")
         method = _method(mission, "_return_home_and_land")
         extracted = ast.ClassDef(
@@ -449,27 +474,7 @@ class Mission2CueStateTests(unittest.TestCase):
         ast.fix_missing_locations(module)
         namespace = {
             "RETURN_SPEED": 30.0,
-            "RETURN_POSITION_THRESHOLD": 10.0,
-            "RETURN_SETTLE_SECONDS": 0.5,
-            "RETURN_TIMEOUT_SECONDS": 45.0,
-            "straight_return_axis_limits": (
-                lambda current_x, current_y, target_x, target_y, speed: (
-                    speed
-                    * abs(target_x - current_x)
-                    / math.hypot(
-                        target_x - current_x,
-                        target_y - current_y,
-                    ),
-                    speed
-                    * abs(target_y - current_y)
-                    / math.hypot(
-                        target_x - current_x,
-                        target_y - current_y,
-                    ),
-                )
-            ),
-            "math": math,
-            "logger": _Logger(),
+            "CRUISE_HEIGHT": 150.0,
             "mission_base": types.SimpleNamespace(TAKEOFF_POINT=(0.0, 0.0)),
         }
         exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
@@ -488,34 +493,13 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(
             [
                 ("set_navigation_speed", 30.0),
-                ("switch_pid", "navi"),
-                ("direct_set_waypoint", (0.0, 0.0)),
                 (
-                    "wait_for_waypoint",
-                    {
-                        "time_thres": 0.5,
-                        "pos_thres": 10.0,
-                        "timeout": 45.0,
-                    },
+                    "navigation_to_waypoint",
+                    (0.0, 0.0, 150.0),
+                    True,
                 ),
-                ("set_navigation_speed", 30.0),
             ],
             task.navi.calls,
-        )
-        distance = math.hypot(237.5, 187.5)
-        self.assertEqual(
-            (
-                -30.0 * 237.5 / distance,
-                30.0 * 237.5 / distance,
-            ),
-            task.navi.navi_x_pid.output_limits,
-        )
-        self.assertEqual(
-            (
-                -30.0 * 187.5 / distance,
-                30.0 * 187.5 / distance,
-            ),
-            task.navi.navi_y_pid.output_limits,
         )
 
     def _build_extracted_task(self, events, landing_function):
@@ -541,6 +525,8 @@ class Mission2CueStateTests(unittest.TestCase):
             "TARGET_LANDING_HEIGHT": 25.0,
             "ARC_END": (237.5, -187.5),
             "TARGET_LANDING_LOCK_TIMEOUT_SECONDS": 20.0,
+            "TARGET_DIRECT_LOCK_HEIGHT": 13.0,
+            "TARGET_DIRECT_LOCK_CONFIRM_SECONDS": 0.4,
             "LOCKED_DWELL_SECONDS": 5.0,
             "CRUISE_HEIGHT": 150.0,
             "PLATFORM_RETAKEOFF_HEIGHT": 30.0,
