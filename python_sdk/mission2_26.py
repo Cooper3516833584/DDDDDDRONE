@@ -81,6 +81,7 @@ PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS = 15.0
 RETAKEOFF_SUCCEEDED_STATE_HOLD_SECONDS = 1.0
 TASK2_H_LANDING_HEIGHT = 30.0
 TASK2_H_LANDING_HEIGHT_TOLERANCE = 5.0
+TASK2_H_LANDING_VERTICAL_SPEED = 25.0
 TASK2_H_LANDING_ALIGNMENT_TIMEOUT_SECONDS = 8.0
 TASK2_H_LANDING_MAX_CONTROL_HEIGHT = 90.0
 
@@ -477,6 +478,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
     def _visual_h_landing_at_takeoff(self) -> None:
         # The inherited routine reads this module constant directly.
         original_height = descent_test.H_LANDING_HEIGHT
+        original_vertical_speed = descent_test.H_LANDING_VERTICAL_SPEED
         original_max_control_height = (
             descent_test.H_LANDING_MAX_CONTROL_HEIGHT
         )
@@ -491,6 +493,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         descent_test.H_LANDING_HEIGHT_TOLERANCE = (
             TASK2_H_LANDING_HEIGHT_TOLERANCE
         )
+        descent_test.H_LANDING_VERTICAL_SPEED = TASK2_H_LANDING_VERTICAL_SPEED
         descent_test.H_LANDING_ALIGNMENT_TIMEOUT = (
             TASK2_H_LANDING_ALIGNMENT_TIMEOUT_SECONDS
         )
@@ -502,6 +505,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             super()._visual_h_landing_at_takeoff()
         finally:
             descent_test.H_LANDING_HEIGHT = original_height
+            descent_test.H_LANDING_VERTICAL_SPEED = original_vertical_speed
             descent_test.H_LANDING_HEIGHT_TOLERANCE = original_height_tolerance
             descent_test.H_LANDING_ALIGNMENT_TIMEOUT = original_alignment_timeout
             descent_test.H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING = (
