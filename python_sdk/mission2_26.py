@@ -27,14 +27,13 @@ import mission1_26_visual_descent_test as descent_test
 from moving_target_descent import (
     MovingTargetDescentConfig,
     MovingTargetDescentController,
+    TargetVelocityEstimator,
 )
 from mission2_26_logic import (
     ARC_CENTER,
     ARC_END,
-    ARC_RADIUS,
     ClockwiseArcVelocityPredictor,
     LowAltitudeTargetOffset,
-    ROUTE_END,
     RoutePassGate,
     TAKEOFF_POINT,
     land_on_target_and_confirm_lock,
@@ -48,19 +47,22 @@ CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 20.0
 PURSUIT_SPEED = 35.0
 PURSUIT_APPROACH_SPEED = 15.0
-PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
 RETURN_SPEED = 30.0
 PURSUIT_POSITION_THRESHOLD = 7.5
 TARGET_DETECTION_PIXEL_THRESHOLD = 30.0
+ESCORT_ENTRY_PIXEL_RADIUS = 80.0
 ARC_VELOCITY_POSITION_TOLERANCE = 20.0
 
-ESCORT_SPEED_MIDPOINT = 12.0
+ESCORT_INITIAL_ESTIMATED_SPEED = 9.0
 ESCORT_STABLE_SECONDS = 3.0
 ESCORT_STABLE_TIMEOUT_SECONDS = 90.0
-# 任务二专用：保留 12cm/s 初始估计，估计器合速度最多 15cm/s，
+# 任务二专用：使用 9cm/s 初始估计，估计器合速度最多 15cm/s，
 # 视觉控制实际输出最多 20cm/s。任务一仍使用共享默认配置。
 TASK2_ESTIMATOR_SPEED_LIMIT = 15.0
 TASK2_OUTPUT_SPEED_LIMIT = 20.0
+TARGET_WAIT_TIMEOUT_SECONDS = 60.0
+TARGET_DESCENT_GATE_RADIUS = 40.0
+TARGET_DESCENT_INTERMEDIATE_HEIGHT = 100.0
 TARGET_LANDING_HEIGHT = 25.0
 TARGET_OFFSET_START_HEIGHT = 50.0
 TARGET_OFFSET_FINAL_X_PX = -30.0
@@ -76,17 +78,11 @@ TASK2_PURSUIT_DIRECT_SEGMENTS = 4
 
 def build_task2_pursuit_trajectory(
     altitude: float,
-    arc_step_degrees: int = 10,
 ) -> List[Tuple[float, float, float]]:
-    """Build the task-2 straight approach and clockwise 90-degree arc."""
+    """Build the task-2 straight approach from takeoff to the arc start."""
     altitude = float(altitude)
-    arc_step_degrees = int(arc_step_degrees)
     if not math.isfinite(altitude):
         raise ValueError("altitude must be finite")
-    if arc_step_degrees <= 0 or 90 % arc_step_degrees:
-        raise ValueError(
-            "arc_step_degrees must be a positive divisor of 90"
-        )
 
     points = [(TAKEOFF_POINT[0], TAKEOFF_POINT[1], altitude)]
     for segment in range(1, TASK2_PURSUIT_DIRECT_SEGMENTS + 1):
@@ -101,21 +97,6 @@ def build_task2_pursuit_trajectory(
             )
         )
     points[-1] = (TASK2_ARC_START[0], TASK2_ARC_START[1], altitude)
-    for angle_degrees in range(
-        -arc_step_degrees,
-        -91,
-        -arc_step_degrees,
-    ):
-        angle = math.radians(float(angle_degrees))
-        points.append(
-            (
-                float(ARC_CENTER[0] + ARC_RADIUS * math.cos(angle)),
-                float(ARC_CENTER[1] + ARC_RADIUS * math.sin(angle)),
-                altitude,
-            )
-        )
-    points[-1] = (ARC_END[0], ARC_END[1], altitude)
-    points.append((ROUTE_END[0], ROUTE_END[1], altitude))
     return points
 
 
@@ -190,7 +171,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                 horizontal_command_limit=TASK2_OUTPUT_SPEED_LIMIT,
             ),
         )
-        self._route_gate = RoutePassGate(radius=PURSUIT_POSITION_THRESHOLD)
+        self._route_gate = RoutePassGate(radius=TARGET_DESCENT_GATE_RADIUS)
         self._arc_velocity_predictor = ClockwiseArcVelocityPredictor(
             start=TASK2_ARC_START,
             position_tolerance=ARC_VELOCITY_POSITION_TOLERANCE,
@@ -201,10 +182,23 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             final_x_px=TARGET_OFFSET_FINAL_X_PX,
             final_y_px=0.0,
         )
+        self._target_wait_estimator = TargetVelocityEstimator(
+            integral_gain=(
+                self.moving_target_descent.config.estimator_integral_gain
+            ),
+            deadband_px=(
+                self.moving_target_descent.config.estimator_deadband_px
+            ),
+            speed_limit=(
+                self.moving_target_descent.config.estimator_speed_limit
+            ),
+            max_sample_dt=(
+                self.moving_target_descent.config.estimator_max_sample_dt
+            ),
+        )
         self._pursuit_speed_stage = 0
         self._pursuit_trajectory = build_task2_pursuit_trajectory(
             altitude=CRUISE_HEIGHT,
-            arc_step_degrees=10,
         )
         self._platform_retakeoff_hold_point: Optional[
             Tuple[float, float]
@@ -251,16 +245,6 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         if self._pursuit_speed_stage == 0 and current_x > ARC_CENTER[0]:
             self._pursuit_speed_stage = 1
             new_speed = PURSUIT_APPROACH_SPEED
-        if (
-            self._pursuit_speed_stage == 1
-            and math.hypot(
-                current_x - TASK2_ARC_START[0],
-                current_y - TASK2_ARC_START[1],
-            )
-            <= PURSUIT_POSITION_THRESHOLD
-        ):
-            self._pursuit_speed_stage = 2
-            new_speed = PURSUIT_AFTER_SLOWDOWN_SPEED
         if new_speed is None:
             return
         self.navi.set_navigation_speed(new_speed)
@@ -275,14 +259,56 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             target_y,
         )
 
-    def _wait_until_target_detected_on_trajectory(
-        self,
-    ) -> Tuple[float, float]:
-        last_sequence = -1
-        while not self.stop_event.is_set():
+    def _wait_for_pursuit_to_arc_start(self) -> None:
+        while self.navi.traj_running_event.is_set():
+            if self.stop_event.is_set():
+                raise RuntimeError("Task 2 stopped during straight pursuit")
             self._update_pursuit_speed()
-            route_complete = self._route_gate_is_open()
+            self.stop_event.wait(mission_base.ESCORT_CONTROL_PERIOD)
+
+        current_x = float(self.navi.current_x)
+        current_y = float(self.navi.current_y)
+        distance = math.hypot(
+            current_x - TASK2_ARC_START[0],
+            current_y - TASK2_ARC_START[1],
+        )
+        if not math.isfinite(distance) or distance > PURSUIT_POSITION_THRESHOLD:
+            raise TargetNotFoundError(
+                "Straight pursuit ended before reaching the arc start"
+            )
+        self.navi.switch_pid("hover")
+        logger.info(
+            "[MISSION2] Reached arc start {}; hovering at ({:.1f}, {:.1f})cm",
+            TASK2_ARC_START,
+            current_x,
+            current_y,
+        )
+
+    def _wait_for_target_to_enter_escort_radius(self) -> Tuple[float, float]:
+        self._clear_vision_samples()
+        self._target_wait_estimator.reset(
+            (ESCORT_INITIAL_ESTIMATED_SPEED, 0.0)
+        )
+        logger.info(
+            "[MISSION2] Hovering at arc start; waiting up to {:.0f}s "
+            "for target to enter {:.0f}px radius",
+            TARGET_WAIT_TIMEOUT_SECONDS,
+            ESCORT_ENTRY_PIXEL_RADIUS,
+        )
+        last_sequence = -1
+        last_captured_at: Optional[float] = None
+        target_seen = False
+        deadline = time.monotonic() + TARGET_WAIT_TIMEOUT_SECONDS
+        while not self.stop_event.is_set():
             self._raise_if_vision_failed()
+            if (
+                not self.fc.state.is_fresh(0.5)
+                or not self.fc.state.unlock.value
+                or not self.navi.pose_is_fresh()
+            ):
+                raise RuntimeError(
+                    "Flight state became invalid while waiting for target"
+                )
             sample = self._latest_vision_sample()
             if sample is not None and sample[0] != last_sequence:
                 sequence, captured_at, x_px, y_px = sample
@@ -294,27 +320,53 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                     and y_px is not None
                     and math.isfinite(float(x_px))
                     and math.isfinite(float(y_px))
-                    and math.hypot(float(x_px), float(y_px))
-                    < TARGET_DETECTION_PIXEL_THRESHOLD
-                    and route_complete
                 ):
-                    self._stop_pursuit_trajectory()
-                    logger.info(
-                        "[MISSION2] Target detected during pursuit: "
-                        "x_px={:.2f}, y_px={:.2f}",
+                    x_px = float(x_px)
+                    y_px = float(y_px)
+                    sample_dt = (
+                        0.0
+                        if last_captured_at is None
+                        else max(0.0, captured_at - last_captured_at)
+                    )
+                    last_captured_at = captured_at
+                    estimated_velocity = self._target_wait_estimator.update(
                         x_px,
                         y_px,
+                        sample_dt,
                     )
-                    return float(x_px), float(y_px)
+                    if not target_seen:
+                        target_seen = True
+                        logger.info(
+                            "[MISSION2] Target appeared; start velocity "
+                            "convergence from {:.1f}cm/s",
+                            ESCORT_INITIAL_ESTIMATED_SPEED,
+                        )
+                    distance_px = math.hypot(x_px, y_px)
+                    if distance_px <= ESCORT_ENTRY_PIXEL_RADIUS:
+                        logger.info(
+                            "[MISSION2] Target entered {:.0f}px escort radius: "
+                            "distance={:.1f}px, estimated velocity="
+                            "({:.2f}, {:.2f})cm/s",
+                            ESCORT_ENTRY_PIXEL_RADIUS,
+                            distance_px,
+                            estimated_velocity[0],
+                            estimated_velocity[1],
+                        )
+                        return estimated_velocity
 
-            if not self.navi.traj_running_event.is_set():
+            if time.monotonic() >= deadline:
                 raise TargetNotFoundError(
-                    "Pursuit trajectory finished without target detection"
+                    "Target did not enter escort radius within {:.0f}s".format(
+                        TARGET_WAIT_TIMEOUT_SECONDS
+                    )
                 )
             self.stop_event.wait(mission_base.ESCORT_CONTROL_PERIOD)
-        raise RuntimeError("Task 2 stopped during target pursuit")
+        raise RuntimeError("Task 2 stopped while waiting for target")
 
-    def _follow_descend_and_land_on_target(self) -> None:
+    def _follow_descend_and_land_on_target(
+        self,
+        initial_target_velocity: Tuple[float, float],
+    ) -> None:
         def predict_target_velocity(
             velocity: Tuple[float, float],
             sample_dt: float,
@@ -326,19 +378,44 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                 self.navi.current_y,
             )
 
-        # 连续伴飞 3 秒后直接执行单段视觉下降，不再等待位置门控。
-        final_velocity = self.moving_target_descent.follow_and_descend(
-            target_height=TARGET_LANDING_HEIGHT,
+        # 第一段：进入 80px 圈后伴飞，连续满足原稳定条件 3 秒再下降。
+        self.moving_target_descent.follow_and_descend(
+            target_height=TARGET_DESCENT_INTERMEDIATE_HEIGHT,
             stabilize_seconds=ESCORT_STABLE_SECONDS,
             stabilize_timeout=ESCORT_STABLE_TIMEOUT_SECONDS,
             hover_seconds=0.0,
-            initial_target_velocity=(ESCORT_SPEED_MIDPOINT, 0.0),
+            initial_target_velocity=initial_target_velocity,
             height_tolerance=descent_test.HEIGHT_TOLERANCE,
             height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
             descent_timeout=TARGET_DESCENT_TIMEOUT_SECONDS,
             on_descent_start=self.signals.send_target_descent_started,
+            pre_descent_max_error_px=TARGET_DETECTION_PIXEL_THRESHOLD,
+            velocity_predictor=predict_target_velocity,
+        )
+        logger.info(
+            "[MISSION2] Reached intermediate height {:.0f}cm; "
+            "continue escort until route gate near {}",
+            TARGET_DESCENT_INTERMEDIATE_HEIGHT,
+            ARC_END,
+        )
+
+        # 第二段：圆弧终点 40cm 范围内且 x<237.5 后继续下降。
+        final_velocity = self.moving_target_descent.follow_and_descend(
+            target_height=TARGET_LANDING_HEIGHT,
+            stabilize_seconds=0.0,
+            stabilize_timeout=ESCORT_STABLE_TIMEOUT_SECONDS,
+            hover_seconds=0.0,
+            initial_target_velocity=(
+                self.moving_target_descent.estimated_target_velocity
+            ),
+            height_tolerance=descent_test.HEIGHT_TOLERANCE,
+            height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
+            descent_timeout=TARGET_DESCENT_TIMEOUT_SECONDS,
+            pre_descent_gate=self._route_gate_is_open,
+            pre_descent_max_error_px=TARGET_DETECTION_PIXEL_THRESHOLD,
             velocity_predictor=predict_target_velocity,
             target_offset_provider=self._low_altitude_target_offset.offset,
+            reset_estimator=False,
         )
         logger.info(
             "[MISSION2] Reached target landing height; estimated target "
@@ -515,19 +592,22 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
         self.signals.send_pursuit_started()
         logger.info(
             "[MISSION2] Pursuit trajectory started with {} points; "
-            "speed {}cm/s, then {}cm/s after x>237.5cm, then "
-            "{}cm/s on 90-degree arc from {}",
+            "straight to {}, speed {}cm/s, then {}cm/s after x>237.5cm",
             len(self._pursuit_trajectory),
+            TASK2_ARC_START,
             PURSUIT_SPEED,
             PURSUIT_APPROACH_SPEED,
-            PURSUIT_AFTER_SLOWDOWN_SPEED,
-            TASK2_ARC_START,
         )
 
         try:
-            self._wait_until_target_detected_on_trajectory()
+            self._wait_for_pursuit_to_arc_start()
+            initial_target_velocity = (
+                self._wait_for_target_to_enter_escort_radius()
+            )
             self.signals.send_escort_started()
-            self._follow_descend_and_land_on_target()
+            self._follow_descend_and_land_on_target(
+                initial_target_velocity
+            )
         except (TargetNotFoundError, PreDescentTimeoutError) as exc:
             self._recover_home_after_expected_failure(str(exc))
             raise RuntimeError(

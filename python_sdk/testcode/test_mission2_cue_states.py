@@ -3,7 +3,7 @@ import math
 import types
 import unittest
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 SDK_DIR = Path(__file__).resolve().parents[1]
@@ -73,6 +73,8 @@ class _Signals:
 
 
 class _Descent:
+    estimated_target_velocity = (9.0, 0.0)
+
     def __init__(self):
         self.calls = []
 
@@ -81,7 +83,7 @@ class _Descent:
         callback = kwargs.get("on_descent_start")
         if callback is not None:
             callback()
-        return (12.0, 0.0)
+        return (9.0, 0.0)
 
 
 class _Predictor:
@@ -174,7 +176,7 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(8, values["ON_CAR"])
         self.assertEqual(15, values["CRUISING"])
 
-    def test_task2_route_is_local_straight_then_90_degree_arc(self):
+    def test_task2_route_is_local_straight_to_arc_start(self):
         function = next(
             node
             for node in self.mission_tree.body
@@ -188,62 +190,148 @@ class Mission2CueStateTests(unittest.TestCase):
             "TAKEOFF_POINT": (0.0, 0.0),
             "TASK2_ARC_START": (312.5, -112.5),
             "TASK2_PURSUIT_DIRECT_SEGMENTS": 4,
-            "ARC_CENTER": (237.5, -112.5),
-            "ARC_RADIUS": 75.0,
-            "ARC_END": (237.5, -187.5),
-            "ROUTE_END": (87.5, -187.5),
         }
         module = ast.Module(body=[function], type_ignores=[])
         ast.fix_missing_locations(module)
         exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
-        trajectory = namespace["build_task2_pursuit_trajectory"](150.0, 10)
+        trajectory = namespace["build_task2_pursuit_trajectory"](150.0)
 
-        direct = trajectory[:5]
+        direct = trajectory
+        self.assertEqual(5, len(direct))
         self.assertEqual((0.0, 0.0, 150.0), direct[0])
         self.assertEqual((312.5, -112.5, 150.0), direct[-1])
         slope = -112.5 / 312.5
         for x, y, _height in direct[1:]:
             self.assertTrue(math.isclose(y / x, slope, abs_tol=1e-9))
 
-        arc = trajectory[4:-1]
-        self.assertEqual(10, len(arc))
-        self.assertEqual((237.5, -187.5, 150.0), arc[-1])
-        for x, y, _height in arc:
-            self.assertTrue(
-                math.isclose(
-                    math.hypot(x - 237.5, y + 112.5),
-                    75.0,
-                    abs_tol=1e-9,
-                )
-            )
+    def test_target_wait_and_escort_thresholds(self):
+        values = {
+            target.id: ast.literal_eval(node.value)
+            for node in self.mission_tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        self.assertEqual(60.0, values["TARGET_WAIT_TIMEOUT_SECONDS"])
+        self.assertEqual(80.0, values["ESCORT_ENTRY_PIXEL_RADIUS"])
+        self.assertEqual(9.0, values["ESCORT_INITIAL_ESTIMATED_SPEED"])
+        self.assertEqual(40.0, values["TARGET_DESCENT_GATE_RADIUS"])
 
-    def test_target_detection_waits_until_the_arc_is_complete(self):
+    def test_escort_starts_after_arc_start_and_80px_wait(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        run = _method(mission, "run")
+        calls = {
+            _call_name(node): node.lineno
+            for node in ast.walk(run)
+            if isinstance(node, ast.Call)
+            and _call_name(node)
+            in {
+                "_wait_for_pursuit_to_arc_start",
+                "_wait_for_target_to_enter_escort_radius",
+                "send_escort_started",
+                "_follow_descend_and_land_on_target",
+            }
+        }
+        self.assertLess(
+            calls["_wait_for_pursuit_to_arc_start"],
+            calls["_wait_for_target_to_enter_escort_radius"],
+        )
+        self.assertLess(
+            calls["_wait_for_target_to_enter_escort_radius"],
+            calls["send_escort_started"],
+        )
+        self.assertLess(
+            calls["send_escort_started"],
+            calls["_follow_descend_and_land_on_target"],
+        )
+
+    def test_target_wait_estimates_before_entering_80px_radius(self):
         mission = _class(self.mission_tree, "Task2Mission")
         method = _method(
             mission,
-            "_wait_until_target_detected_on_trajectory",
+            "_wait_for_target_to_enter_escort_radius",
         )
-        detection_ifs = [
-            node
-            for node in ast.walk(method)
-            if isinstance(node, ast.If)
-            and any(
-                isinstance(child, ast.Call)
-                and _call_name(child) == "_stop_pursuit_trajectory"
-                for child in ast.walk(node)
-            )
-        ]
-        self.assertTrue(
-            any(
-                "route_complete"
-                in {
-                    child.id
-                    for child in ast.walk(detection_if.test)
-                    if isinstance(child, ast.Name)
-                }
-                for detection_if in detection_ifs
+        extracted = ast.ClassDef(
+            name="ExtractedTargetWait",
+            bases=[],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        class StopEvent:
+            @staticmethod
+            def is_set():
+                return False
+
+            @staticmethod
+            def wait(seconds):
+                FakeTime.now += float(seconds)
+
+        class Estimator:
+            def __init__(self):
+                self.reset_value = None
+                self.updates = []
+
+            def reset(self, value):
+                self.reset_value = value
+
+            def update(self, x_px, y_px, sample_dt):
+                self.updates.append((x_px, y_px, sample_dt))
+                return 9.0, 0.0
+
+        namespace = {
+            "Optional": Optional,
+            "Tuple": Tuple,
+            "math": math,
+            "time": FakeTime,
+            "logger": _Logger(),
+            "ESCORT_INITIAL_ESTIMATED_SPEED": 9.0,
+            "TARGET_WAIT_TIMEOUT_SECONDS": 60.0,
+            "ESCORT_ENTRY_PIXEL_RADIUS": 80.0,
+            "TargetNotFoundError": RuntimeError,
+            "mission_base": types.SimpleNamespace(
+                VISION_SAMPLE_STALE_SECONDS=0.35,
+                ESCORT_CONTROL_PERIOD=0.05,
+            ),
+        }
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+        task = namespace["ExtractedTargetWait"]()
+        task.stop_event = StopEvent()
+        task._target_wait_estimator = Estimator()
+        task._clear_vision_samples = lambda: None
+        task._raise_if_vision_failed = lambda: None
+        task.fc = types.SimpleNamespace(
+            state=types.SimpleNamespace(
+                is_fresh=lambda _age: True,
+                unlock=types.SimpleNamespace(value=True),
             )
         )
+        task.navi = types.SimpleNamespace(pose_is_fresh=lambda: True)
+        samples = iter(
+            [
+                (1, 0.0, 100.0, 0.0),
+                (2, 0.05, 79.0, 0.0),
+            ]
+        )
+        task._latest_vision_sample = lambda: next(samples)
+
+        velocity = task._wait_for_target_to_enter_escort_radius()
+
+        self.assertEqual((9.0, 0.0), velocity)
+        self.assertEqual((9.0, 0.0), task._target_wait_estimator.reset_value)
+        self.assertEqual(2, len(task._target_wait_estimator.updates))
+        self.assertEqual(100.0, task._target_wait_estimator.updates[0][0])
+        self.assertEqual(79.0, task._target_wait_estimator.updates[1][0])
 
     def test_landing_reports_bracket_confirmed_lock(self):
         mission = _class(self.mission_tree, "Task2Mission")
@@ -281,7 +369,7 @@ class Mission2CueStateTests(unittest.TestCase):
         task = self._build_extracted_task(events, fail_landing)
 
         with self.assertRaises(RuntimeError):
-            task._follow_descend_and_land_on_target()
+            task._follow_descend_and_land_on_target((9.0, 0.0))
 
         self.assertLess(events.index("landing_started"), events.index("land"))
         self.assertNotIn("target_locked", events)
@@ -294,15 +382,21 @@ class Mission2CueStateTests(unittest.TestCase):
 
         task = self._build_extracted_task(events, confirm_landing)
 
-        task._follow_descend_and_land_on_target()
+        task._follow_descend_and_land_on_target((9.0, 0.0))
 
-        self.assertEqual(1, len(task.moving_target_descent.calls))
-        descent_call = task.moving_target_descent.calls[0]
-        self.assertEqual(3.0, descent_call["stabilize_seconds"])
-        self.assertEqual(25.0, descent_call["target_height"])
-        self.assertNotIn("pre_descent_gate", descent_call)
-        self.assertNotIn("pre_descent_max_error_px", descent_call)
-        self.assertNotIn("horizontal_command_guard", descent_call)
+        self.assertEqual(2, len(task.moving_target_descent.calls))
+        first_descent, second_descent = task.moving_target_descent.calls
+        self.assertEqual(3.0, first_descent["stabilize_seconds"])
+        self.assertEqual(100.0, first_descent["target_height"])
+        self.assertEqual((9.0, 0.0), first_descent["initial_target_velocity"])
+        self.assertEqual(30.0, first_descent["pre_descent_max_error_px"])
+        self.assertNotIn("pre_descent_gate", first_descent)
+
+        self.assertEqual(0.0, second_descent["stabilize_seconds"])
+        self.assertEqual(25.0, second_descent["target_height"])
+        self.assertIn("pre_descent_gate", second_descent)
+        self.assertEqual(30.0, second_descent["pre_descent_max_error_px"])
+        self.assertIs(False, second_descent["reset_estimator"])
 
         self.assertLess(events.index("landing_started"), events.index("land"))
         self.assertLess(events.index("land"), events.index("target_locked"))
@@ -328,9 +422,11 @@ class Mission2CueStateTests(unittest.TestCase):
             "logger": _Logger(),
             "ESCORT_STABLE_SECONDS": 3.0,
             "ESCORT_STABLE_TIMEOUT_SECONDS": 90.0,
-            "ESCORT_SPEED_MIDPOINT": 12.0,
+            "TARGET_DESCENT_INTERMEDIATE_HEIGHT": 100.0,
+            "TARGET_DETECTION_PIXEL_THRESHOLD": 30.0,
             "TARGET_DESCENT_TIMEOUT_SECONDS": 15.0,
             "TARGET_LANDING_HEIGHT": 25.0,
+            "ARC_END": (237.5, -187.5),
             "TARGET_LANDING_LOCK_TIMEOUT_SECONDS": 20.0,
             "LOCKED_DWELL_SECONDS": 5.0,
             "CRUISE_HEIGHT": 150.0,
@@ -354,6 +450,7 @@ class Mission2CueStateTests(unittest.TestCase):
         task.moving_target_descent = _Descent()
         task._arc_velocity_predictor = _Predictor()
         task._low_altitude_target_offset = _Offset()
+        task._route_gate_is_open = lambda: True
         task.navi = _Navigation()
         task.fc = object()
         task.stop_event = object()
