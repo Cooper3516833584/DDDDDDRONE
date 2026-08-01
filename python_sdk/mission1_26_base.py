@@ -123,6 +123,8 @@ class MissionOperationState:
     MISSION1_DROP_COMPLETED = 14
     # Pursuit or cruise-height flight before target acquisition.
     CRUISING = 15
+    # MISSION2 only: platform retakeoff has reached cruise height.
+    RETAKEOFF_SUCCEEDED = 16
 
 
 FLEET_TRACE_DRAIN_TIMEOUT_SECONDS = 6.0
