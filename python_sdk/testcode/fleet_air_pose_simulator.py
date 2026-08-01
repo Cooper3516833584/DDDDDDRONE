@@ -8,9 +8,16 @@ FleetBus TARGETED_STOP command.
 
 import argparse
 import math
+from pathlib import Path
 import signal
+import sys
 import threading
 import time
+
+
+SDK_DIR = Path(__file__).resolve().parents[1]
+if str(SDK_DIR) not in sys.path:
+    sys.path.insert(0, str(SDK_DIR))
 
 
 def build_parser():
