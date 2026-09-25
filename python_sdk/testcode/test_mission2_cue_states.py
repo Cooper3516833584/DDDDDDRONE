@@ -245,7 +245,13 @@ class Mission2CueStateTests(unittest.TestCase):
         self.assertEqual(40.0, values["TARGET_DESCENT_GATE_RADIUS"])
         self.assertEqual(18.0, values["PURSUIT_APPROACH_SPEED"])
         self.assertEqual(5.0, values["LOCKED_DWELL_SECONDS"])
-        self.assertEqual(75.0, values["TASK2_H_LANDING_HEIGHT"])
+        self.assertEqual(1.0, values["RETAKEOFF_SUCCEEDED_STATE_HOLD_SECONDS"])
+        self.assertEqual(30.0, values["TASK2_H_LANDING_HEIGHT"])
+        self.assertEqual(5.0, values["TASK2_H_LANDING_HEIGHT_TOLERANCE"])
+        self.assertEqual(
+            8.0,
+            values["TASK2_H_LANDING_ALIGNMENT_TIMEOUT_SECONDS"],
+        )
         self.assertEqual(
             90.0,
             values["TASK2_H_LANDING_MAX_CONTROL_HEIGHT"],
@@ -271,20 +277,28 @@ class Mission2CueStateTests(unittest.TestCase):
 
         class BaseMission:
             def _visual_h_landing_at_takeoff(self):
-                self.observed_height = descent.H_LANDING_HEIGHT
-                self.observed_max_control_height = (
-                    descent.H_LANDING_MAX_CONTROL_HEIGHT
+                self.observed = (
+                    descent.H_LANDING_HEIGHT,
+                    descent.H_LANDING_HEIGHT_TOLERANCE,
+                    descent.H_LANDING_ALIGNMENT_TIMEOUT,
+                    descent.H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING,
+                    descent.H_LANDING_MAX_CONTROL_HEIGHT,
                 )
                 raise RuntimeError("alignment failed")
 
         descent = types.SimpleNamespace(
             H_LANDING_HEIGHT=60.0,
             H_LANDING_MAX_CONTROL_HEIGHT=75.0,
+            H_LANDING_HEIGHT_TOLERANCE=8.0,
+            H_LANDING_ALIGNMENT_TIMEOUT=60.0,
+            H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING=False,
         )
         namespace = {
             "BaseMission": BaseMission,
             "descent_test": descent,
-            "TASK2_H_LANDING_HEIGHT": 75.0,
+            "TASK2_H_LANDING_HEIGHT": 30.0,
+            "TASK2_H_LANDING_HEIGHT_TOLERANCE": 5.0,
+            "TASK2_H_LANDING_ALIGNMENT_TIMEOUT_SECONDS": 8.0,
             "TASK2_H_LANDING_MAX_CONTROL_HEIGHT": 90.0,
         }
         exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
@@ -293,10 +307,118 @@ class Mission2CueStateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "alignment failed"):
             task._visual_h_landing_at_takeoff()
 
-        self.assertEqual(75.0, task.observed_height)
-        self.assertEqual(90.0, task.observed_max_control_height)
+        self.assertEqual((30.0, 5.0, 8.0, True, 90.0), task.observed)
         self.assertEqual(60.0, descent.H_LANDING_HEIGHT)
+        self.assertEqual(8.0, descent.H_LANDING_HEIGHT_TOLERANCE)
+        self.assertEqual(60.0, descent.H_LANDING_ALIGNMENT_TIMEOUT)
+        self.assertIs(False, descent.H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING)
         self.assertEqual(75.0, descent.H_LANDING_MAX_CONTROL_HEIGHT)
+
+    def test_retakeoff_success_state_is_held_before_return(self):
+        mission = _class(self.mission_tree, "Task2Mission")
+        run = _method(mission, "run")
+        calls = [
+            (_call_name(node), node.lineno)
+            for node in ast.walk(run)
+            if isinstance(node, ast.Call)
+            and _call_name(node)
+            in {
+                "_follow_descend_and_land_on_target",
+                "_hold_retakeoff_succeeded_state",
+                "_return_home_and_land",
+            }
+        ]
+        call_lines = dict(calls)
+        self.assertLess(
+            call_lines["_follow_descend_and_land_on_target"],
+            call_lines["_hold_retakeoff_succeeded_state"],
+        )
+        self.assertLess(
+            call_lines["_hold_retakeoff_succeeded_state"],
+            call_lines["_return_home_and_land"],
+        )
+
+    def test_h_alignment_timeout_uses_current_point_landing(self):
+        base_mission = _class(
+            ast.parse(
+                (SDK_DIR / "mission1_26_visual_descent_test.py").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            "StaticTargetVisualDescentMission",
+        )
+        method = _method(base_mission, "_visual_h_landing_at_takeoff")
+        extracted = ast.ClassDef(
+            name="ExtractedLandingMission",
+            bases=[],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        module = ast.Module(body=[extracted], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        def wait(seconds):
+            FakeTime.now += float(seconds)
+            return False
+
+        landing_points = []
+
+        namespace = {
+            "math": math,
+            "time": FakeTime,
+            "logger": _Logger(),
+            "mission1": types.SimpleNamespace(VISION_SAMPLE_STALE_SECONDS=0.35),
+            "H_LANDING_VERTICAL_SPEED": 15.0,
+            "H_LANDING_HEIGHT": 30.0,
+            "H_LANDING_HEIGHT_TOLERANCE": 5.0,
+            "H_LANDING_HEIGHT_TIMEOUT": 8.0,
+            "H_LANDING_PIXEL_THRESHOLD": 18.0,
+            "H_LANDING_CENTER_CONFIRM_FRAMES": 5,
+            "H_LANDING_APPROACH_SPEED": 15.0,
+            "H_LANDING_CONTROL_PERIOD": 0.1,
+            "H_LANDING_ALIGNMENT_TIMEOUT": 0.2,
+            "H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING": True,
+            "H_LANDING_MIN_CONTROL_HEIGHT": 25.0,
+            "H_LANDING_MAX_CONTROL_HEIGHT": 75.0,
+        }
+        exec(compile(module, str(MISSION2_PATH), "exec"), namespace)
+        task = namespace["ExtractedLandingMission"]()
+        task.stop_event = types.SimpleNamespace(
+            is_set=lambda: False,
+            wait=wait,
+        )
+        task.navi = types.SimpleNamespace(
+            running=True,
+            current_point=(1.0, 2.0),
+            set_vertical_speed=lambda _speed: None,
+            set_height=lambda _height: None,
+            wait_for_height=lambda **_kwargs: True,
+            pose_is_fresh=lambda: True,
+            stop_move=lambda: None,
+            pointing_landing=lambda point: landing_points.append(point) or True,
+        )
+        task.fc = types.SimpleNamespace(
+            HOLD_POS_MODE=2,
+            state=types.SimpleNamespace(
+                is_fresh=lambda _age: True,
+                unlock=types.SimpleNamespace(value=True),
+                mode=types.SimpleNamespace(value=2),
+            ),
+        )
+        task._current_navi_height = lambda: 30.0
+        task._latest_vision_sample = lambda: None
+
+        task._visual_h_landing_at_takeoff()
+
+        self.assertEqual([(1.0, 2.0)], landing_points)
 
     def test_escort_starts_after_arc_start_and_80px_wait(self):
         mission = _class(self.mission_tree, "Task2Mission")

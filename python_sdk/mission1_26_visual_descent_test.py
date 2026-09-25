@@ -67,8 +67,17 @@ H_LANDING_HEIGHT_TIMEOUT = 8.0
 H_LANDING_PIXEL_THRESHOLD = 18.0
 H_LANDING_CENTER_CONFIRM_FRAMES = 5
 H_LANDING_APPROACH_SPEED = 15.0
+H_LANDING_COARSE_ERROR_PX = 60.0
+H_LANDING_FINE_ERROR_PX = 30.0
+H_LANDING_COARSE_SPEED = 20.0
+H_LANDING_MEDIUM_SPEED = 12.0
+H_LANDING_FINE_SPEED = 6.0
 H_LANDING_CONTROL_PERIOD = 0.1
 H_LANDING_ALIGNMENT_TIMEOUT = 60.0
+# Task-specific callers may opt into descending at the current point if the
+# bounded visual-alignment window expires. The default preserves legacy fail
+# closed behavior for existing callers.
+H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING = False
 H_LANDING_MIN_CONTROL_HEIGHT = 25.0
 H_LANDING_MAX_CONTROL_HEIGHT = 75.0
 
@@ -308,6 +317,127 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         except Exception:
             return None
 
+    def _h_landing_approach_speed(self, distance_px: float) -> float:
+        """Return the horizontal H-marker correction speed in cm/s."""
+        if distance_px >= H_LANDING_COARSE_ERROR_PX:
+            return H_LANDING_COARSE_SPEED
+        if distance_px >= H_LANDING_FINE_ERROR_PX:
+            return H_LANDING_MEDIUM_SPEED
+        return H_LANDING_FINE_SPEED
+
+    def _h_landing_pre_alignment_enabled(self) -> bool:
+        """Whether this mission opts into H correction during descent."""
+        return False
+
+    def _h_landing_pre_alignment_max_height(self) -> float:
+        """Maximum height at which descent-time H correction is allowed."""
+        return H_LANDING_MAX_CONTROL_HEIGHT
+
+    def _h_landing_final_visual_descent_config(
+        self,
+    ) -> Optional[Tuple[float, float, float]]:
+        """Return (height, tolerance, timeout) for an optional H final descent."""
+        return None
+
+    def _move_toward_h_marker(
+        self,
+        x_px: float,
+        y_px: float,
+        distance_px: float,
+    ) -> None:
+        speed = float(self._h_landing_approach_speed(distance_px))
+        if not math.isfinite(speed) or speed <= 0:
+            raise RuntimeError("Invalid H-marker approach speed")
+        direction_deg = math.degrees(math.atan2(y_px, x_px))
+        self.navi.move_by_direction(speed=speed, direction_deg=direction_deg)
+        self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+        self.navi.stop_move()
+
+    def _wait_for_h_landing_height_with_pre_alignment(self) -> bool:
+        """Descend while applying bounded H-marker corrections when available."""
+        navi = self.navi
+        max_height = float(self._h_landing_pre_alignment_max_height())
+        if (
+            not math.isfinite(max_height)
+            or max_height < H_LANDING_MIN_CONTROL_HEIGHT
+        ):
+            raise RuntimeError("Invalid H-marker pre-alignment height limit")
+
+        deadline = time.monotonic() + H_LANDING_HEIGHT_TIMEOUT
+        reached_since: Optional[float] = None
+        try:
+            while time.monotonic() < deadline:
+                if self.stop_event.is_set():
+                    logger.warning("[H-LAND] Height wait stopped during pre-alignment")
+                    return False
+
+                now = time.monotonic()
+                current_height = self._current_navi_height()
+                state_fresh = self.fc.state.is_fresh(0.5)
+                height_reached = (
+                    current_height is not None
+                    and abs(current_height - H_LANDING_HEIGHT)
+                    < H_LANDING_HEIGHT_TOLERANCE
+                    and navi.running
+                    and state_fresh
+                )
+                if height_reached:
+                    if reached_since is None:
+                        reached_since = now
+                    elif now - reached_since >= 0.5:
+                        logger.info("[H-LAND] Reached visual approach height")
+                        return True
+                else:
+                    reached_since = None
+
+                if (
+                    current_height is None
+                    or current_height < H_LANDING_MIN_CONTROL_HEIGHT
+                    or current_height > max_height
+                ):
+                    navi.stop_move()
+                    self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                    continue
+
+                if not (
+                    navi.running
+                    and state_fresh
+                    and self.fc.state.unlock.value
+                    and self.fc.state.mode.value == self.fc.HOLD_POS_MODE
+                    and navi.pose_is_fresh()
+                ):
+                    navi.stop_move()
+                    self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                    continue
+
+                navi.stop_move()
+                sample = self._latest_vision_sample()
+                if (
+                    sample is None
+                    or time.monotonic() - sample[1]
+                    > mission1.VISION_SAMPLE_STALE_SECONDS
+                ):
+                    self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                    continue
+
+                x_px, y_px = sample[2], sample[3]
+                if x_px is None or y_px is None:
+                    self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                    continue
+
+                x_px = float(x_px)
+                y_px = float(y_px)
+                distance_px = math.hypot(x_px, y_px)
+                if distance_px <= H_LANDING_PIXEL_THRESHOLD:
+                    self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
+                    continue
+                self._move_toward_h_marker(x_px, y_px, distance_px)
+        finally:
+            navi.stop_move()
+
+        logger.warning("[H-LAND] Height overtime during pre-alignment")
+        return False
+
     def _visual_h_landing_at_takeoff(self) -> None:
         """返航后以 60cm 高度视觉对准 H 标记，再在该点调用定点降落。
 
@@ -328,10 +458,14 @@ class StaticTargetVisualDescentMission(mission1.Mission):
         navi.set_vertical_speed(H_LANDING_VERTICAL_SPEED)
         navi.set_height(H_LANDING_HEIGHT)
         navi.keep_height_flag = True
-        if not navi.wait_for_height(
-            height_thres=H_LANDING_HEIGHT_TOLERANCE,
-            timeout=H_LANDING_HEIGHT_TIMEOUT,
-        ):
+        if self._h_landing_pre_alignment_enabled():
+            height_reached = self._wait_for_h_landing_height_with_pre_alignment()
+        else:
+            height_reached = navi.wait_for_height(
+                height_thres=H_LANDING_HEIGHT_TOLERANCE,
+                timeout=H_LANDING_HEIGHT_TIMEOUT,
+            )
+        if not height_reached:
             raise RuntimeError(
                 "Failed to reach H visual approach height {}cm".format(
                     H_LANDING_HEIGHT
@@ -411,23 +545,54 @@ class StaticTargetVisualDescentMission(mission1.Mission):
                     continue
 
                 centered_frames = 0
-                direction_deg = math.degrees(math.atan2(y_px, x_px))
-                navi.move_by_direction(
-                    speed=H_LANDING_APPROACH_SPEED,
-                    direction_deg=direction_deg,
-                )
-                self.stop_event.wait(H_LANDING_CONTROL_PERIOD)
-                navi.stop_move()
+                self._move_toward_h_marker(x_px, y_px, distance_px)
         finally:
             navi.stop_move()
 
         if not centered:
-            raise RuntimeError("H-marker alignment was not confirmed")
+            if self.stop_event.is_set():
+                raise RuntimeError("H-marker alignment was stopped")
+            if not H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING:
+                raise RuntimeError("H-marker alignment was not confirmed")
+            logger.warning(
+                "[H-LAND] Alignment timed out after {:.1f}s; "
+                "descending at the current point",
+                H_LANDING_ALIGNMENT_TIMEOUT,
+            )
         if not self.fc.state.is_fresh(0.5) or not self.fc.state.unlock.value:
             raise RuntimeError("Flight state invalid after H visual alignment")
 
+        final_visual_descent = self._h_landing_final_visual_descent_config()
+        approach_height = 35.0
+        if final_visual_descent is not None:
+            target_height, height_tolerance, timeout = final_visual_descent
+            values = (target_height, height_tolerance, timeout)
+            if (
+                not all(math.isfinite(float(value)) for value in values)
+                or target_height < H_LANDING_MIN_CONTROL_HEIGHT
+                or height_tolerance <= 0
+                or timeout <= 0
+            ):
+                raise RuntimeError("Invalid H visual final-descent configuration")
+            logger.info(
+                "[H-LAND] Continue visual correction down to {:.1f}cm",
+                target_height,
+            )
+            self.visual_descent.descend_to_height(
+                target_height=float(target_height),
+                hover_seconds=0.0,
+                base_velocity=(0.0, 0.0),
+                height_tolerance=float(height_tolerance),
+                height_confirm_time=HEIGHT_CONFIRM_SECONDS,
+                timeout=float(timeout),
+            )
+            approach_height = float(target_height)
+
         landing_point = navi.current_point
-        if not navi.pointing_landing(landing_point):
+        if not navi.pointing_landing(
+            landing_point,
+            approach_height=approach_height,
+        ):
             raise RuntimeError(
                 "Pointing landing was not confirmed after H alignment"
             )

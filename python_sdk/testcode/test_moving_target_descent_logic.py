@@ -275,6 +275,45 @@ def test_provider_once_per_sequence_and_command_limit() -> None:
     assert math.hypot(vel_x, vel_y) <= 15.0
 
 
+def test_complete_on_height_reached_stops_before_next_sample() -> None:
+    _FakeTime.now = 0.0
+    navi = _Navigation()
+    callback_completed = False
+    sample_reads = 0
+
+    def latest_sample():
+        nonlocal sample_reads
+        if callback_completed:
+            raise AssertionError(
+                "Vision was sampled again after the height callback"
+            )
+        sample_reads += 1
+        return sample_reads, _FakeTime.now, 0.0, 0.0
+
+    def on_height_reached():
+        nonlocal callback_completed
+        callback_completed = True
+
+    controller = _new_visual_controller(latest_sample, navi)
+    original_time = visual_target_descent.time
+    visual_target_descent.time = _FakeTime
+    try:
+        controller.descend_to_height(
+            target_height=100.0,
+            hover_seconds=10.0,
+            height_confirm_time=0.05,
+            timeout=1.0,
+            on_height_reached=on_height_reached,
+            complete_on_height_reached=True,
+        )
+    finally:
+        visual_target_descent.time = original_time
+
+    assert callback_completed
+    assert sample_reads == 2
+    assert navi.override_stopped
+
+
 def test_low_altitude_target_offset_changes_only_control_error() -> None:
     _FakeTime.now = 0.0
     navi = _Navigation()
@@ -505,6 +544,7 @@ def main() -> None:
     test_estimator()
     test_estimator_velocity_predictor()
     test_provider_once_per_sequence_and_command_limit()
+    test_complete_on_height_reached_stops_before_next_sample()
     test_low_altitude_target_offset_changes_only_control_error()
     test_horizontal_command_guard_runs_before_send_and_record()
     test_loss_resets_continuous_follow_timer()

@@ -284,6 +284,7 @@ class MovingTargetDescentController:
         descent_timeout: float = 15.0,
         on_descent_start: Optional[Callable[[], None]] = None,
         on_height_reached: Optional[Callable[[], None]] = None,
+        complete_on_height_reached: bool = False,
         pre_descent_gate: Optional[Callable[[], bool]] = None,
         pre_descent_max_error_px: Optional[float] = None,
         velocity_predictor: Optional[VelocityPredictor] = None,
@@ -296,6 +297,7 @@ class MovingTargetDescentController:
         reset_estimator: 是否在开始前重置目标速度估计。连续两段伴飞
             衔接时传 False，沿用上一段伴飞器继续积分估计；目标速度
             不会突变，重置会丢失已收敛的速度估计。
+        complete_on_height_reached: 高度回调完成后立即结束视觉伴飞。
         """
         if velocity_predictor is not None and not callable(
             velocity_predictor
@@ -324,6 +326,7 @@ class MovingTargetDescentController:
             height_confirm_time=height_confirm_time,
             timeout=descent_timeout,
             on_height_reached=on_height_reached,
+            complete_on_height_reached=complete_on_height_reached,
             base_velocity_provider=provide_base_velocity,
             pre_descent_follow_seconds=stabilize_seconds,
             pre_descent_follow_timeout=stabilize_timeout,

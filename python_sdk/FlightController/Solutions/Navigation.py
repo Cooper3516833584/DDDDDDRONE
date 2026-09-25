@@ -866,7 +866,7 @@ class Navigation(object):
         self,
         traj_list: Union[List[Tuple[float, ...]], np.ndarray],
         pos_thres: float = 10.0,
-        timeout_per_point: float = 6.0,
+        timeout_per_point: float = 14.0,
     ):
         """
         轨迹跟随任务（改进版）

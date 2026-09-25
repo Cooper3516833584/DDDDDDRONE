@@ -4,7 +4,8 @@
 追及路径与任务二保持一致：直线 + 右侧顺时针半圆弧 + 末段直线的
 曲线追及轨迹，非阻塞调用，速度按 初始->接近->减速后 三段调度。
 发现移动目标后，连续有效伴飞 10 秒，
-在同一视觉速度接管内从 150 cm 下降到 40 cm，并继续伴飞 0.5 秒。
+在同一视觉速度接管内从 150 cm 下降到 40 cm；投放完成后立即结束
+小车标记视觉闭环，恢复高度控制并开始爬升返航。
 
 起飞采用非定点垂直起飞（90 cm 一键离地后垂直爬升至 150 cm），
 该阶段垂直速度设为 30 cm/s；起飞完成后先稳定偏航，再悬停 2.5s，
@@ -49,8 +50,6 @@ from moving_target_descent import MovingTargetDescentController
 DESCENT_TARGET_HEIGHT = 40.0
 STABILIZE_SECONDS = 10.0
 STABILIZE_TIMEOUT_SECONDS = 20.0
-# 特殊抛投后，缩短低空伴飞以避免下落货物遮挡移动目标标记。
-LOW_HOVER_SECONDS = 0.5
 # 抛投释放采用短间隔重复关断，降低单次命令未触发机械释放的概率。
 DROP_RELEASE_REPEAT_COUNT = 5
 DROP_RELEASE_INTERVAL_SECONDS = 0.05
@@ -375,6 +374,7 @@ class MovingTargetVisualDescentMission(
             "[MISSION1] Digital output 0 disabled at {}cm",
             DESCENT_TARGET_HEIGHT,
         )
+        self.enable_h_landing_vision()
         self.signals.send_drop_completed()
 
     def _start_drop_and_indicator(self) -> None:
@@ -396,13 +396,14 @@ class MovingTargetVisualDescentMission(
                 target_height=DESCENT_TARGET_HEIGHT,
                 stabilize_seconds=STABILIZE_SECONDS,
                 stabilize_timeout=STABILIZE_TIMEOUT_SECONDS,
-                hover_seconds=LOW_HOVER_SECONDS,
+                hover_seconds=0.0,
                 initial_target_velocity=INITIAL_TARGET_VELOCITY,
                 height_tolerance=descent_test.HEIGHT_TOLERANCE,
                 height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
                 descent_timeout=DESCENT_TIMEOUT_SECONDS,
                 on_descent_start=self._start_drop_and_indicator,
                 on_height_reached=self._disable_output_and_report,
+                complete_on_height_reached=True,
             )
         finally:
             self._stop_drop_indicator()
@@ -526,8 +527,7 @@ class MovingTargetVisualDescentMission(
         self.signals.send_escort_started()
         self._perform_target_action()
 
-        # 返航开始时切换到 H 降落点检测；相机保持全程开启。
-        self.enable_h_landing_vision()
+        # 投放完成时已切换 H 检测；相机保持全程开启。
         navi.set_navigation_speed(RETURN_SPEED)
         if not navi.navigation_to_waypoint(
             mission1.TAKEOFF_POINT,

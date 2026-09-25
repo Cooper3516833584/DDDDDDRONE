@@ -239,6 +239,7 @@ class VisualTargetDescentController:
         height_confirm_time: float = 0.4,
         timeout: float = 15.0,
         on_height_reached: Optional[Callable[[], None]] = None,
+        complete_on_height_reached: bool = False,
         base_velocity_provider: Optional[BaseVelocityProvider] = None,
         pre_descent_follow_seconds: float = 0.0,
         pre_descent_follow_timeout: float = 20.0,
@@ -248,7 +249,7 @@ class VisualTargetDescentController:
         target_offset_provider: Optional[TargetOffsetProvider] = None,
         horizontal_command_guard: Optional[HorizontalCommandGuard] = None,
     ) -> None:
-        """视觉伴飞后下降到指定激光高度，并继续悬停指定时间。"""
+        """视觉伴飞后下降到指定激光高度，并按需继续悬停。"""
         values = np.asarray(
             [
                 target_height,
@@ -299,6 +300,8 @@ class VisualTargetDescentController:
             horizontal_command_guard
         ):
             raise ValueError("horizontal_command_guard must be callable")
+        if not isinstance(complete_on_height_reached, bool):
+            raise ValueError("complete_on_height_reached must be boolean")
         if pre_descent_max_error_px is not None:
             pre_descent_max_error_px = float(pre_descent_max_error_px)
             if (
@@ -549,11 +552,27 @@ class VisualTargetDescentController:
                             hover_elapsed = 0.0
                             if on_height_reached is not None:
                                 on_height_reached()
-                            logger.info(
-                                "[VISUAL-DESCENT] Reached {}cm; hover {:.1f}s",
-                                target_height,
-                                hover_seconds,
-                            )
+                            if complete_on_height_reached:
+                                logger.info(
+                                    "[VISUAL-DESCENT] Reached {}cm; "
+                                    "complete after height callback",
+                                    target_height,
+                                )
+                                self._record(
+                                    started_at,
+                                    "height_reached",
+                                    offset,
+                                    vel_x,
+                                    vel_y,
+                                )
+                                break
+                            else:
+                                logger.info(
+                                    "[VISUAL-DESCENT] Reached {}cm; "
+                                    "hover {:.1f}s",
+                                    target_height,
+                                    hover_seconds,
+                                )
                     else:
                         height_reached_since = None
                     phase = (

@@ -78,11 +78,28 @@ TARGET_DIRECT_LOCK_CONFIRM_SECONDS = 0.4
 LOCKED_DWELL_SECONDS = 5.0
 PLATFORM_RETAKEOFF_HEIGHT = 30
 PLATFORM_RETAKEOFF_HEIGHT_TIMEOUT_SECONDS = 15.0
-TASK2_H_LANDING_HEIGHT = 75.0
+RETAKEOFF_SUCCEEDED_STATE_HOLD_SECONDS = 1.0
+TASK2_H_LANDING_HEIGHT = 40.0
+TASK2_H_LANDING_HEIGHT_TOLERANCE = 5.0
+TASK2_H_LANDING_VERTICAL_SPEED = 25.0
+TASK2_H_LANDING_ALIGNMENT_TIMEOUT_SECONDS = 5.0
 TASK2_H_LANDING_MAX_CONTROL_HEIGHT = 90.0
+# Set False to return to the previous sequential H-landing approach.
+TASK2_H_LANDING_PREALIGN_ENABLED = True
+TASK2_H_LANDING_PREALIGN_MAX_HEIGHT = 60.0
+TASK2_H_LANDING_COARSE_ERROR_PX = 60.0
+TASK2_H_LANDING_FINE_ERROR_PX = 30.0
+TASK2_H_LANDING_COARSE_SPEED = 20.0
+TASK2_H_LANDING_MEDIUM_SPEED = 12.0
+TASK2_H_LANDING_FINE_SPEED = 6.0
+# Set False to hand off directly to pointing_landing after H alignment.
+TASK2_H_LANDING_FINAL_VISUAL_DESCENT_ENABLED = True
+TASK2_H_LANDING_FINAL_VISUAL_DESCENT_HEIGHT = 25.0
+TASK2_H_LANDING_FINAL_VISUAL_DESCENT_HEIGHT_TOLERANCE = 3.0
+TASK2_H_LANDING_FINAL_VISUAL_DESCENT_TIMEOUT_SECONDS = 12.0
 
 TASK2_ARC_START = (312.5, -112.5)
-TASK2_PURSUIT_DIRECT_SEGMENTS = 4
+TASK2_PURSUIT_DIRECT_SEGMENTS = 2
 
 
 def build_task2_pursuit_trajectory(
@@ -463,13 +480,61 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             hold_point,
         )
 
+    def _hold_retakeoff_succeeded_state(self) -> None:
+        logger.info(
+            "[MISSION2] Holding retakeoff-success state for {:.1f}s",
+            RETAKEOFF_SUCCEEDED_STATE_HOLD_SECONDS,
+        )
+        if self.stop_event.wait(RETAKEOFF_SUCCEEDED_STATE_HOLD_SECONDS):
+            raise RuntimeError("Task 2 stopped during retakeoff-success hold")
+
+    def _h_landing_approach_speed(self, distance_px: float) -> float:
+        if distance_px >= TASK2_H_LANDING_COARSE_ERROR_PX:
+            return TASK2_H_LANDING_COARSE_SPEED
+        if distance_px >= TASK2_H_LANDING_FINE_ERROR_PX:
+            return TASK2_H_LANDING_MEDIUM_SPEED
+        return TASK2_H_LANDING_FINE_SPEED
+
+    def _h_landing_pre_alignment_enabled(self) -> bool:
+        return TASK2_H_LANDING_PREALIGN_ENABLED
+
+    def _h_landing_pre_alignment_max_height(self) -> float:
+        return TASK2_H_LANDING_PREALIGN_MAX_HEIGHT
+
+    def _h_landing_final_visual_descent_config(
+        self,
+    ) -> Optional[Tuple[float, float, float]]:
+        if not TASK2_H_LANDING_FINAL_VISUAL_DESCENT_ENABLED:
+            return None
+        return (
+            TASK2_H_LANDING_FINAL_VISUAL_DESCENT_HEIGHT,
+            TASK2_H_LANDING_FINAL_VISUAL_DESCENT_HEIGHT_TOLERANCE,
+            TASK2_H_LANDING_FINAL_VISUAL_DESCENT_TIMEOUT_SECONDS,
+        )
+
     def _visual_h_landing_at_takeoff(self) -> None:
         # The inherited routine reads this module constant directly.
         original_height = descent_test.H_LANDING_HEIGHT
+        original_vertical_speed = descent_test.H_LANDING_VERTICAL_SPEED
         original_max_control_height = (
             descent_test.H_LANDING_MAX_CONTROL_HEIGHT
         )
+        original_height_tolerance = descent_test.H_LANDING_HEIGHT_TOLERANCE
+        original_alignment_timeout = descent_test.H_LANDING_ALIGNMENT_TIMEOUT
+        original_timeout_fallback = (
+            descent_test.H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING
+        )
         descent_test.H_LANDING_HEIGHT = TASK2_H_LANDING_HEIGHT
+        # A 5cm tolerance keeps the accepted approach height at or above
+        # the inherited 25cm minimum for horizontal visual control.
+        descent_test.H_LANDING_HEIGHT_TOLERANCE = (
+            TASK2_H_LANDING_HEIGHT_TOLERANCE
+        )
+        descent_test.H_LANDING_VERTICAL_SPEED = TASK2_H_LANDING_VERTICAL_SPEED
+        descent_test.H_LANDING_ALIGNMENT_TIMEOUT = (
+            TASK2_H_LANDING_ALIGNMENT_TIMEOUT_SECONDS
+        )
+        descent_test.H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING = True
         descent_test.H_LANDING_MAX_CONTROL_HEIGHT = (
             TASK2_H_LANDING_MAX_CONTROL_HEIGHT
         )
@@ -477,9 +542,13 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
             super()._visual_h_landing_at_takeoff()
         finally:
             descent_test.H_LANDING_HEIGHT = original_height
-            descent_test.H_LANDING_MAX_CONTROL_HEIGHT = (
-                original_max_control_height
+            descent_test.H_LANDING_VERTICAL_SPEED = original_vertical_speed
+            descent_test.H_LANDING_HEIGHT_TOLERANCE = original_height_tolerance
+            descent_test.H_LANDING_ALIGNMENT_TIMEOUT = original_alignment_timeout
+            descent_test.H_LANDING_TIMEOUT_FALLBACK_TO_DIRECT_LANDING = (
+                original_timeout_fallback
             )
+            descent_test.H_LANDING_MAX_CONTROL_HEIGHT = original_max_control_height
 
     def _return_home_and_land(self) -> None:
         self.signals.send_return_started()
@@ -661,6 +730,7 @@ class Task2Mission(mission1.MovingTargetVisualDescentMission):
                 "Task 2 ended after a safe failure return"
             ) from exc
 
+        self._hold_retakeoff_succeeded_state()
         self._return_home_and_land()
         self.signals.send_mission_completed()
         logger.info("[MISSION2] Mission completed")
