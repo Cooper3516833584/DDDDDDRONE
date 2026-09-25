@@ -1,250 +1,668 @@
 """
-单雷达定位的任务一程序。
+任务一：移动目标视觉伴飞、同步下降、抛投、返航与定点降落。
 
-坐标与单位：
-- 水平坐标和高度均为 cm；
-- x 向前为正，y 向左为正；
-- PURSUIT_SPEED 和 ESCORT_SPEED 是 set_navigation_speed() 的参数，
-  不是对无人机实际速度的保证。
+追及路径与任务二保持一致：直线 + 右侧顺时针半圆弧 + 末段直线的
+曲线追及轨迹，非阻塞调用，速度按 初始->接近->减速后 三段调度。
+发现移动目标后，连续有效伴飞 10 秒，
+在同一视觉速度接管内从 150 cm 下降到 40 cm；投放完成后立即结束
+小车标记视觉闭环，恢复高度控制并开始爬升返航。
 
-当前占位行为：
-- 起飞信号尚未接入，wait_for_takeoff_signal() 当前立即返回；
-- 视觉尚未接入，wait_until_target_detected() 当前在前飞 3 秒后返回 True。
+起飞采用非定点垂直起飞（90 cm 一键离地后垂直爬升至 150 cm），
+该阶段垂直速度设为 30 cm/s；起飞完成后先稳定偏航，再悬停 2.5s，
+随后关闭指示灯继续追及。返航开始时切换到 H 降落点检测，下降至
+60 cm 后以 30 像素阈值完成视觉校准，再在该点定点降落，降落阶段
+垂直速度设为 15 cm/s。相机全程保持开启，不重复开关。
+
+本文件会连接真实飞控、雷达和相机并执行飞行。运行前必须确认
+server_ros.py 及其他 FC_Server 已关闭、现场和投放区域安全。
+地面站通过 FleetBus 依次发送准备和起飞命令；准备命令开启电磁铁，
+起飞命令仅在地面站完成三端联调时序后放行非定点起飞。
 """
 
+import csv
+import math
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 from loguru import logger
 
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
 from FlightController.Solutions.Navigation import Navigation
+from fleet_bus.models import CommandId
+from fleet_bus.trace_buffer import TraceSamplingOptions
+import mission1_26_base as mission1
+import mission1_26_visual_descent_test as descent_test
+from mission2_26_logic import (
+    ARC_END,
+    PURSUIT_SLOWDOWN_POINT,
+    PursuitSpeedSchedule,
+    ROUTE_GATE_RADIUS,
+    RoutePassGate,
+    build_pursuit_trajectory,
+)
+from moving_target_descent import MovingTargetDescentController
 
 
-FC_SERIAL_DEV = "/dev/ttyACM0"
+DESCENT_TARGET_HEIGHT = 40.0
+STABILIZE_SECONDS = 10.0
+STABILIZE_TIMEOUT_SECONDS = 20.0
+# 抛投释放采用短间隔重复关断，降低单次命令未触发机械释放的概率。
+DROP_RELEASE_REPEAT_COUNT = 5
+DROP_RELEASE_INTERVAL_SECONDS = 0.05
+DESCENT_TIMEOUT_SECONDS = 15.0
+INITIAL_TARGET_VELOCITY = (3.6, 0.0)
 
-TAKEOFF_POINT = np.array([0.0, 0.0])
-ENTRY_POINT = np.array([87.5, -37.5])
-CRUISE_HEIGHT = 150
-VERTICAL_SPEED = 20
+# 起飞后、开始追及前的悬停时间（秒）。
+HOVER_BEFORE_PURSUIT_SECONDS = 2.5
 
-PURSUIT_SPEED = 30
-ESCORT_SPEED = 10
-TARGET_DETECTION_PLACEHOLDER_SECONDS = 3.0
-ESCORT_OUTPUT_ON_SECONDS = 5.0
-ESCORT_OUTPUT_OFF_SECONDS = 2.0
+# 追及轨迹与速度规划，与任务二保持一致：直线 + 右侧顺时针半圆弧 +
+# 末段直线，非阻塞调用，速度按 初始->接近->减速后 三段调度。
+PURSUIT_SPEED = 20.0
+PURSUIT_APPROACH_SPEED = 25.0
+PURSUIT_AFTER_SLOWDOWN_SPEED = 15.0
+PURSUIT_POSITION_THRESHOLD = 7.5
 
-# 仅用作持续沿 +x 飞行的 PID 引导目标，不代表任务要求到达该点。
-# 后续接入真实视觉时，应结合实际场地边界调整，并保留未发现目标时的停止条件。
-FORWARD_GUIDANCE_DISTANCE = 300.0
+# 完成抛投并恢复巡航高度后的水平返航速度（cm/s）。
+RETURN_SPEED = 40.0
 
 
-class Mission:
-    def __init__(
-        self,
-        fc: FC_Controller,
-        radar: LD_Radar,
-        navi: Navigation,
-        stop_event: threading.Event,
-    ):
-        self.fc = fc
-        self.radar = radar
-        self.navi = navi
-        self.stop_event = stop_event
-        self.takeoff_signal = threading.Event()
+class MissionGroundStationSignals:
+    """Publish moving-target mission phases through the existing FleetBus link."""
 
-    def stop(self):
-        self.stop_event.set()
-        self.navi.stop()
-        logger.info("[MISSION] Mission stopped")
+    TAKEOFF_SIGNAL_RECEIVED = 2
+    DROP_STARTED = 6
 
-    def notify_takeoff_signal(self):
-        """供后续无线、按键或其他信号回调通知起飞。"""
-        self.takeoff_signal.set()
+    def __init__(self, mission: "MovingTargetVisualDescentMission") -> None:
+        self._mission = mission
 
-    def wait_for_takeoff_signal(self):
-        """
-        起飞信号占位函数。
+    def _send(self, name: str, operation_state: int) -> None:
+        self._mission.set_fleet_status(operation_state)
+        logger.info("[GROUND] Mission signal sent: {}", name)
 
-        TODO: 后续合作者接入真实信号源时，让信号回调调用
-        notify_takeoff_signal()，再取消下面三行等待代码的注释。
-        当前不等待任何外部信号，会立即继续任务。
-        """
-        logger.warning(
-            "[MISSION] Takeoff signal is not implemented; placeholder continues immediately"
+    def send_initialization_success(self) -> None:
+        self._send("initialization_success", mission1.MissionOperationState.READY)
+
+    def send_takeoff_signal_received(self) -> None:
+        self._send("takeoff_signal_received", self.TAKEOFF_SIGNAL_RECEIVED)
+
+    def send_takeoff_started(self) -> None:
+        self._send("takeoff_started", mission1.MissionOperationState.TAKEOFF)
+
+    def send_takeoff_succeeded(self) -> None:
+        self._send(
+            "takeoff_succeeded", mission1.MissionOperationState.HOVERING
         )
-        # self.takeoff_signal.clear()
-        # self.takeoff_signal.wait()
-        # self.takeoff_signal.clear()
 
-    def _wait_with_stop(self, duration_s: float) -> bool:
-        """等待指定时间；收到停止请求时立即返回 False。"""
-        deadline = time.monotonic() + duration_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return True
-            if self.stop_event.wait(min(0.05, remaining)):
-                return False
+    def send_pursuit_started(self) -> None:
+        self._send("pursuit_started", mission1.MissionOperationState.CRUISING)
 
-    def wait_until_target_detected(self) -> bool:
-        """
-        视觉检测占位函数。
+    def send_escort_started(self) -> None:
+        self._send("escort_started", mission1.MissionOperationState.ESCORTING)
 
-        TODO: 后续将此函数体替换为摄像头检测循环；检测到目标时返回 True，
-        收到 stop_event、定位失效或达到场地安全边界时返回 False。
-        当前以“沿 +x 前飞 3 秒后发现目标”模拟视觉结果。
-        """
-        logger.warning(
-            "[MISSION] Vision is not implemented; target will be reported after {}s",
-            TARGET_DETECTION_PLACEHOLDER_SECONDS,
+    def send_drop_started(self) -> None:
+        self._send("drop_started", self.DROP_STARTED)
+
+    def send_drop_completed(self) -> None:
+        self._send(
+            "drop_completed",
+            mission1.MissionOperationState.MISSION1_DROP_COMPLETED,
         )
-        if not self._wait_with_stop(TARGET_DETECTION_PLACEHOLDER_SECONDS):
-            return False
-        logger.info("[MISSION] Target detected by placeholder")
-        return True
 
-    def run(self):
-        fc = self.fc
-        navi = self.navi
+    def send_return_started(self) -> None:
+        self._send(
+            "return_started", mission1.MissionOperationState.RETURNING_HOME
+        )
 
-        navi.set_navigation_speed(PURSUIT_SPEED)
-        navi.set_vertical_speed(VERTICAL_SPEED)
-        navi.start(mode="radar")
-        logger.info("[MISSION] Single-radar navigation started")
+    def send_landing_started(self) -> None:
+        self._send(
+            "landing_started", mission1.MissionOperationState.LANDING_HOME
+        )
 
-        # 以起飞位置建立任务坐标原点；必须先获得雷达位姿更新。
-        navi.calibrate_basepoint()
-        logger.info("[MISSION] Radar basepoint calibrated: {}", navi.basepoint)
+    def send_mission_completed(self) -> None:
+        self._send(
+            "mission_completed", mission1.MissionOperationState.COMPLETED
+        )
 
-        self.wait_for_takeoff_signal()
-        if self.stop_event.is_set():
+
+class MovingTargetVisualDescentMission(
+    descent_test.StaticTargetVisualDescentMission
+):
+    """移动目标伴飞、同步下降、抛投、返航和定点降落任务。"""
+
+    LOG_PREFIX = "mission1_26_moving_target_descent_"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.signals = MissionGroundStationSignals(self)
+        self._ground_commands = None
+        self._digital_output_enabled = False
+        self._drop_indicator_enabled = False
+        self.moving_target_descent = MovingTargetDescentController(
+            fc=self.fc,
+            navi=self.navi,
+            stop_event=self.stop_event,
+            latest_vision_sample=self._latest_vision_sample,
+            raise_if_vision_failed=self._raise_if_vision_failed,
+            record_callback=self._record_moving_descent,
+        )
+        # 追及轨迹与速度规划与任务二保持一致。
+        self._route_gate = RoutePassGate(radius=ROUTE_GATE_RADIUS)
+        self._pursuit_speed_schedule = PursuitSpeedSchedule(
+            initial_speed=PURSUIT_SPEED,
+            approach_speed=PURSUIT_APPROACH_SPEED,
+            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
+        )
+        self._pursuit_trajectory = build_pursuit_trajectory(
+            altitude=float(mission1.CRUISE_HEIGHT),
+            arc_step_degrees=10,
+        )
+
+    def bind_ground_commands(self, command_queue) -> None:
+        self._ground_commands = command_queue
+
+    def _route_gate_is_open(self) -> bool:
+        was_open = self._route_gate.passed
+        is_open = self._route_gate.update(
+            self.navi.current_x,
+            self.navi.current_y,
+        )
+        if is_open and not was_open:
+            logger.info(
+                "[MISSION1] Route gate passed near {} at "
+                "({:.1f}, {:.1f})cm",
+                ARC_END,
+                self.navi.current_x,
+                self.navi.current_y,
+            )
+        return is_open
+
+    def _stop_pursuit_trajectory(self) -> None:
+        self.navi.navigation_stop_here()
+        deadline = time.monotonic() + 0.5
+        while (
+            self.navi.traj_running_event.is_set()
+            and time.monotonic() < deadline
+        ):
+            self.stop_event.wait(0.02)
+        if self.navi.traj_running_event.is_set():
+            raise RuntimeError("Pursuit trajectory did not stop in time")
+
+    def _update_pursuit_speed(self) -> None:
+        target_x, target_y = self.navi.navigation_target
+        new_speed = self._pursuit_speed_schedule.update(
+            target_x,
+            target_y,
+            self.navi.current_x,
+            self.navi.current_y,
+        )
+        if new_speed is None:
             return
+        self.navi.set_navigation_speed(new_speed)
+        logger.info(
+            "[MISSION1] Pursuit speed changed to {:.1f}cm/s at "
+            "position ({:.1f}, {:.1f}); trajectory target "
+            "({:.1f}, {:.1f})",
+            new_speed,
+            self.navi.current_x,
+            self.navi.current_y,
+            target_x,
+            target_y,
+        )
+
+    def _wait_until_target_detected_on_trajectory(
+        self,
+    ) -> Tuple[float, float]:
+        last_sequence = -1
+        while not self.stop_event.is_set():
+            self._update_pursuit_speed()
+            self._route_gate_is_open()
+            self._raise_if_vision_failed()
+            sample = self._latest_vision_sample()
+            if sample is not None and sample[0] != last_sequence:
+                sequence, captured_at, x_px, y_px = sample
+                last_sequence = sequence
+                if (
+                    time.monotonic() - captured_at
+                    <= mission1.VISION_SAMPLE_STALE_SECONDS
+                    and x_px is not None
+                    and y_px is not None
+                    and math.isfinite(float(x_px))
+                    and math.isfinite(float(y_px))
+                    and math.hypot(float(x_px), float(y_px))
+                    < mission1.TARGET_DETECTION_PIXEL_THRESHOLD
+                ):
+                    self._stop_pursuit_trajectory()
+                    logger.info(
+                        "[MISSION1] Target detected during pursuit: "
+                        "x_px={:.2f}, y_px={:.2f}",
+                        x_px,
+                        y_px,
+                    )
+                    return float(x_px), float(y_px)
+
+            if not self.navi.traj_running_event.is_set():
+                raise RuntimeError(
+                    "Pursuit trajectory finished without target detection"
+                )
+            self.stop_event.wait(mission1.ESCORT_CONTROL_PERIOD)
+        raise RuntimeError("Task 1 stopped during target pursuit")
+
+    def _wait_for_ground_command(self, expected: CommandId):
+        if self._ground_commands is None:
+            raise RuntimeError("FleetBus command queue is not attached")
+        logger.info("[GROUND] Waiting for {} command", expected.name)
+        while not self.stop_event.is_set():
+            command = self._ground_commands.receive(timeout=0.2)
+            if command is None:
+                continue
+            if command.command_id == int(CommandId.TARGETED_STOP):
+                self._ground_commands.complete(command)
+                raise RuntimeError("Mission stopped by ground station")
+            if command.command_id != int(expected):
+                self._ground_commands.fail(command, error_code=1)
+                logger.warning(
+                    "[GROUND] Rejected command {} while waiting for {}",
+                    command.command_id,
+                    expected.name,
+                )
+                continue
+            return command
+        raise RuntimeError("Mission stopped while waiting for ground command")
+
+    def _record_moving_descent(
+        self,
+        started_at: float,
+        phase: str,
+        x_px: Optional[float],
+        y_px: Optional[float],
+        estimated_target_vx: float,
+        estimated_target_vy: float,
+        command_vx: int,
+        command_vy: int,
+    ) -> None:
+        if (
+            len(self._visual_descent_records)
+            == self._visual_descent_records.maxlen
+        ):
+            self._visual_descent_records_dropped += 1
+        self._visual_descent_records.append(
+            {
+                "elapsed_s": time.monotonic() - started_at,
+                "phase": phase,
+                "height_cm": float(self.navi.current_height),
+                "x_px": x_px,
+                "y_px": y_px,
+                "pixel_distance_px": (
+                    math.hypot(x_px, y_px)
+                    if x_px is not None and y_px is not None
+                    else None
+                ),
+                "estimated_target_vx_cm_s": estimated_target_vx,
+                "estimated_target_vy_cm_s": estimated_target_vy,
+                "estimated_target_speed_cm_s": math.hypot(
+                    estimated_target_vx,
+                    estimated_target_vy,
+                ),
+                "command_vx_cm_s": command_vx,
+                "command_vy_cm_s": command_vy,
+                "command_speed_cm_s": math.hypot(command_vx, command_vy),
+                "digital_output_0_enabled": self._digital_output_enabled,
+            }
+        )
+
+    def write_visual_descent_log(self) -> Optional[Path]:
+        records: List[Dict[str, object]] = list(
+            self._visual_descent_records
+        )
+        if not records:
+            logger.warning("[MISSION1] No moving-target descent records to write")
+            return None
+
+        log_dir = Path(__file__).resolve().parent / "fc_log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / (
+            self.LOG_PREFIX
+            + datetime.now().strftime("%Y%m%d_%H%M%S")
+            + ".csv"
+        )
+        fieldnames = [
+            "elapsed_s",
+            "phase",
+            "height_cm",
+            "x_px",
+            "y_px",
+            "pixel_distance_px",
+            "estimated_target_vx_cm_s",
+            "estimated_target_vy_cm_s",
+            "estimated_target_speed_cm_s",
+            "command_vx_cm_s",
+            "command_vy_cm_s",
+            "command_speed_cm_s",
+            "digital_output_0_enabled",
+        ]
+        with log_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(records)
+        if self._visual_descent_records_dropped:
+            logger.warning(
+                "[MISSION1] Moving-target log discarded {} oldest records",
+                self._visual_descent_records_dropped,
+            )
+        logger.info(
+            "[MISSION1] Moving-target descent log written to {}", log_path
+        )
+        return log_path
+
+    def _disable_output_and_report(self) -> None:
+        for attempt in range(DROP_RELEASE_REPEAT_COUNT):
+            if attempt:
+                self.stop_event.wait(DROP_RELEASE_INTERVAL_SECONDS)
+            self.fc.set_digital_output(0, False)
+            logger.info(
+                "[MISSION1] Digital output 0 disable acknowledged "
+                "({}/{})",
+                attempt + 1,
+                DROP_RELEASE_REPEAT_COUNT,
+            )
+        self._digital_output_enabled = False
+        logger.info(
+            "[MISSION1] Digital output 0 disabled at {}cm",
+            DESCENT_TARGET_HEIGHT,
+        )
+        self.enable_h_landing_vision()
+        self.signals.send_drop_completed()
+
+    def _start_drop_and_indicator(self) -> None:
+        self.fc.set_indicator_led(255, 255, 0)
+        self._drop_indicator_enabled = True
+        logger.info("[MISSION1] Drop indicator LED set to yellow")
+        self.signals.send_drop_started()
+
+    def _stop_drop_indicator(self) -> None:
+        if not self._drop_indicator_enabled:
+            return
+        self.fc.set_indicator_led(0, 0, 0)
+        self._drop_indicator_enabled = False
+        logger.info("[MISSION1] Drop indicator LED turned off")
+
+    def _perform_target_action(self) -> None:
+        try:
+            final_velocity = self.moving_target_descent.follow_and_descend(
+                target_height=DESCENT_TARGET_HEIGHT,
+                stabilize_seconds=STABILIZE_SECONDS,
+                stabilize_timeout=STABILIZE_TIMEOUT_SECONDS,
+                hover_seconds=0.0,
+                initial_target_velocity=INITIAL_TARGET_VELOCITY,
+                height_tolerance=descent_test.HEIGHT_TOLERANCE,
+                height_confirm_time=descent_test.HEIGHT_CONFIRM_SECONDS,
+                descent_timeout=DESCENT_TIMEOUT_SECONDS,
+                on_descent_start=self._start_drop_and_indicator,
+                on_height_reached=self._disable_output_and_report,
+                complete_on_height_reached=True,
+            )
+        finally:
+            self._stop_drop_indicator()
+        logger.info(
+            "[MISSION1] Moving-target descent finished; estimated target "
+            "velocity=({:.2f}, {:.2f})cm/s",
+            final_velocity[0],
+            final_velocity[1],
+        )
+
+        self.signals.send_return_started()
+        self.navi.set_height(float(mission1.CRUISE_HEIGHT))
+        self.navi.keep_height_flag = True
+        if not self.navi.wait_for_height(
+            height_thres=descent_test.HEIGHT_TOLERANCE,
+            timeout=descent_test.ASCENT_TIMEOUT_SECONDS,
+        ):
+            raise RuntimeError("Failed to return to cruise height")
+        logger.info(
+            "[MISSION1] Returned to {}cm cruise height",
+            mission1.CRUISE_HEIGHT,
+        )
+
+    def run(self) -> None:
+        navi = self.navi
+        navi.set_navigation_speed(mission1.PURSUIT_SPEED)
+        navi.set_vertical_speed(mission1.VERTICAL_SPEED)
+        navi.start(mode="radar")
+        logger.info("[MISSION1] Single-radar navigation started")
+
+        descent_test.wait_for_radar_pose(navi, self.radar)
+        navi.calibrate_basepoint()
+        calibrated_at = time.monotonic()
+        descent_test.wait_for_radar_pose(
+            navi,
+            self.radar,
+            newer_than=calibrated_at,
+        )
+        logger.info(
+            "[MISSION1] Radar basepoint calibrated: {}", navi.basepoint
+        )
+
+        self._start_vision_tracker()
+        self.fc.set_indicator_led(255, 0, 0)
+
+        prepare_command = self._wait_for_ground_command(
+            CommandId.DRONE_PREPARE_MISSION
+        )
+        try:
+            self.fc.set_digital_output(0, True)
+            self._digital_output_enabled = True
+            self.signals.send_initialization_success()
+            self._ground_commands.complete(prepare_command)
+        except Exception:
+            self._ground_commands.fail(prepare_command, error_code=1)
+            raise
+        logger.warning(
+            "[MISSION1] Digital output 0 enabled; "
+            "confirm payload and drop-area safety"
+        )
+
+        takeoff_command = self._wait_for_ground_command(
+            CommandId.DRONE_START_MISSION
+        )
+        self.signals.send_takeoff_signal_received()
+        if self.stop_event.is_set():
+            self._ground_commands.fail(takeoff_command, error_code=1)
+            return
+        self.fc.set_indicator_led(0, 255, 0)
+        self.signals.send_takeoff_started()
+
+        try:
+            navi.set_vertical_speed(mission1.FAST_TAKEOFF_VERTICAL_SPEED)
+            navi.fast_non_pointing_takeoff(
+                target_height=mission1.CRUISE_HEIGHT,
+            )
+            navi.set_vertical_speed(mission1.VERTICAL_SPEED)
+            self._ground_commands.complete(takeoff_command)
+        except Exception:
+            self._ground_commands.fail(takeoff_command, error_code=1)
+            raise
+        self.signals.send_takeoff_succeeded()
+
+        # 起飞完成后先稳定偏航，再悬停 2.5s，随后关闭指示灯继续追及。
+        navi.set_yaw(0)
+        if not navi.wait_for_yaw():
+            raise RuntimeError("Yaw stabilization was not confirmed")
+        logger.info(
+            "[MISSION1] Hovering {:.1f}s after takeoff before pursuit",
+            HOVER_BEFORE_PURSUIT_SECONDS,
+        )
+        time.sleep(HOVER_BEFORE_PURSUIT_SECONDS)
+        self.fc.set_indicator_led(0, 0, 0)
 
         logger.info(
-            "[MISSION] Pointing takeoff to {}cm at {}",
-            CRUISE_HEIGHT,
-            TAKEOFF_POINT,
+            "[MISSION1] Pursuit trajectory started with {} points; "
+            "speed {}cm/s, then {}cm/s toward {}, then {}cm/s",
+            len(self._pursuit_trajectory),
+            PURSUIT_SPEED,
+            PURSUIT_APPROACH_SPEED,
+            PURSUIT_SLOWDOWN_POINT,
+            PURSUIT_AFTER_SLOWDOWN_SPEED,
         )
-        navi.pointing_takeoff(TAKEOFF_POINT, CRUISE_HEIGHT)
-
-        logger.info("[MISSION] Navigate to entry point {}", ENTRY_POINT)
-        if not navi.navigation_to_waypoint(ENTRY_POINT, wait=True):
-            raise RuntimeError("Failed to reach entry point")
-
-        # 使用远端 +x 目标维持前飞方向。set_navigation_speed() 只是 PID 参数，
-        # 实际速度仍由定位误差、PID 输出和飞行状态共同决定。
-        forward_target = np.array(
-            [ENTRY_POINT[0] + FORWARD_GUIDANCE_DISTANCE, ENTRY_POINT[1]]
+        self._clear_vision_samples()
+        self._pursuit_speed_schedule = PursuitSpeedSchedule(
+            initial_speed=PURSUIT_SPEED,
+            approach_speed=PURSUIT_APPROACH_SPEED,
+            after_slowdown_speed=PURSUIT_AFTER_SLOWDOWN_SPEED,
         )
         navi.set_navigation_speed(PURSUIT_SPEED)
         navi.switch_pid("navi")
-        navi.direct_set_waypoint(forward_target)
-        logger.info(
-            "[MISSION] Pursuing along +x with navigation-speed parameter {}",
-            PURSUIT_SPEED,
-        )
+        if not navi.navigation_follow_trajectory(
+            self._pursuit_trajectory,
+            wait=False,
+            pos_thres=PURSUIT_POSITION_THRESHOLD,
+        ):
+            raise RuntimeError("Failed to start task 1 pursuit trajectory")
 
-        if not self.wait_until_target_detected():
-            raise RuntimeError("Target detection stopped or failed")
+        self.signals.send_pursuit_started()
+        self._wait_until_target_detected_on_trajectory()
+        self.signals.send_escort_started()
+        self._perform_target_action()
 
-        # 不更换目标点，只收紧 PID 输出限幅，因此继续保持原 +x 方向。
-        navi.set_navigation_speed(ESCORT_SPEED)
-        logger.info(
-            "[MISSION] Escorting with navigation-speed parameter {}",
-            ESCORT_SPEED,
-        )
-        if not self._wait_with_stop(ESCORT_OUTPUT_ON_SECONDS):
-            return
-
-        fc.set_digital_output(0, False)
-        logger.info("[MISSION] Digital output 0 disabled")
-
-        if not self._wait_with_stop(ESCORT_OUTPUT_OFF_SECONDS):
-            return
-
-        # 终止 +x 引导并锁定当前位置，再创建返航轨迹，避免目标点竞争。
-        navi.navigation_stop_here()
-        logger.info("[MISSION] Returning to takeoff point {}", TAKEOFF_POINT)
-        if not navi.navigation_to_waypoint(TAKEOFF_POINT, wait=True):
+        # 投放完成时已切换 H 检测；相机保持全程开启。
+        navi.set_navigation_speed(RETURN_SPEED)
+        if not navi.navigation_to_waypoint(
+            mission1.TAKEOFF_POINT,
+            wait=True,
+        ):
             raise RuntimeError("Failed to return to takeoff point")
-        logger.info("[MISSION] Returned to takeoff point")
+
+        self.signals.send_landing_started()
+        self._visual_h_landing_at_takeoff()
+        self.signals.send_mission_completed()
+        logger.info(
+            "[MISSION1] Moving-target visual descent flight completed"
+        )
 
 
-def main():
+def main() -> None:
     fc = FC_Controller()
     radar = LD_Radar()
     stop_event = threading.Event()
-    navi = None
-    mission = None
-    digital_output_enabled = False
+    navi: Optional[Navigation] = None
+    mission: Optional[MovingTargetVisualDescentMission] = None
+    fleet_node = None
 
     try:
-        # server_ros.py 已关闭：本程序按单雷达方案直连飞控串口。
-        fc.start_listen_serial(serial_dev=FC_SERIAL_DEV, print_state=False)
+        fc.start_listen_serial(
+            serial_dev=mission1.FC_SERIAL_DEV,
+            print_state=False,
+        )
         if not fc.wait_for_connection(timeout_s=10):
-            raise RuntimeError("Flight controller connection timeout")
-        logger.info("[MANAGER] Flight controller connected")
-
-        # 按任务要求，在确认飞控连接后立即打开数字输出 0。
-        fc.set_digital_output(0, True)
-        digital_output_enabled = True
-        logger.info("[MANAGER] Digital output 0 enabled")
+            raise RuntimeError("Flight-controller connection timeout")
+        if not fc.state.is_fresh(0.5):
+            raise RuntimeError("Flight-controller telemetry is stale")
+        if fc.state.unlock.value:
+            raise RuntimeError(
+                "Flight controller is already unlocked; mission will not take control"
+            )
+        logger.info(
+            "[MISSION1] Flight controller connected through direct serial"
+        )
 
         radar.debug = False
         radar.start()
-        logger.info("[MANAGER] Single radar started")
+        logger.info("[MISSION1] Single radar started")
 
-        navi = Navigation(fc=fc, radar=radar, stop_event=stop_event)
-        mission = Mission(
+        navi = descent_test.SingleRadarNavigation(
+            fc=fc,
+            radar=radar,
+            stop_event=stop_event,
+        )
+        mission = MovingTargetVisualDescentMission(
             fc=fc,
             radar=radar,
             navi=navi,
             stop_event=stop_event,
         )
+        fleet_node = mission1.attach_air_fleet_node(
+            fc,
+            navi,
+            stop_event,
+            readonly=True,
+            allow_start_mission=True,
+            state_provider=mission1.MissionFleetStateProvider(fc, navi, mission),
+            trace_options=TraceSamplingOptions(
+                enabled=True,
+                sample_interval_s=mission1.FLEET_TRACE_SAMPLE_INTERVAL_SECONDS,
+                buffer_capacity=mission1.FLEET_TRACE_BUFFER_CAPACITY,
+                min_distance_cm=mission1.FLEET_TRACE_MIN_DISTANCE_CM,
+                stationary_keepalive_s=(
+                    mission1.FLEET_TRACE_STATIONARY_KEEPALIVE_SECONDS
+                ),
+            ),
+        )
+        mission.bind_ground_commands(fleet_node.command_queue)
         mission.run()
     except KeyboardInterrupt:
-        logger.warning("[MANAGER] Mission interrupted by user")
+        logger.warning("[MISSION1] Interrupted by user")
     except Exception:
-        logger.exception("[MANAGER] Mission failed")
+        if mission is not None:
+            mission.set_fleet_status(
+                mission1.MissionOperationState.FAULT,
+                error_code=1,
+            )
+        logger.exception("[MISSION1] Moving-target visual descent mission failed")
     finally:
         if mission is not None:
-            mission.stop()
-        elif navi is not None:
-            navi.stop()
-
-        if digital_output_enabled:
             try:
-                fc.set_digital_output(0, False)
+                mission.stop()
             except Exception:
-                logger.exception("[MANAGER] Failed to disable digital output 0")
+                logger.exception("[MISSION1] Failed to stop mission")
+            try:
+                mission.write_visual_descent_log()
+            except Exception:
+                logger.exception(
+                    "[MISSION1] Failed to write moving-target log"
+                )
+        elif navi is not None:
+            try:
+                navi.stop()
+            except Exception:
+                logger.exception("[MISSION1] Failed to stop navigation")
 
-        # 正常返航后或异常退出时均执行已有的安全降落兜底。
         try:
-            if fc.state.unlock.value:
-                logger.warning("[MANAGER] Auto landing")
-                fc.set_flight_mode(fc.PROGRAM_MODE)
-                fc.stablize()
-                fc.land()
-                if not fc.wait_for_lock(timeout_s=20):
-                    logger.error(
-                        "[MANAGER] Landing lock not confirmed; keep landing command active "
-                        "and refuse airborne force-lock"
-                    )
-                    fc.land()
+            if fc.connected:
+                fc.set_indicator_led(0, 0, 0)
         except Exception:
-            logger.exception("[MANAGER] Auto landing failed")
+            logger.exception("[MISSION1] Failed to turn off indicator LED")
+
+        try:
+            if fc.connected:
+                fc.set_digital_output(0, False)
+        except Exception:
+            logger.exception(
+                "[MISSION1] Failed to disable digital output 0"
+            )
+
+        try:
+            if fc.connected and fc.state.unlock.value:
+                descent_test.emergency_land(fc)
+        except Exception:
+            logger.exception("[MISSION1] Emergency landing request failed")
 
         try:
             if radar.running:
                 radar.stop()
         except Exception:
-            logger.exception("[MANAGER] Failed to stop radar")
+            logger.exception("[MISSION1] Failed to stop radar")
 
-        fc.close()
-        logger.info("[MANAGER] Mission finished")
+        if fleet_node is not None:
+            mission1.drain_terminal_fleet_trace(fleet_node)
+            fleet_node.close()
+        try:
+            fc.close()
+        except Exception:
+            logger.exception("[MISSION1] Failed to close flight controller")
+        logger.info("[MISSION1] Moving-target visual descent mission finished")
 
 
 if __name__ == "__main__":
