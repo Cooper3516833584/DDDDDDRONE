@@ -1,6 +1,6 @@
 """2026 空地协同救援物资投放赛无人机主入口。
 
-默认仅连接飞控和雷达监视位姿；真实飞行还需 ``--confirm-flight``、
+默认仅连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
 视觉与避障接口实现、投放数量、继电器端口和终端 ``start_mission`` 指令。
 运行前确认 server_ros.py / FC_Server 未运行，避免抢占飞控串口。
 
@@ -40,7 +40,7 @@ FREE_DROP_HEIGHT = 80.0
 MANDATORY_DROP_HEIGHT = 100.0
 TAKEOFF_POINT = (0.0, 0.0)
 LANDING_HEIGHT_TIMEOUT = 8.0
-RADAR_POSE_READY_TIMEOUT = 15.0
+LIO_POSE_READY_TIMEOUT = 15.0
 MONITOR_INTERVAL = 1.0
 
 # 视觉初值沿用 former_code/2026_disaster_survey.py；超时和丢失等待由用户指定。
@@ -210,8 +210,21 @@ class DropLedger:
         return channel
 
 
+def wait_for_lio_basepoint(navi: Navigation, timeout: float = LIO_POSE_READY_TIMEOUT) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            navi.calibrate_basepoint(wait=False)
+            if navi.lio_pose.get_pose() is not None:
+                return
+        except RuntimeError:
+            pass
+        time.sleep(0.1)
+    raise RuntimeError("fresh LIO pose was not ready before timeout")
+
+
 class SingleRadarNavigation(Navigation):
-    """沿用模板的任务层兼容补丁：只在雷达三轴位姿有效时更新时间戳。"""
+    """Retained for legacy bench scripts; the rescue entry does not instantiate it."""
 
     def _get_radar_pose(self, wait=True):
         pose = super()._get_radar_pose(wait=wait)
@@ -220,12 +233,8 @@ class SingleRadarNavigation(Navigation):
         return pose
 
 
-def wait_for_radar_pose(
-    navi: Navigation,
-    radar: LD_Radar,
-    timeout: float = RADAR_POSE_READY_TIMEOUT,
-    newer_than: float = 0.0,
-) -> None:
+def wait_for_radar_pose(navi, radar, timeout=15.0, newer_than=0.0):
+    """Retained for legacy bench scripts; the rescue entry uses LIO."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         pose_inited = getattr(radar, "_rt_pose_inited", [False, False, False])
@@ -238,12 +247,11 @@ def wait_for_radar_pose(
 
 
 class Mission:
-    def __init__(self, fc: FC_Controller, radar: LD_Radar, navi: Navigation,
+    def __init__(self, fc: FC_Controller, navi: Navigation,
                  relay: Optional[LCUSRelay], vision: Optional[VisionInterface],
                  obstacle: Optional[ObstacleInterface], allocation: Dict[str, int],
                  stop_event: threading.Event):
         self.fc = fc
-        self.radar = radar
         self.navi = navi
         self.relay = relay
         self.vision = vision
@@ -268,18 +276,15 @@ class Mission:
     def prepare_navigation(self) -> None:
         self.navi.set_navigation_speed(CRUISE_SPEED)
         self.navi.set_vertical_speed(VERTICAL_SPEED)
-        self.navi.start(mode="radar")
-        wait_for_radar_pose(self.navi, self.radar)
-        self.navi.calibrate_basepoint()
-        calibrated_at = time.monotonic()
-        wait_for_radar_pose(self.navi, self.radar, newer_than=calibrated_at)
-        logger.info("[RESCUE] Radar basepoint calibrated: {}", self.navi.basepoint)
+        self.navi.start()
+        wait_for_lio_basepoint(self.navi)
+        logger.info("[RESCUE] LIO basepoint calibrated: {}", self.navi.basepoint)
 
     def monitor_pose(self) -> None:
         logger.warning("[RESCUE] Monitor-only mode; press Ctrl+C to exit")
         while not self.stop_event.wait(MONITOR_INTERVAL):
             if not self.navi.pose_is_fresh():
-                logger.warning("[RESCUE] Radar navigation pose is stale")
+                logger.warning("[RESCUE] LIO navigation pose is stale")
                 continue
             logger.info("[RESCUE] position=({:.1f},{:.1f})cm yaw={:.1f}deg",
                         self.navi.current_x, self.navi.current_y,
@@ -333,7 +338,7 @@ class Mission:
         if not self.fc.state.is_fresh(0.5):
             raise RuntimeError("flight-controller telemetry is stale")
         if not self.navi.pose_is_fresh():
-            raise RuntimeError("single-radar navigation pose is stale")
+            raise RuntimeError("LIO navigation pose is stale")
         if check_deadline and self.deadline is not None and time.monotonic() >= self.deadline:
             raise MissionDeadline("20-minute mission deadline reached")
 
@@ -664,9 +669,8 @@ def emergency_land(fc: FC_Controller) -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="2026 救援物资投放无人机主入口")
     parser.add_argument("--confirm-flight", action="store_true",
-                        help="启用真实飞行；默认仅监视单雷达位姿")
+                        help="启用真实飞行；默认仅监视 LIO 位姿")
     parser.add_argument("--fc-port", default=FC_SERIAL_DEV)
-    parser.add_argument("--radar-port", default=None)
     parser.add_argument("--relay-port", default=None,
                         help="LCUS 继电器串口；也可用 D_TASK_RELAY_PORT 环境变量")
     parser.add_argument("--red-count", type=int)
@@ -701,7 +705,6 @@ def main() -> int:
     args = parse_args()
     stop_event = threading.Event()
     fc: Optional[FC_Controller] = None
-    radar: Optional[LD_Radar] = None
     navi: Optional[Navigation] = None
     relay: Optional[LCUSRelay] = None
     mission: Optional[Mission] = None
@@ -728,11 +731,8 @@ def main() -> int:
         if fc.state.unlock.value:
             raise RuntimeError("flight controller already unlocked; refuse takeover")
 
-        radar = LD_Radar()
-        radar.debug = False
-        radar.start(com=args.radar_port)
-        navi = SingleRadarNavigation(fc=fc, radar=radar, stop_event=stop_event)
-        mission = Mission(fc, radar, navi, None, vision, obstacle, allocation, stop_event)
+        navi = Navigation(fc=fc, stop_event=stop_event)
+        mission = Mission(fc, navi, None, vision, obstacle, allocation, stop_event)
         mission.prepare_navigation()
 
         if not args.confirm_flight:
@@ -798,12 +798,6 @@ def main() -> int:
             finally:
                 relay.close()
 
-        if radar is not None:
-            try:
-                if radar.running:
-                    radar.stop()
-            except Exception:
-                logger.exception("[RESCUE] Failed to stop radar")
         if fc is not None:
             try:
                 fc.close()

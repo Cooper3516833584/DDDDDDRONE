@@ -121,7 +121,7 @@ class Navigation(object):
         #####################################
         self.keep_height_flag = False  # 定高状态
         self.navigation_flag = False  # 导航状态
-        self.keep_height_by_rs = False  # 使用realsense定高
+        self.keep_height_by_rs = False  # 历史兼容字段；运行时高度仅使用飞控遥测
         self.stop_event = kwargs.get("stop_event")
         self.running = False
         self._control_lock = threading.Lock()
@@ -406,20 +406,13 @@ class Navigation(object):
         paused = False
         while self.running:
             try:
-                if not self.keep_height_by_rs:
-                    if not self.fc.state.update_event.wait(1):
-                        logger.warning("[NAVI] FC state update timeout")
-                        self.update_realtime_control(vel_z=0, _source="height")
-                        continue
-                    self.fc.state.update_event.clear()
-                    self.current_height = self.fc.state.alt_add.value
-                    height = self.current_height
-                else:
-                    if not self.rs.update_event.wait(1):
-                        logger.warning("[NAVI] RealSense height timeout")
-                        self.update_realtime_control(vel_z=0, _source="height")
-                        continue
-                    height = self.current_height_rs
+                if not self.fc.state.update_event.wait(1):
+                    logger.warning("[NAVI] FC state update timeout")
+                    self.update_realtime_control(vel_z=0, _source="height")
+                    continue
+                self.fc.state.update_event.clear()
+                self.current_height = self.fc.state.alt_add.value
+                height = self.current_height
                 logger_dbg.debug(f"[NAVI] Current height: {height}")
                 if not (
                     self.keep_height_flag
