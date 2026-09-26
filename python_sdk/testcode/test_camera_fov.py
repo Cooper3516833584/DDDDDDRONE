@@ -8,11 +8,12 @@ test_camera_fov.py
   - 下视 USB 摄像头已连接在 /dev/video0
   - 本脚本通过 FC_Client 连接 FC_Server，不直接抢占飞控串口
 
-照片保存在 /home/fc/桌面/DDDDDrone_Cloned 下。
+照片保存在仓库根目录的 fc_log/ 下（该目录已被 .gitignore 忽略）。
 通过照片中地面覆盖区域和已知高度(150cm)可推算摄像头实际视场角(FOV)。
 """
 import os
 import time
+from pathlib import Path
 import cv2
 from datetime import datetime
 from loguru import logger
@@ -26,7 +27,8 @@ from FlightController.Components.RosNode import RosNodeRunner
 # ============ 可调参数 ============
 CRUISE_HEIGHT = 150          # 拍照高度 cm
 CAMERA_INDEX = 0             # 下视 USB 摄像头索引 (/dev/video0)
-SAVE_DIR = "/home/fc/桌面/DDDDDrone_Cloned"
+# 仓库根目录下的 fc_log/，不写死主机绝对路径
+SAVE_DIR = str(Path(__file__).resolve().parents[2] / "fc_log")
 CART_TIMEOUT = 30.0          # Cartographer TF 初始化超时 / s
 # =================================
 

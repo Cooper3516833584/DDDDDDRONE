@@ -1,0 +1,7 @@
+# Keep the LX flight controller out of ModemManager.
+#
+# 2026-09-26 暂时停用 SYSTEMD_WANTS：目标程序已从 python_sdk/ 移到 python_sdk/former_code/，
+# 现有 systemd 单元的 ExecStart 指向的文件不存在，插上飞控若仍触发启动会反复失败重启。
+# 等新任务入口确定、单元按新入口重新安装后，取消下面那一行的注释即可恢复。
+ACTION!="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="66cc", ATTRS{idProduct}=="2233", ATTRS{serial}=="76", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="systemd"
+# ACTION!="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="66cc", ATTRS{idProduct}=="2233", ATTRS{serial}=="76", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="d-task-drone-dispatcher.service"
