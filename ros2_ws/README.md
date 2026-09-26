@@ -69,8 +69,12 @@ launch-time facts only, not rate or drift measurements:
 - `/livox/lidar` carries `livox_ros_driver2/msg/CustomMsg`, and
   `laser_mapping` subscribes to `/livox/lidar` and `/livox/imu`.
 - `/Odometry` and `/Odometry_highrate` both have a `laser_mapping` publisher.
-- The driver logs `bind failed` and `Failed to init livox lidar sdk` while the
-  `enp3s0` port has no carrier.
+- The driver logs `bind failed` and `Failed to init livox lidar sdk` when no
+  process holds `192.168.1.50` on `enp3s0`. With NetworkManager applying the
+  saved static address, the same launch reaches `Init lds lidar success!`.
+- No `/livox/lidar` or `/livox/imu` publisher exists until the LiDAR actually
+  delivers data, so the four topics only carry a `laser_mapping` subscription
+  until the MID360S is connected.
 
 Still unmeasured because no MID360S is attached: the four topic rates,
 stationary drift, hand translation/rotation direction, and timestamp

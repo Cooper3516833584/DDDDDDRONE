@@ -282,7 +282,10 @@ systemctl set-default multi-user.target
   产出 `livox_ros_driver2_node`、`fastlio_mapping`；`ros2 pkg list` 与 `rclpy` 正常。
 - 升级时停用的第三方 apt 源以 `*.disabled-for-jammy-upgrade` 形式保留在 `/etc/apt/sources.list.d/`
   （ros-fish、librealsense、nemh、graphics-drivers），未删除、未启用。
-- `enp3s0` 的 NetworkManager 配置（manual `192.168.1.50/24`、autoconnect）在升级后保留。
+- `enp3s0` 的 NetworkManager 配置（manual `192.168.1.50/24`、autoconnect）在升级后保留，并已由 NM
+  激活下发：即使网线未接（载波 0），`ip -4 addr show enp3s0` 也能看到 `192.168.1.50/24`，
+  驱动启动即可越过绑定阶段（日志 `Init lds lidar success!`）。此前临时手工加地址被 NM 接管后生成的
+  假定连接 `/run/NetworkManager/system-connections/enp3s0.nmconnection` 已删除。
 - python_sdk 的 pip 依赖原装在 python3.8 目录，升级后对 python3.10 不可见；已按
   `python_sdk/requirements.txt` 的 pin 重装到用户 site，15 个模块导入全部通过：numpy 1.24.4、
   scipy 1.10.1、matplotlib 3.7.5、cv2 4.8.0、ultralytics 8.4.100、onnxruntime 1.16.3、
