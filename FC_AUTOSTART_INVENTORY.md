@@ -174,12 +174,18 @@ udev 规则目录只剩 `.disabled` 文件。单元文件 `/etc/systemd/system/t
 `/etc/udev/rules.d/99-lx-flight-controller.rules` 删掉了
 `ENV{SYSTEMD_WANTS}+="d-task-drone-dispatcher.service"`，只保留 `ID_MM_DEVICE_IGNORE` 模板保护。
 
-### 4.3 `.zshrc` 里的 ROS 加载
+### 4.3 shell 里的 ROS 加载
 
 删除 `# >>> fishros initialize >>>` 整块（含 `source /opt/ros/foxy/setup.zsh`）与
 `source ~/prj/ros2ws/install/setup.zsh`。`zsh -n` 通过，交互式登录 shell 验证正常。
 2026-09-27 将 `~/.bashrc` 第 120 行改为 `source /opt/ros/humble/setup.bash`，并保留
 `/home/fc/.bashrc.pre-humble-20260927` 备份。交互式 shell 验证 `ROS_DISTRO=humble`。
+默认登录 shell 是 zsh；升级后新 zsh 会话原本找不到 `ros2`。现已在 `~/.zshrc` 加入
+`source /opt/ros/humble/setup.zsh`，保留 `/home/fc/.zshrc.pre-humble-20260927` 备份，
+用干净环境的新 zsh 登录会话验证 `ROS_DISTRO=humble` 且能找到 `ros2`。
+两种 shell 还加载 `/home/fc/dddddrone/ros2_ws/install/setup.{zsh,bash}`，使新登录会话能解析
+`fast_lio` 和 `livox_ros_driver2`；改动前的 shell 文件另存为
+`/home/fc/.zshrc.pre-overlay-20260927` 和 `/home/fc/.bashrc.pre-overlay-20260927`。
 
 ### 4.4 更早的旧入口（2026-09-26 上午之前）
 
@@ -230,7 +236,9 @@ systemctl set-default multi-user.target
 | GUI | `systemctl set-default graphical.target && systemctl enable --now gdm3.service` |
 | T265 自启（2026-09-27 重新启用） | `sudo mv /etc/udev/rules.d/99-t265-boot-init.rules.disabled /etc/udev/rules.d/99-t265-boot-init.rules && sudo udevadm control --reload-rules && sudo systemctl enable --now t265-boot-init.timer t265-boot-init.service`（单元文件一直保留在 `/etc/systemd/system/`，未删除） |
 | dispatcher 自启 | 从 `/home/fc/deployment_backups/autostart-clear-20260926-112155/` 恢复单元与 drop-in，`systemctl daemon-reload` |
-| `.zshrc` | 同一备份目录的 `zshrc.before` |
+| `.zshrc` | 本次工作区加载改动可从 `/home/fc/.zshrc.pre-overlay-20260927` 恢复；Humble 加载前版本在 `/home/fc/.zshrc.pre-humble-20260927` |
+| `.bashrc` | 本次工作区加载改动可从 `/home/fc/.bashrc.pre-overlay-20260927` 恢复；Humble 加载前版本在 `/home/fc/.bashrc.pre-humble-20260927` |
+| Live ISO 校验服务 | `sudo systemctl enable casper-md5check.service`（仅在重新需要安装介质校验时） |
 | FC udev 规则 | 同一备份目录的 `99-lx-flight-controller.rules.before` |
 | 更早的旧入口 | 按 `/home/fc/legacy_sources/MANIFEST.md` 逐项搬回 |
 | 2026-09-26 上午那轮改造 | `/home/fc/deployment_backups/autostart-rework-20260926-104949/` |
@@ -286,11 +294,15 @@ systemctl set-default multi-user.target
   激活下发：即使网线未接（载波 0），`ip -4 addr show enp3s0` 也能看到 `192.168.1.50/24`，
   驱动启动即可越过绑定阶段（日志 `Init lds lidar success!`）。此前临时手工加地址被 NM 接管后生成的
   假定连接 `/run/NetworkManager/system-connections/enp3s0.nmconnection` 已删除。
-- python_sdk 的 pip 依赖原装在 python3.8 目录，升级后对 python3.10 不可见；已按
-  `python_sdk/requirements.txt` 的 pin 重装到用户 site，15 个模块导入全部通过：numpy 1.24.4、
+- python_sdk 的 pip 依赖原装在 python3.8 目录，升级后对 python3.10 不可见；已重装到用户 site。
+  `python_sdk/requirements.txt` 已更新为 22.04 / Python 3.10 的实际版本；模块导入通过：numpy 1.24.4、
   scipy 1.10.1、matplotlib 3.7.5、cv2 4.8.0、ultralytics 8.4.100、onnxruntime 1.16.3、
   torch 2.3.1+cpu、torchvision 0.18.1+cpu、pyrealsense2 2.53.1.4623、pupil-apriltags 1.0.4.post10、
-  pyzbar 0.1.9、pyserial 3.5、loguru 0.5.3、simple-pid 2.0.0、attrs 19.3.0。两处与文件的偏差已确认：
-  `pyrealsense2==2.51.1.4348` 没有 cp310 wheel，改用可用的 `2.53.1.4623`；`torch`/`torchvision`
-  用 CPU 轮子（N97 无 NVIDIA GPU），版本仍为文件所依赖的 2.3.1 / 0.18.1。
-- `~/.bashrc` 已改为加载 Humble；`/opt/ros/foxy` 目录仍存在，但不再由 `~/.bashrc` 加载。
+  pyzbar 0.1.9、pyserial 3.5、loguru 0.5.3、simple-pid 2.0.0、attrs 21.4.0。
+  `pyrealsense2` 改用可供 cp310 安装的 2.53.1.4623；`torch`/`torchvision`
+  用 CPU 轮子（N97 无 NVIDIA GPU），版本为 2.3.1 / 0.18.1。`pip check` 无冲突。
+  定位与 FleetBus 的 61 项纯逻辑测试通过；真实相机、雷达和飞控操作未验证。
+- `~/.bashrc` 和 `~/.zshrc` 均加载 Humble 与项目工作区；干净的新 bash/zsh 会话均可解析
+  `fast_lio`、`livox_ros_driver2`。`/opt/ros/foxy` 目录仍存在，但不再由登录 shell 加载。
+- 升级后唯一失败服务 `casper-md5check` 属安装介质校验：机器从已安装的根分区启动，
+  `/cdrom/md5sum.txt` 不存在。已停用并清除失败状态；`systemctl --failed` 现在为空。
