@@ -121,7 +121,7 @@ class Navigation(object):
         #####################################
         self.keep_height_flag = False  # 定高状态
         self.navigation_flag = False  # 导航状态
-        self.keep_height_by_rs = False  # 使用realsense定高
+        self.keep_height_by_rs = False  # 历史兼容字段；运行时高度仅使用飞控遥测
         self.stop_event = kwargs.get("stop_event")
         self.running = False
         self._control_lock = threading.Lock()
@@ -406,20 +406,13 @@ class Navigation(object):
         paused = False
         while self.running:
             try:
-                if not self.keep_height_by_rs:
-                    if not self.fc.state.update_event.wait(1):
-                        logger.warning("[NAVI] FC state update timeout")
-                        self.update_realtime_control(vel_z=0, _source="height")
-                        continue
-                    self.fc.state.update_event.clear()
-                    self.current_height = self.fc.state.alt_add.value
-                    height = self.current_height
-                else:
-                    if not self.rs.update_event.wait(1):
-                        logger.warning("[NAVI] RealSense height timeout")
-                        self.update_realtime_control(vel_z=0, _source="height")
-                        continue
-                    height = self.current_height_rs
+                if not self.fc.state.update_event.wait(1):
+                    logger.warning("[NAVI] FC state update timeout")
+                    self.update_realtime_control(vel_z=0, _source="height")
+                    continue
+                self.fc.state.update_event.clear()
+                self.current_height = self.fc.state.alt_add.value
+                height = self.current_height
                 logger_dbg.debug(f"[NAVI] Current height: {height}")
                 if not (
                     self.keep_height_flag
@@ -516,6 +509,7 @@ class Navigation(object):
 
     def _navigation_task(self):
         paused = False
+        pose_available = True
         while self.running:
             try:
                 if self.stop_event is not None and self.stop_event.is_set():
@@ -529,7 +523,9 @@ class Navigation(object):
                     self.update_realtime_control(
                         vel_x=0, vel_y=0, yaw=0, _source="navigation"
                     )
-                    logger.warning("[NAVI] Navigation pose not available")
+                    if pose_available:
+                        logger.warning("[NAVI] Navigation pose not available")
+                        pose_available = False
                     time.sleep(0.05)
                     continue
                 self.current_x, self.current_y, self.current_yaw, available = (
@@ -540,6 +536,18 @@ class Navigation(object):
                 )
                 if available:
                     self._last_pose_update = time.monotonic()
+                    if not pose_available:
+                        logger.info("[NAVI] Navigation pose restored")
+                        pose_available = True
+                else:
+                    self.update_realtime_control(
+                        vel_x=0, vel_y=0, yaw=0, _source="navigation"
+                    )
+                    if pose_available:
+                        logger.warning("[NAVI] Navigation pose not available")
+                        pose_available = False
+                    time.sleep(0.05)
+                    continue
                 logger_dbg.info(f"[NAVI] Pose: {self.current_x}, {self.current_y}, {self.current_yaw}")
                 if not (
                     self.navigation_flag
@@ -562,13 +570,6 @@ class Navigation(object):
                     self.navi_y_pid.set_auto_mode(True, last_output=0)
                     self.yaw_pid.set_auto_mode(True, last_output=0)
                     logger.info("[NAVI] Navigation resumed")
-                if not available:
-                    logger.warning("[NAVI] Pose not available")
-                    self.update_realtime_control(
-                        vel_x=0, vel_y=0, yaw=0, _source="navigation"
-                    )
-                    time.sleep(0.1)
-                    continue
                 # self.fc.send_general_position(x=self.current_x, y=self.current_y)
                 out_x_world = self.navi_x_pid(self.current_x)
                 out_y_world = self.navi_y_pid(self.current_y)
