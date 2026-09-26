@@ -178,8 +178,8 @@ udev 规则目录只剩 `.disabled` 文件。单元文件 `/etc/systemd/system/t
 
 删除 `# >>> fishros initialize >>>` 整块（含 `source /opt/ros/foxy/setup.zsh`）与
 `source ~/prj/ros2ws/install/setup.zsh`。`zsh -n` 通过，交互式登录 shell 验证正常。
-已知遗留：`~/.bashrc` 第 120 行仍有 `source /opt/ros/foxy/setup.bash`，本次未动。
-2026-09-27 系统升级到 Ubuntu 22.04 后 `/opt/ros/foxy` 已失效、`/opt/ros/humble` 已安装，该行仍是旧路径且未修改（见第 11 节）。
+2026-09-27 将 `~/.bashrc` 第 120 行改为 `source /opt/ros/humble/setup.bash`，并保留
+`/home/fc/.bashrc.pre-humble-20260927` 备份。交互式 shell 验证 `ROS_DISTRO=humble`。
 
 ### 4.4 更早的旧入口（2026-09-26 上午之前）
 
@@ -293,5 +293,4 @@ systemctl set-default multi-user.target
   pyzbar 0.1.9、pyserial 3.5、loguru 0.5.3、simple-pid 2.0.0、attrs 19.3.0。两处与文件的偏差已确认：
   `pyrealsense2==2.51.1.4348` 没有 cp310 wheel，改用可用的 `2.53.1.4623`；`torch`/`torchvision`
   用 CPU 轮子（N97 无 NVIDIA GPU），版本仍为文件所依赖的 2.3.1 / 0.18.1。
-- 遗留未处理：`~/.bashrc` 第 120 行仍 `source /opt/ros/foxy/setup.bash`（Foxy 已随升级失效），
-  `/opt/ros/foxy` 目录仍存在；两处都未改动。
+- `~/.bashrc` 已改为加载 Humble；`/opt/ros/foxy` 目录仍存在，但不再由 `~/.bashrc` 加载。
