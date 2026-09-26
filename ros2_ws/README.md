@@ -20,10 +20,10 @@ colcon build --symlink-install --cmake-args -DROS_EDITION=ROS2 -DDISTRO_ROS=humb
 source install/setup.bash
 ```
 
-The current flight computer has Ubuntu 20.04 and ROS2 Foxy. To smoke-test its
-installed environment, source `/opt/ros/foxy/setup.bash` and use the same build
-command with `-DDISTRO_ROS=foxy`. This does not replace the requested Humble
-validation on Ubuntu 22.04.
+The flight computer (Intel N97) now runs Ubuntu 22.04 with ROS2 Humble. The
+Foxy installation it shipped with was upgraded in place, and both localization
+packages build on Humble with the command above without changing the pinned
+patch. `ros2-apt-source` supplies the Humble repository and its signing key.
 
 The driver source is `src/livox_ros_driver2` at
 `21445540f0d100dc86a7e6df312dd70bbdb4afdf`. FAST-LIO is
@@ -58,6 +58,23 @@ ros2 topic hz /Odometry_highrate
 Record stationary drift, hand translation/rotation direction, monotonic
 high-rate timestamps, and the four actual topic rates. Exercise LiDAR loss,
 FAST-LIO restart, and stale odometry with propellers removed.
+
+## Verified on the flight computer
+
+Checked on the upgraded flight computer with no LiDAR link, so these are
+launch-time facts only, not rate or drift measurements:
+
+- `livox_ros_driver2` and `fast_lio` build on Ubuntu 22.04 with Humble.
+- Both nodes register: `/livox_lidar_publisher` and `/laser_mapping`.
+- `/livox/lidar` carries `livox_ros_driver2/msg/CustomMsg`, and
+  `laser_mapping` subscribes to `/livox/lidar` and `/livox/imu`.
+- `/Odometry` and `/Odometry_highrate` both have a `laser_mapping` publisher.
+- The driver logs `bind failed` and `Failed to init livox lidar sdk` while the
+  `enp3s0` port has no carrier.
+
+Still unmeasured because no MID360S is attached: the four topic rates,
+stationary drift, hand translation/rotation direction, and timestamp
+continuity.
 
 ## Production measurements required
 
