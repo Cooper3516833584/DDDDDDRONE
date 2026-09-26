@@ -120,3 +120,6 @@ index d441261..ee900cb 100644
 +                last_highrate_imu = anchor;
 +                highrate_odom_ready = true;
 +            }
+@@ -1115 +1179 @@ private:
+-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
++    void map_save_callback(std_srvs::srv::Trigger::Request::SharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)

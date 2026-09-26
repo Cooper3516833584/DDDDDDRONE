@@ -20,6 +20,11 @@ colcon build --symlink-install --cmake-args -DROS_EDITION=ROS2 -DDISTRO_ROS=humb
 source install/setup.bash
 ```
 
+The current flight computer has Ubuntu 20.04 and ROS2 Foxy. To smoke-test its
+installed environment, source `/opt/ros/foxy/setup.bash` and use the same build
+command with `-DDISTRO_ROS=foxy`. This does not replace the requested Humble
+validation on Ubuntu 22.04.
+
 The driver source is `src/livox_ros_driver2` at
 `21445540f0d100dc86a7e6df312dd70bbdb4afdf`. FAST-LIO is
 `src/FAST_LIO_ROS2` at `2fffc570a25d0df172720bac034fbdb6a13d2162`.
