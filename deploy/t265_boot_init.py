@@ -41,12 +41,11 @@ LOG_BACKUPS = 2
 T265_IDS = ("8087", "0b37")
 VPU_IDS = ("03e7", "2150")
 USB_SYSFS = Path("/sys/bus/usb/devices")
-USB_DRIVER = Path("/sys/bus/usb/drivers/usb")
 USB_DEVS = Path("/dev/bus/usb")
 
 POLL_SECONDS = 2.0
 REENUMERATE_TIMEOUT = 12.0
-RESET_COOLDOWN_SECONDS = 120.0
+RESET_COOLDOWN_SECONDS = 60.0
 
 POSE_TIMEOUT_MS = 5000
 POSE_MAX_SECONDS = 15.0
@@ -55,7 +54,10 @@ POSE_MIN_CONFIDENT = 8
 CONFIDENT_LEVEL = 2  # rs.tracker_confidence MEDIUM
 QUATERNION_TOLERANCE = 0.02
 
-RESET_METHODS = ("usbdevfs_reset", "authorized", "unbind_bind")
+# "librealsense_kick" comes first because it is the only mechanism measured to
+# work on this machine: opening the device makes the firmware boot, whereas a
+# plain USB reset only resets the port in place and leaves it in the VPU state.
+RESET_METHODS = ("librealsense_kick", "usbdevfs_reset")
 USBDEVFS_RESET = 0x5514  # _IO('U', 20)
 
 def _rotate_log() -> None:
@@ -207,24 +209,44 @@ def _reset_usbdevfs(device: dict) -> None:
         os.close(descriptor)
 
 
-def _reset_authorized(device: dict) -> None:
-    authorized = device["path"] / "authorized"
-    authorized.write_text("0", encoding="utf-8")
-    time.sleep(1.0)
-    authorized.write_text("1", encoding="utf-8")
+_KICK_SOURCE = """
+import pyrealsense2 as rs
+
+ctx = rs.context()
+devices = list(ctx.devices)
+print("context devices: %d" % len(devices))
+for device in devices:
+    try:
+        print("  %s %s" % (device.get_info(rs.camera_info.name),
+                           device.get_info(rs.camera_info.serial_number)))
+    except Exception as exc:
+        print("  info error: %s" % exc)
+"""
 
 
-def _reset_unbind_bind(device: dict) -> None:
-    name = device["name"]
-    (USB_DRIVER / "unbind").write_text(name, encoding="utf-8")
-    time.sleep(1.0)
-    (USB_DRIVER / "bind").write_text(name, encoding="utf-8")
+def _kick_librealsense(device: dict) -> None:
+    """Open the device through librealsense, which makes the firmware boot.
+
+    This is what the old ``realsense-viewer`` step really did.  It has to happen
+    in a separate process: a live ``rs.context()`` keeps the device claimed, and
+    the pose check afterwards needs to open it again.
+    """
+
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, "-c", _KICK_SOURCE],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    detail = (result.stdout + result.stderr).strip().replace("\n", " | ")
+    log("  librealsense 引导（%s）: %s" % (device["ids"], detail[:400] or "(无输出)"))
 
 
 _RESETS = {
+    "librealsense_kick": _kick_librealsense,
     "usbdevfs_reset": _reset_usbdevfs,
-    "authorized": _reset_authorized,
-    "unbind_bind": _reset_unbind_bind,
 }
 
 
@@ -365,8 +387,9 @@ def run(wait_seconds: float) -> int:
         write_state(last="reset_cycle", reset_cycle_at=time.time(), at=time.time())
         if kind != "t265":
             log(
-                "三种复位方式都未能把设备带成 T265（当前 %s），%.0f 秒内不再重试；"
-                "若持续如此需要检查线缆/供电或人工重新插拔" % (kind, RESET_COOLDOWN_SECONDS)
+                "%s 都未能把设备带成 T265（当前 %s），%.0f 秒后重试；"
+                "若持续如此需要人工重新插拔，或检查线缆与 USB 端口"
+                % ("、".join(RESET_METHODS), kind, RESET_COOLDOWN_SECONDS)
             )
             return 1
 
