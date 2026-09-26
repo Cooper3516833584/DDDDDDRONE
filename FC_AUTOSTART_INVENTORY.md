@@ -5,10 +5,11 @@
 - 目标主机：`fc@192.168.31.176`
 - 主机名：`fc-ubuntu`
 - 最近一次完整核验与改造：2026-09-26 10:26—11:33（UTC+08:00）
+- 最近一次变更：2026-09-27——系统升级到 Ubuntu 22.04、T265 自启入口停用（见第 11 节）
 - 默认启动目标：`multi-user.target`（无图形）
 - 桌面会话：已停用，GDM 不启动；`nxserver`（NoMachine，`tcp/4000`）保留可用
 - 核验与配置方式：SSH 只读检查 + 用户授权后的受控修改；改动前的配置已备份
-- 配置生效范围：下一次开机。**T265 入口已通过一次真实受控重启验证**（见第 9 节）
+- 配置生效范围：下一次开机。T265 入口在 2026-09-26 通过一次真实受控重启验证，2026-09-27 已停用（见第 9、11 节）
 
 本文所称“启用”是指配置会在下一次满足对应启动条件时被系统加载；“正在运行”是指采集时确实发现对应进程或会话。二者不能互相替代。
 
@@ -17,13 +18,15 @@
 
 ## 2. 结论摘要
 
-全机只剩 **一个** 项目自启入口，就是 T265 的 bring-up；没有任何别的常驻项目进程。
+2026-09-27 起全机**没有任何项目自启入口**：唯一的 T265 bring-up 已停用。定位链（MID360S + FAST-LIO）不在自启动清单里，由 `python_sdk/server_ros.py` 在需要时按需启动。
 
 | 入口 | 类型 | 状态 | 作用 |
 |---|---|---|---|
-| `t265-boot-init.service` | 系统级 systemd（`Type=oneshot`, `User=root`） | `enabled` | 启动/插入时把 T265 从 VPU 带起来并验证位姿，成功即退出 |
-| `t265-boot-init.timer` | 系统级 timer | `enabled` + `active` | 每 30 秒轻量健康检查（兜底，健康时立即退出） |
-| `99-t265-boot-init.rules` | udev | 生效 | 插入边沿立即触发上面的 service |
+| `t265-boot-init.service` | 系统级 systemd（`Type=oneshot`, `User=root`） | `disabled` + `inactive` | 启动/插入时把 T265 从 VPU 带起来并验证位姿，成功即退出；新定位链已不使用 T265 |
+| `t265-boot-init.timer` | 系统级 timer | `disabled` + `inactive` | 每 30 秒轻量健康检查（原为兜底） |
+| `/etc/udev/rules.d/99-t265-boot-init.rules.disabled` | udev | 已停用（改名保留） | 原为插入边沿触发上面的 service |
+
+下图为停用前的设计链路，保留备查：
 
 ```mermaid
 flowchart TD
@@ -38,7 +41,7 @@ flowchart TD
 
 2026-09-26 之前的主角 `d-task-drone-dispatcher.service` 已整体移除，见第 4 节。
 
-## 3. 当前唯一入口：`t265-boot-init`
+## 3. 已停用的入口：`t265-boot-init`（2026-09-27 停用）
 
 ### 3.1 单元文件
 
@@ -136,6 +139,23 @@ t=7.60s   usb 2-1: 8087:0b37 Intel RealSense T265   ← 固件被引导，走 US
 `8087:0b37` / `03e7:2150` 设为 `0666`），这里用 root 是为了让日志与设备操作路径不受额外权限约束。
 若要收紧为 `User=fc`，需要把日志目录改到 `~/.local/state/` 再重新验证一次。
 
+### 3.6 2026-09-27 停用记录
+
+新定位链改用 MID360S + FAST-LIO2，T265 不再参与运行；经用户授权后按下述可恢复方式停用（未删除任何文件）：
+
+```bash
+sudo systemctl disable --now t265-boot-init.timer
+sudo systemctl disable --now t265-boot-init.service
+sudo mv /etc/udev/rules.d/99-t265-boot-init.rules \
+        /etc/udev/rules.d/99-t265-boot-init.rules.disabled
+sudo udevadm control --reload-rules
+```
+
+停用前该 timer 每约 35 秒空转一次（`/var/log/t265-boot-init/run.log` 记录“设备状态=absent”），机上也没有
+Realsense/T265 USB 设备。停用后核验：`systemctl is-enabled` 均为 `disabled`、`is-active` 均为 `inactive`，
+udev 规则目录只剩 `.disabled` 文件。单元文件 `/etc/systemd/system/t265-boot-init.service` 与
+`/etc/systemd/system/t265-boot-init.timer` 原样保留，重新启用的命令见第 8 节。
+
 ## 4. 2026-09-26 移除的入口
 
 ### 4.1 `d-task-drone-dispatcher.service`（已整体删除）
@@ -159,6 +179,7 @@ t=7.60s   usb 2-1: 8087:0b37 Intel RealSense T265   ← 固件被引导，走 US
 删除 `# >>> fishros initialize >>>` 整块（含 `source /opt/ros/foxy/setup.zsh`）与
 `source ~/prj/ros2ws/install/setup.zsh`。`zsh -n` 通过，交互式登录 shell 验证正常。
 已知遗留：`~/.bashrc` 第 120 行仍有 `source /opt/ros/foxy/setup.bash`，本次未动。
+2026-09-27 系统升级到 Ubuntu 22.04 后 `/opt/ros/foxy` 已失效、`/opt/ros/humble` 已安装，该行仍是旧路径且未修改（见第 11 节）。
 
 ### 4.4 更早的旧入口（2026-09-26 上午之前）
 
@@ -207,7 +228,7 @@ systemctl set-default multi-user.target
 | 改动 | 回退 |
 |---|---|
 | GUI | `systemctl set-default graphical.target && systemctl enable --now gdm3.service` |
-| T265 自启 | `systemctl disable --now t265-boot-init.timer t265-boot-init.service`，删掉单元与 `/etc/udev/rules.d/99-t265-boot-init.rules` 后 `udevadm control --reload-rules` |
+| T265 自启（2026-09-27 重新启用） | `sudo mv /etc/udev/rules.d/99-t265-boot-init.rules.disabled /etc/udev/rules.d/99-t265-boot-init.rules && sudo udevadm control --reload-rules && sudo systemctl enable --now t265-boot-init.timer t265-boot-init.service`（单元文件一直保留在 `/etc/systemd/system/`，未删除） |
 | dispatcher 自启 | 从 `/home/fc/deployment_backups/autostart-clear-20260926-112155/` 恢复单元与 drop-in，`systemctl daemon-reload` |
 | `.zshrc` | 同一备份目录的 `zshrc.before` |
 | FC udev 规则 | 同一备份目录的 `99-lx-flight-controller.rules.before` |
@@ -223,6 +244,8 @@ systemctl set-default multi-user.target
 - 三种 USB 复位手段无效、librealsense 打开有效，均在真机上对比确认（见 3.3）。
 - 静态验证：`systemd-analyze verify` 对两个单元无告警；`ast.parse` / `sh -n` / `git diff --check` 通过。
 - 全机自启动入口复查：除上述 T265 入口外为空。
+- 2026-09-27 停用后复查：两个单元 `is-enabled` 均为 `disabled`、`is-active` 均为 `inactive`；
+  `/etc/udev/rules.d/` 中只剩 `99-t265-boot-init.rules.disabled`，`udevadm control --reload-rules` 后不再加载 T265 规则。
 
 未完成：
 
@@ -231,15 +254,41 @@ systemctl set-default multi-user.target
 - **没有新任务入口，因此没有任何自启的常驻调度进程**；D 任务重启用时需按第 4.1 节重新配置并单独验证。
 - 未做任何解锁、起飞、移动、降落或执行器动作；未向地面站发送 `START`/`STOP`。
 - T265 位姿验证只证明“设备可用、位姿流干净”，不代表它在真实飞行中的长期稳定性。
+- T265 停用后**未做真实重启复验**：改动只影响自启动条件，没有在下一次开机后复查。
+- Python 依赖只验证了 `import`；使用这些库的视觉/任务脚本未运行（会驱动相机、串口或执行器）。
 
-## 10. 部署副本状态（2026-09-26 核验）
+## 10. 部署副本状态（2026-09-27 核验）
 
 ```text
 路径：/home/fc/dddddrone
 远程：git@github.com:Cooper3516833584/DDDDDDRONE.git
 分支：main
-提交：28c322bc6131c3d9a2ce570497eba0ed35b67da0
+提交：51ac966be50fe90f36d0d85db6c09f7922e6f393
 工作树：干净
 ```
 
 机上 GitHub SSH 认证用户为 `luai-git`，`git ls-remote` 与 `git pull` 均正常，不需要从开发机转发推送。
+
+## 11. 2026-09-27 系统升级与定位环境
+
+为满足 MID360S 定位方案要求的 Ubuntu 22.04 + ROS 2 Humble，经用户授权后原位升级：
+
+- 20.04 → 22.04 完成；升级器在“删除 227 个旧包”处选择**保留**，未删除任何软件包。
+- 启动内核固定为 `5.15.0-194-generic`（该内核有 `rtl8821ce` Wi-Fi 模块），6.8 内核未采用，避免重启后失联。
+- ROS 2 Humble 由官方 `ros2-apt-source_1.3.0~jammy` 配置（keyring 内嵌），写入
+  `/etc/apt/sources.list.d/ros2.sources`；已安装 `ros-humble-ros-base`、`ros-dev-tools`、`pcl_ros`、
+  `pcl_conversions`、`rosbag2`、`libpcl-dev`、`libeigen3-dev`、`libapr1-dev` 等。
+- 定位工作区 `~/ddddrone/ros2_ws` 在 Humble 下重新编译通过：`livox_ros_driver2` 与 `fast_lio` 构建成功，
+  产出 `livox_ros_driver2_node`、`fastlio_mapping`；`ros2 pkg list` 与 `rclpy` 正常。
+- 升级时停用的第三方 apt 源以 `*.disabled-for-jammy-upgrade` 形式保留在 `/etc/apt/sources.list.d/`
+  （ros-fish、librealsense、nemh、graphics-drivers），未删除、未启用。
+- `enp3s0` 的 NetworkManager 配置（manual `192.168.1.50/24`、autoconnect）在升级后保留。
+- python_sdk 的 pip 依赖原装在 python3.8 目录，升级后对 python3.10 不可见；已按
+  `python_sdk/requirements.txt` 的 pin 重装到用户 site，15 个模块导入全部通过：numpy 1.24.4、
+  scipy 1.10.1、matplotlib 3.7.5、cv2 4.8.0、ultralytics 8.4.100、onnxruntime 1.16.3、
+  torch 2.3.1+cpu、torchvision 0.18.1+cpu、pyrealsense2 2.53.1.4623、pupil-apriltags 1.0.4.post10、
+  pyzbar 0.1.9、pyserial 3.5、loguru 0.5.3、simple-pid 2.0.0、attrs 19.3.0。两处与文件的偏差已确认：
+  `pyrealsense2==2.51.1.4348` 没有 cp310 wheel，改用可用的 `2.53.1.4623`；`torch`/`torchvision`
+  用 CPU 轮子（N97 无 NVIDIA GPU），版本仍为文件所依赖的 2.3.1 / 0.18.1。
+- 遗留未处理：`~/.bashrc` 第 120 行仍 `source /opt/ros/foxy/setup.bash`（Foxy 已随升级失效），
+  `/opt/ros/foxy` 目录仍存在；两处都未改动。
