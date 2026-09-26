@@ -509,6 +509,7 @@ class Navigation(object):
 
     def _navigation_task(self):
         paused = False
+        pose_available = True
         while self.running:
             try:
                 if self.stop_event is not None and self.stop_event.is_set():
@@ -522,7 +523,9 @@ class Navigation(object):
                     self.update_realtime_control(
                         vel_x=0, vel_y=0, yaw=0, _source="navigation"
                     )
-                    logger.warning("[NAVI] Navigation pose not available")
+                    if pose_available:
+                        logger.warning("[NAVI] Navigation pose not available")
+                        pose_available = False
                     time.sleep(0.05)
                     continue
                 self.current_x, self.current_y, self.current_yaw, available = (
@@ -533,6 +536,18 @@ class Navigation(object):
                 )
                 if available:
                     self._last_pose_update = time.monotonic()
+                    if not pose_available:
+                        logger.info("[NAVI] Navigation pose restored")
+                        pose_available = True
+                else:
+                    self.update_realtime_control(
+                        vel_x=0, vel_y=0, yaw=0, _source="navigation"
+                    )
+                    if pose_available:
+                        logger.warning("[NAVI] Navigation pose not available")
+                        pose_available = False
+                    time.sleep(0.05)
+                    continue
                 logger_dbg.info(f"[NAVI] Pose: {self.current_x}, {self.current_y}, {self.current_yaw}")
                 if not (
                     self.navigation_flag
@@ -555,13 +570,6 @@ class Navigation(object):
                     self.navi_y_pid.set_auto_mode(True, last_output=0)
                     self.yaw_pid.set_auto_mode(True, last_output=0)
                     logger.info("[NAVI] Navigation resumed")
-                if not available:
-                    logger.warning("[NAVI] Pose not available")
-                    self.update_realtime_control(
-                        vel_x=0, vel_y=0, yaw=0, _source="navigation"
-                    )
-                    time.sleep(0.1)
-                    continue
                 # self.fc.send_general_position(x=self.current_x, y=self.current_y)
                 out_x_world = self.navi_x_pid(self.current_x)
                 out_y_world = self.navi_y_pid(self.current_y)
