@@ -1,15 +1,15 @@
-# N97 Ubuntu 20.04 / Python 3.8 runtime requirements
+# N97 Ubuntu 22.04 / Python 3.10 runtime requirements
 # Generated from project imports + env_probe output on the N97 machine.
-# Install with: python3 -m pip install --user -r requirements_n97_runtime.txt
+# Install from repository root: python3 -m pip install --user -r python_sdk/requirements.txt
 
-attrs==19.3.0
+attrs==21.4.0
 loguru==0.5.3
 matplotlib==3.7.5
 numpy==1.24.4
 onnxruntime==1.16.3
 opencv-contrib-python==4.8.0.74
 pupil-apriltags==1.0.4.post10
-pyrealsense2==2.51.1.4348
+pyrealsense2==2.53.1.4623
 pyserial==3.5
 pyzbar==0.1.9
 scipy==1.10.1
