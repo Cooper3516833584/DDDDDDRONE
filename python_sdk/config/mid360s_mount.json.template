@@ -1,0 +1,7 @@
+{
+  "note": "BENCH MEASUREMENT REQUIRED. Do not copy this template as production data without measured values.",
+  "T_I_B": {
+    "translation_m": ["REQUIRED_MEASURED_X", "REQUIRED_MEASURED_Y", "REQUIRED_MEASURED_Z"],
+    "quaternion_xyzw": ["REQUIRED_MEASURED_QX", "REQUIRED_MEASURED_QY", "REQUIRED_MEASURED_QZ", "REQUIRED_MEASURED_QW"]
+  }
+}

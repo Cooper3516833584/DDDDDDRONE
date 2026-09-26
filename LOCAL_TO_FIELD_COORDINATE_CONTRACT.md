@@ -34,6 +34,14 @@ current task. Its `+X` and `+Y` remain the existing Navigation local axes.
 Navigation's internal `current_yaw` remains clockwise-positive; the FleetBus
 heading is `(-current_yaw) % 360`.
 
+The MID360S ROS2 localization path consumes FAST-LIO's `/Odometry_highrate` as
+the IMU pose `T_WI`. A measured mounting transform `T_I_B` gives the aircraft
+body pose `T_WB = T_WI * T_I_B`. `calibrate_basepoint()` saves the current
+`T_WB0`; Navigation receives `inverse(T_WB0) * T_WB` in centimetres, with
+clockwise-positive yaw. This does not reset FAST-LIO's world frame and does
+not apply a FIELD transform on the aircraft. Missing measured LiDAR-to-IMU or
+IMU-to-body transforms prohibit propeller-on closed-loop flight.
+
 For this integration, the task-level attachment must use
 `position_transform=None` and `heading_offset_deg=0.0`. It must not start
 legacy `AircraftGroundStation`/`GroundStationLink` together with

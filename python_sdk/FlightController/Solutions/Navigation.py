@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import threading
 import time
 from typing import Any, List, Literal, Optional, Tuple, Union
@@ -6,7 +8,7 @@ import numpy as np
 from attr import dataclass
 from FlightController import FC_Like
 from FlightController.Components import LD_Radar
-from FlightController.Components.RealSense import T265, T265_Pose_Frame
+from FlightController.Components.LioPoseProvider import LioPoseProvider
 from loguru import logger
 from simple_pid import PID
 
@@ -67,7 +69,7 @@ class PARAMS:
 
 class Navigation(object):
     """
-    闭环导航, 使用realsense T265作为位置闭环, 使用雷达SLAM作为定位校准
+    闭环导航，使用 FAST-LIO 高频 body 位姿作为水平位置来源。
     """
 
     def __init__(self, *args, **kwargs):
@@ -79,19 +81,12 @@ class Navigation(object):
             mapper: ROS地图模块实例(可选) (RosMapper)
         """
         self.fc: FC_Like = kwargs["fc"]
-        self.radar: LD_Radar = kwargs["radar"]
+        self.radar: Optional[LD_Radar] = kwargs.get("radar")
         
         # 此处为没有t265的修改
         #self.rs: T265 = kwargs["rs"]
         self.rs: T265 = kwargs.get("rs",None)
-
-        if "mapper" in kwargs:
-            from FlightController.Components.RosMapper import RosMapper
-
-            # 解耦:按需导入ROS相关的模块,防止非ROS环境下无法运行
-            self.mapper: Optional[RosMapper] = kwargs["mapper"]
-        else:
-            self.mapper = None
+        self.mapper = None  # Legacy mapper is never used by the LIO runtime.
         ############### PID #################
         self.navi_speed = 40  # 导航速度 / cm/s
         self.pid_tunings = {  # PID参数 (仅导航XY使用)
@@ -139,6 +134,9 @@ class Navigation(object):
         self._velocity_override_horizontal_cancelled = False
         self._last_pose_update = 0.0
         self._last_ros_calibration = 0.0
+        self.lio_pose = kwargs.get("lio_pose_provider") or LioPoseProvider()
+        self._lio_listener = None
+        self._legacy_mode_warned = False
         self._thread_list: List[threading.Thread] = []
         self.traj_running_event = threading.Event()
         self.traj_progress = 0.0
@@ -146,13 +144,23 @@ class Navigation(object):
 
     def calibrate_basepoint(self, wait=True) -> np.ndarray:
         """
-        重置基地点到当前雷达位置 / cm
+        将当前 LIO body 位姿设为 startup-local 原点。
         """
-        if wait and not self.radar.rt_pose_update_event.wait(1):
-            logger.error("[NAVI] reset_basepoint(): Radar pose update timeout")
-            raise RuntimeError("Radar pose update timeout")
-        x, y, _ = self.radar.rt_pose
-        self.basepoint = np.array([x, y])
+        deadline = time.monotonic() + (1.0 if wait else 0.0)
+        while True:
+            try:
+                self.lio_pose.calibrate_basepoint()
+                break
+            except RuntimeError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+        pose = self.lio_pose.get_pose()
+        if pose is None:
+            raise RuntimeError("LIO pose became stale during basepoint calibration")
+        self.current_x, self.current_y, self.current_yaw, _ = pose
+        self._last_pose_update = time.monotonic()
+        self.basepoint = np.array([0.0, 0.0])
         logger.info(f"[NAVI] Basepoint reset to {self.basepoint}")
         return self.basepoint
 
@@ -167,6 +175,8 @@ class Navigation(object):
         """
         设置导航状态
         """
+        if state and self.lio_pose.get_pose() is None:
+            raise RuntimeError("Navigation requires calibrated fresh LIO pose")
         self.navigation_flag = state
         if state and self.fc.state.mode.value != self.fc.HOLD_POS_MODE:
             self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
@@ -192,38 +202,33 @@ class Navigation(object):
             self.update_realtime_control(vel_x=0, vel_y=0, vel_z=0, yaw=0)
         except Exception:
             logger.exception("[NAVI] Failed to send zero control while stopping")
-        self.radar.stop_resolve_pose()
         if join:
             for thread in self._thread_list:
                 thread.join()
         logger.info("[NAVI] Navigation stopped")
 
-    def start(self, mode="fusion"):
+    def start(self, mode=None):
         """
-        启动导航
-        mode: 导航模式, "radar"/"rs"/"fusion"/"fusion-ros"
+        启动 LIO 导航。旧 mode 参数仅用于调用兼容。
         """
         if self.running:
             logger.warning("[NAVI] Navigation already running, restarting...")
             self.stop(join=True)
-        self.running = True
-        self.radar.subtask_skip = PARAMS.RADAR_SKIP
-        
-        # 此处为没有t265的修改
-        if self.rs:
-            self.rs.event_skip = PARAMS.RS_SKIP
+        if mode not in (None, "lio") and not self._legacy_mode_warned:
+            logger.warning("[NAVI] Legacy navigation mode ignored; LIO is the only backend")
+            self._legacy_mode_warned = True
+        if self._lio_listener is None:
+            from FlightController.Components.RosNode import LioListenNode, RosNodeRunner
 
-        self._fusion_skip = PARAMS.FUSION_SKIP
-        if self.mapper is not None:
-            self.mapper.trans_event_skip = PARAMS.MAP_SKIP
-        self._fusion_cnt = 0
-        self._t265_trans_args = None
+            self._lio_listener = LioListenNode(self.lio_pose.on_odometry)
+            RosNodeRunner().add_nodes().run()
+        self.running = True
         self._velocity_override_active = False
         self._velocity_override_keep_height = False
         self._velocity_override_updated_at = 0.0
         self._velocity_override_faulted = False
         self._velocity_override_horizontal_cancelled = False
-        self.switch_navigation_mode(mode)  # type: ignore
+        self._navigation_mode = "lio"
         self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
         self.update_realtime_control(vel_x=0, vel_y=0, vel_z=0, yaw=0)
         logger.info("[NAVI] Realtime control started")
@@ -356,33 +361,12 @@ class Navigation(object):
                 logger.exception("[NAVI] Velocity override watchdog error")
             time.sleep(0.05)
 
-    def switch_navigation_mode(self, mode: Literal["radar", "rs", "fusion", "fusion-ros"]):
-        """
-        切换导航模式
-        radar: 仅雷达扫网定位
-        rs: 仅T265定位
-        fusion: 雷达扫网定位辅助T265定位
-        fusion-ros: ROS建图辅助T265定位
-        """
-        assert mode in ("radar", "rs", "fusion", "fusion-ros"), "Invalid navigation mode"
-        if mode == "radar" or mode == "fusion":
-            assert self.radar.running, "Radar not running"
-            self.radar.start_resolve_pose(
-                size=PARAMS.MAP_SIZE,
-                scale_ratio=PARAMS.SCALE_RATIO,
-                low_pass_ratio=PARAMS.LOW_PASS_RATIO,
-                polyline=PARAMS.POLYLINE,
-            )
-            logger.info("[NAVI] Radar resolve pose started")
-        elif self.radar._rtpose_flag:
-            self.radar.stop_resolve_pose()
-            logger.info("[NAVI] Radar resolve pose stopped")
-        if mode == "rs" or mode == "fusion" or mode == "fusion-ros":
-            assert self.rs.running, "RealSense not running"
-        if mode == "fusion-ros":
-            assert self.mapper is not None, "Mapper not initialized"
-        self._navigation_mode = mode
-        logger.info(f"[NAVI] Navigation mode switched to {mode}")
+    def switch_navigation_mode(self, mode: str):
+        """旧调用兼容；运行时只有 LIO。"""
+        if mode != "lio" and not self._legacy_mode_warned:
+            logger.warning("[NAVI] Legacy navigation mode ignored; LIO is the only backend")
+            self._legacy_mode_warned = True
+        self._navigation_mode = "lio"
 
     def _rs_speed_report_callback(self, pose: T265_Pose_Frame, _, __):
         vel_x = round(-pose.velocity.z * 100)
@@ -540,21 +524,13 @@ class Navigation(object):
                     )
                     time.sleep(0.05)
                     continue
-                if self._navigation_mode == "radar":
-                    pose = self._get_radar_pose()
-                elif self._navigation_mode == "rs":
-                    pose = self._get_t265_pose()
-                elif self._navigation_mode == "fusion":
-                    pose = self._get_fusion_pose()
-                elif self._navigation_mode == "fusion-ros":
-                    pose = self._get_fusion_ros_pose()
-                else:
-                    raise ValueError(f"Unknown navigation mode: {self._navigation_mode}")
+                pose = self.lio_pose.get_pose()
                 if pose is None:
                     self.update_realtime_control(
                         vel_x=0, vel_y=0, yaw=0, _source="navigation"
                     )
                     logger.warning("[NAVI] Navigation pose not available")
+                    time.sleep(0.05)
                     continue
                 self.current_x, self.current_y, self.current_yaw, available = (
                     float(pose[0]),
@@ -562,6 +538,8 @@ class Navigation(object):
                     float(pose[2]),
                     bool(pose[3]),
                 )
+                if available:
+                    self._last_pose_update = time.monotonic()
                 logger_dbg.info(f"[NAVI] Pose: {self.current_x}, {self.current_y}, {self.current_yaw}")
                 if not (
                     self.navigation_flag
@@ -1050,7 +1028,8 @@ class Navigation(object):
     def pose_is_fresh(self, max_age: float = POSE_STALE_TIMEOUT) -> bool:
         """Return whether a usable navigation pose was received recently."""
         return bool(
-            self._last_pose_update > 0
+            self.lio_pose.get_pose() is not None
+            and self._last_pose_update > 0
             and time.monotonic() - self._last_pose_update <= float(max_age)
         )
 

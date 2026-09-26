@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import atexit
 import math
 import multiprocessing
@@ -8,8 +10,6 @@ from xmlrpc.client import Boolean
 
 import numpy as np
 import rclpy
-from cartographer_ros_msgs.msg import SensorTopics, TrajectoryOptions
-from cartographer_ros_msgs.srv import FinishTrajectory, StartTrajectory, WriteState
 from geometry_msgs.msg import Pose, PoseStamped, Transform, TransformStamped, Twist
 from loguru import logger
 from nav_msgs.msg import MapMetaData, OccupancyGrid, Odometry
@@ -81,6 +81,17 @@ class T265ListenNode(Node):  # listen to the T265 data
         self.callback(t265_data)
 
 
+class LioListenNode(Node):
+    def __init__(self, callback: Callable[[Odometry], None]):
+        super().__init__("PyLioListenNode")
+        self.callback = callback
+        self.lio_sub = self.create_subscription(
+            Odometry, "/Odometry_highrate", self.callback, qos_profile_sensor_data
+        )
+        _nodes_to_run.append(self)
+        logger.info("[ROS] LioListenNode ready to start")
+
+
 class MapListenNode(Node):  # listen to the map data
     def __init__(self, callback: Callable[[OccupancyGrid], None]):
         super().__init__("PyMapListenNode")
@@ -95,6 +106,8 @@ class MapListenNode(Node):  # listen to the map data
 
 class MapClientNode(Node):  # communicate with Cartographer
     def __init__(self):
+        from cartographer_ros_msgs.srv import FinishTrajectory, StartTrajectory, WriteState
+
         super().__init__("PyMapClientNode")
         self.start_trajectory_client = self.create_client(StartTrajectory, "/start_trajectory")
         self.finish_trajectory_client = self.create_client(FinishTrajectory, "/finish_trajectory")
@@ -213,6 +226,8 @@ class RosNodeRunner:  # run all the listen nodes
         return RosNodeRunner.__instance
 
     def __init__(self):
+        if hasattr(self, "_excuter"):
+            return
         self._running_nodes = []
         self._excuter = rclpy.executors.MultiThreadedExecutor()
         self._thread = threading.Thread(target=self._excuter.spin, daemon=True)

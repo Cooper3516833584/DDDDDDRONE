@@ -1,4 +1,7 @@
 import os
+import ast
+import math
+import re
 import time
 from typing import List, Literal
 
@@ -7,6 +10,7 @@ import threading
 
 from FlightController import FC_Server
 from FlightController.Components.RosManager import RosManager
+from FlightController.Components.LioPoseProvider import LioPoseProvider
 from FlightController.Components.UartScreen import UARTScreen
 from FlightController.Components.Utils import Tmux
 from loguru import logger
@@ -19,14 +23,36 @@ PATH = os.path.dirname(os.path.abspath(__file__))
 PYTHON_EXCUTEABLE = "python3"
 mis_num = 0
 packages = [
-    (0, ("ldlidar_stl_ros2", "ld06.launch.py"), ["/dev/ttyUSB0"]),
-    (0, ("realsense2_camera", "rs_launch.py"), ["/dev/video0", "/dev/video1"]),
-    (0, ("cartographer_ros", "cartographer.launch.py"), []),
-    (1, ("tf2_ros", "static_transform_publisher", "0 0 0 0 0 0 camera_pose_frame base_link"), []),
+    (0, ("livox_ros_driver2", "msg_MID360s_launch.py"), []),
+    (0, ("fast_lio", "mapping.launch.py", "config_file:=mid360s_drone.yaml rviz:=false"), []),
 ]
 
 
+def require_production_localization():
+    config = os.path.join(PATH, "../ros2_ws/src/FAST_LIO_ROS2/config/mid360s_drone.yaml")
+    if not os.path.isfile(config):
+        raise RuntimeError("Measured MID360S LiDAR-to-IMU production config is missing")
+    with open(config, encoding="utf-8") as stream:
+        yaml_text = stream.read()
+    if ("REQUIRED_MEASURED" in yaml_text or
+            not re.search(r"^\s*extrinsic_est_en:\s*false\s*(?:#.*)?$", yaml_text, re.M)):
+        raise RuntimeError("MID360S production extrinsic is not finalized")
+    for key, length in (("extrinsic_T", 3), ("extrinsic_R", 9)):
+        match = re.search(rf"^\s*{key}:\s*(\[[^\]]+\])", yaml_text, re.M)
+        try:
+            values = ast.literal_eval(match.group(1)) if match else None
+            if len(values) != length or not all(math.isfinite(float(v)) for v in values):
+                raise ValueError(key)
+        except (TypeError, ValueError, SyntaxError):
+            raise RuntimeError(f"Measured MID360S {key} is required")
+        if key == "extrinsic_T" and values == [-0.011, -0.02329, 0.04412]:
+            raise RuntimeError("Ordinary MID360 example extrinsic is forbidden")
+    LioPoseProvider()  # Measured IMU-to-body mounting transform is mandatory.
+
+
 def run_item(item, kill_exist=True):
+    if item[1][0] == "fast_lio":
+        require_production_localization()
     for dev in item[2]:
         rm.chmod(dev)
     if item[0] == 0:
@@ -100,13 +126,13 @@ def callback(cmd: str):
             sending_log = False
         elif cmd.startswith("ros_state"):
             topics = rm.get_running_topics()
-            set_ellipse("scan", 2 if "/scan" in topics else 0)
-            set_ellipse("camera", 2 if "/camera/pose/sample" in topics else 0)
-            set_ellipse("map", 2 if "/map" in topics else 0)
-            check_pack("ldlidar_stl_ros2", "radar")
-            check_pack("realsense2_camera", "t265")
-            check_pack("cartographer_ros", "cart")
-            check_pack("tf2_ros", "tf2")
+            set_ellipse("scan", 2 if "/livox/lidar" in topics else 0)
+            set_ellipse("camera", 2 if "/livox/imu" in topics else 0)
+            set_ellipse("map", 2 if "/Odometry" in topics else 0)
+            set_ellipse("radar", 2 if "/Odometry_highrate" in topics else 0)
+            set_ellipse("t265", 0)
+            set_ellipse("cart", 0)
+            set_ellipse("tf2", 0)
         elif cmd.startswith("mis_state"):
             scr.set_widget_value("main_volt.txt", f'"{fc.state.bat.value:.2f}V"')
             if mis_tmux.session_running:
@@ -126,6 +152,7 @@ def callback(cmd: str):
                 mis_tmux.kill_session()
             scr.set_widget_value("main_info.txt", f'"已结束任务"')
         elif cmd.startswith("mis_boot="):
+            require_production_localization()
             mis_num = int(cmd.split("=")[1]) + 1
             logger.info(f"[US] Start mission {mis_num}")
             if not os.path.exists(f"{PATH}/mission{mis_num}.py"):

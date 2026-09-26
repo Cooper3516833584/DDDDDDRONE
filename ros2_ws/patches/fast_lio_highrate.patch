@@ -1,0 +1,122 @@
+diff --git a/launch/mapping.launch.py b/launch/mapping.launch.py
+index 25dad7d..3cad4eb 100644
+--- a/launch/mapping.launch.py
++++ b/launch/mapping.launch.py
+@@ -34 +34 @@ def generate_launch_description():
+-        'config_file', default_value='mid360.yaml',
++        'config_file', default_value='mid360s_drone.yaml',
+diff --git a/src/IMU_Processing.hpp b/src/IMU_Processing.hpp
+index f35378f..98f46ce 100644
+--- a/src/IMU_Processing.hpp
++++ b/src/IMU_Processing.hpp
+@@ -50,0 +51,5 @@ class ImuProcess
++  bool imu_ready() const { return !imu_need_init_; }
++  bool PropagateHighRateState(const sensor_msgs::msg::Imu::ConstSharedPtr &last_imu,
++                              const sensor_msgs::msg::Imu::ConstSharedPtr &cur_imu,
++                              state_ikfom &state_io, V3D &gyr_unbiased,
++                              double max_dt = 0.1);
+@@ -155,0 +161,28 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
++bool ImuProcess::PropagateHighRateState(
++    const sensor_msgs::msg::Imu::ConstSharedPtr &last_imu,
++    const sensor_msgs::msg::Imu::ConstSharedPtr &cur_imu,
++    state_ikfom &state_io, V3D &gyr_unbiased, double max_dt)
++{
++  if (imu_need_init_ || !last_imu || !cur_imu) return false;
++  const double dt = rclcpp::Time(cur_imu->header.stamp).seconds() -
++                    rclcpp::Time(last_imu->header.stamp).seconds();
++  if (dt <= 0.0 || dt > max_dt || mean_acc.norm() < 1e-6) return false;
++
++  const V3D gyr_avr(
++      0.5 * (last_imu->angular_velocity.x + cur_imu->angular_velocity.x),
++      0.5 * (last_imu->angular_velocity.y + cur_imu->angular_velocity.y),
++      0.5 * (last_imu->angular_velocity.z + cur_imu->angular_velocity.z));
++  V3D acc_avr(
++      0.5 * (last_imu->linear_acceleration.x + cur_imu->linear_acceleration.x),
++      0.5 * (last_imu->linear_acceleration.y + cur_imu->linear_acceleration.y),
++      0.5 * (last_imu->linear_acceleration.z + cur_imu->linear_acceleration.z));
++  acc_avr *= G_m_s2 / mean_acc.norm();
++  gyr_unbiased = gyr_avr - state_io.bg;
++  V3D acc_world = state_io.rot * (acc_avr - state_io.ba);
++  for (int i = 0; i < 3; ++i) acc_world[i] += state_io.grav[i];
++  state_io.pos += state_io.vel * dt + 0.5 * acc_world * dt * dt;
++  state_io.vel += acc_world * dt;
++  state_io.rot = SO3(state_io.rot.toRotationMatrix() * Exp(gyr_unbiased, dt));
++  return true;
++}
++
+diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
+index d441261..ee900cb 100644
+--- a/src/laserMapping.cpp
++++ b/src/laserMapping.cpp
+@@ -135,0 +136,5 @@ state_ikfom state_point;
++state_ikfom state_highrate;
++mutex mtx_highrate_odom;
++bool highrate_odom_ready = false;
++sensor_msgs::msg::Imu::ConstSharedPtr last_highrate_imu;
++rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomHighrate;
+@@ -370 +375 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+-        std::cerr << "lidar loop back, clear buffer" << std::endl;
++        std::cerr << "imu loop back, clear buffer" << std::endl;
+@@ -371,0 +377,3 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
++        lock_guard<mutex> lock(mtx_highrate_odom);
++        highrate_odom_ready = false;
++        last_highrate_imu.reset();
+@@ -378,0 +387,37 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
++
++    state_ikfom snapshot;
++    V3D gyr_unbiased = Zero3d;
++    bool publish_highrate = false;
++    {
++        lock_guard<mutex> lock(mtx_highrate_odom);
++        if (highrate_odom_ready && last_highrate_imu && p_imu->imu_ready())
++        {
++            publish_highrate = p_imu->PropagateHighRateState(
++                last_highrate_imu, msg, state_highrate, gyr_unbiased);
++            if (publish_highrate) snapshot = state_highrate;
++            else highrate_odom_ready = false;
++        }
++        if (highrate_odom_ready) last_highrate_imu = msg;
++    }
++    if (publish_highrate)
++    {
++        nav_msgs::msg::Odometry odom;
++        odom.header.stamp = msg->header.stamp;
++        odom.header.frame_id = "camera_init";
++        odom.child_frame_id = "body";
++        odom.pose.pose.position.x = snapshot.pos.x();
++        odom.pose.pose.position.y = snapshot.pos.y();
++        odom.pose.pose.position.z = snapshot.pos.z();
++        odom.pose.pose.orientation.x = snapshot.rot.coeffs()[0];
++        odom.pose.pose.orientation.y = snapshot.rot.coeffs()[1];
++        odom.pose.pose.orientation.z = snapshot.rot.coeffs()[2];
++        odom.pose.pose.orientation.w = snapshot.rot.coeffs()[3];
++        const V3D vel_body = snapshot.rot.toRotationMatrix().transpose() * snapshot.vel;
++        odom.twist.twist.linear.x = vel_body.x();
++        odom.twist.twist.linear.y = vel_body.y();
++        odom.twist.twist.linear.z = vel_body.z();
++        odom.twist.twist.angular.x = gyr_unbiased.x();
++        odom.twist.twist.angular.y = gyr_unbiased.y();
++        odom.twist.twist.angular.z = gyr_unbiased.z();
++        pubOdomHighrate->publish(odom);
++    }
+@@ -934,0 +980 @@ public:
++        pubOdomHighrate = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry_highrate", 20);
+@@ -1053,0 +1100,18 @@ private:
++            if (extrinsic_est_en)
++            {
++                const M3D R = state_point.offset_R_L_I.toRotationMatrix();
++                const V3D &T = state_point.offset_T_L_I;
++                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
++                    "BENCH LiDAR-to-IMU T=[%.6f, %.6f, %.6f] R=[%.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f]",
++                    T.x(), T.y(), T.z(), R(0,0), R(0,1), R(0,2),
++                    R(1,0), R(1,1), R(1,2), R(2,0), R(2,1), R(2,2));
++            }
++            if (p_imu->imu_ready() && !Measures.imu.empty())
++            {
++                lock_guard<mutex> lock(mtx_highrate_odom);
++                state_highrate = state_point;
++                auto anchor = std::make_shared<sensor_msgs::msg::Imu>(*Measures.imu.back());
++                anchor->header.stamp = get_ros_time(lidar_end_time);
++                last_highrate_imu = anchor;
++                highrate_odom_ready = true;
++            }
