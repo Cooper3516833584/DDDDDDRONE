@@ -97,11 +97,14 @@ FleetBus 不转发飞控姿态或控制原始帧。飞控 USB 继续使用 `5000
 C:\Users\TZDEZACR\Desktop\DDDDDrone_Cloned\python_sdk\fleet_bus
 ```
 
-机载上位机部署副本（2026-07-30 只读核验）：
+机载上位机部署副本（2026-09-26 核验）：
 
 ```text
-/home/fc/桌面/DDDDrone_Cloned
+/home/fc/dddddrone
 ```
+
+该目录原先位于 `/home/fc/桌面/DDDDrone_Cloned`。2026-09-26 为脱离桌面目录与图形会话依赖，
+连同 systemd 单元一起迁到当前位置；Git 远程、分支与工作树状态不变。
 
 地面站端：
 
