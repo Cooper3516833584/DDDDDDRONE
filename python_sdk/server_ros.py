@@ -26,6 +26,12 @@ packages = [
     (0, ("livox_ros_driver2", "msg_MID360s_launch.py"), []),
     (0, ("fast_lio", "mapping.launch.py", "config_file:=mid360s_drone.yaml rviz:=false"), []),
 ]
+REQUIRED_LIO_TOPICS = ("/livox/lidar", "/livox/imu", "/Odometry", "/Odometry_highrate")
+
+
+def missing_lio_topics(topics):
+    available = set(topics)
+    return [topic for topic in REQUIRED_LIO_TOPICS if topic not in available]
 
 
 def require_production_localization():
@@ -154,13 +160,18 @@ def callback(cmd: str):
         elif cmd.startswith("mis_boot="):
             require_production_localization()
             mis_num = int(cmd.split("=")[1]) + 1
-            logger.info(f"[US] Start mission {mis_num}")
             if not os.path.exists(f"{PATH}/mission{mis_num}.py"):
                 scr.set_widget_value("main_info.txt", f'"任务{mis_num}不存在"')
                 return
             if mis_tmux.session_running:
                 scr.set_widget_value("main_info.txt", f'"请先终止任务"')
                 return
+            missing = missing_lio_topics(rm.get_running_topics())
+            if missing:
+                logger.error("[US] Mission refused; missing LIO topics: {}", ", ".join(missing))
+                scr.set_widget_value("main_info.txt", '"定位链未就绪"')
+                return
+            logger.info(f"[US] Start mission {mis_num}")
             scr.set_widget_value("main_info.txt", f'"正在启动任务{mis_num}"')
             mis_tmux.new_session()
             time.sleep(1)
