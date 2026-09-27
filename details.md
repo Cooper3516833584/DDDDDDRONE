@@ -170,7 +170,7 @@ C:\Users\TZDEZACR\Desktop\ground_station\Ground_Station\components
 - 本机没有运行 FAST-LIO；生产文件 `/home/fc/dddddrone/ros2_ws/src/FAST_LIO_ROS2/config/mid360s_drone.yaml` 和 `/home/fc/dddddrone/python_sdk/config/mid360s_mount.json` 均未找到。因此未产生或验证 `/Odometry`、`/Odometry_highrate`，也未运行任务或飞行控制程序。
 - 检查后停止了短时驱动。SDK 报告完成清理，但 ROS launch 在关闭时报告进程退出码 `-7`；该关闭异常尚未定位。
 
-**当前判断：**以太网、雷达发现和点云数据通路已验证；IMU 数据、FAST-LIO 里程计及生产定位外参仍未验收。后续先查明 `/livox/imu` 无消息的原因，再进行 FAST-LIO 台架测量；不得把台架估计初值直接当作生产外参。
+**后续复测更新：**雷达启动稳定后独立订阅 10 秒收到 2000 条 IMU，源时间严格递增，间隔约 3.93–6.10 ms。12.63 秒 rosbag 记录 126 帧点云、2527 条 IMU；离线 FAST-LIO 编译和回放结果见 `docs/mid360s_c1_progress.md` 至 `docs/mid360s_c6_progress.md`。此前 4 秒无 IMU 的记录属于启动早期采样，不能作为稳定运行结论。驱动 SIGINT `-7` 退出仍待查明。生产机体安装 `T_I_B`、动态精度、板载延迟和失效控制仍未验收；不得把台架估计初值当作机体安装外参。
 
 两组外参的坐标方向、字段单位和台架测量步骤见
 `ros2_ws/README.md` 的 “Production measurements required” 一节。
