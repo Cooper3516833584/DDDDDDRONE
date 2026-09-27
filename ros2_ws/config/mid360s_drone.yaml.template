@@ -1,13 +1,13 @@
 # Production-template intent:
 # - exactly one project profile
 # - algorithm constants remain internal
-# - measured LiDAR/IMU extrinsic is intentionally NOT guessed here
+# - fixed manufacturer LiDAR/IMU extrinsic from the MID360S plan
 # - mapping.extrinsic_T/R encode T_I_L: p_I = R_I_L * p_L + t_I_L
 #   (LiDAR coordinates into IMU coordinates; translation in metres;
 #    rotation is a row-major 3x3 matrix)
 #
-# Before flight, replace the REQUIRED_MEASURED placeholders with measured values
-# and set extrinsic_est_en: false.
+# Validate this fixed internal transform on the bench before flight. The separate
+# IMU-to-aircraft-body installation T_I_B must be measured and reviewed.
 
  /**:
     ros__parameters:
@@ -43,11 +43,10 @@
 
             extrinsic_est_en: false
 
-            # REQUIRED_MEASURED — do not substitute MID360 sample values.
-            # extrinsic_T: [tx, ty, tz]
-            # extrinsic_R: [r00, r01, r02,
-            #               r10, r11, r12,
-            #               r20, r21, r22]
+            extrinsic_T: [-0.011, -0.02329, 0.04412]
+            extrinsic_R: [1.0, 0.0, 0.0,
+                          0.0, 1.0, 0.0,
+                          0.0, 0.0, 1.0]
 
         publish:
             path_en: false

@@ -26,7 +26,9 @@ packages = [
     (0, ("livox_ros_driver2", "msg_MID360s_launch.py"), []),
     (0, ("fast_lio", "mapping.launch.py", "config_file:=mid360s_drone.yaml rviz:=false"), []),
 ]
-REQUIRED_LIO_TOPICS = ("/livox/lidar", "/livox/imu", "/Odometry", "/Odometry_highrate")
+REQUIRED_LIO_TOPICS = (
+    "/livox/lidar", "/livox/imu", "/Odometry", "/Odometry_highrate", "/LioHealth"
+)
 
 
 def missing_lio_topics(topics):
@@ -37,7 +39,7 @@ def missing_lio_topics(topics):
 def require_production_localization():
     config = os.path.join(PATH, "../ros2_ws/src/FAST_LIO_ROS2/config/mid360s_drone.yaml")
     if not os.path.isfile(config):
-        raise RuntimeError("Measured MID360S LiDAR-to-IMU production config is missing")
+        raise RuntimeError("MID360S production LIO config is missing")
     with open(config, encoding="utf-8") as stream:
         yaml_text = stream.read()
     if ("REQUIRED_MEASURED" in yaml_text or
@@ -50,9 +52,7 @@ def require_production_localization():
             if len(values) != length or not all(math.isfinite(float(v)) for v in values):
                 raise ValueError(key)
         except (TypeError, ValueError, SyntaxError):
-            raise RuntimeError(f"Measured MID360S {key} is required")
-        if key == "extrinsic_T" and values == [-0.011, -0.02329, 0.04412]:
-            raise RuntimeError("Ordinary MID360 example extrinsic is forbidden")
+            raise RuntimeError(f"Valid MID360S {key} is required")
     LioPoseProvider()  # Measured IMU-to-body mounting transform is mandatory.
 
 

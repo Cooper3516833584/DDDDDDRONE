@@ -46,7 +46,8 @@ class Provider:
             return self.poses.pop(0)
         return self.poses[0]
 
-    def calibrate_basepoint(self):
+    def calibrate_basepoint(self, *, disarmed):
+        assert disarmed
         self.calibrations += 1
 
 
@@ -69,6 +70,7 @@ def navigation(provider):
     nav.running = True
     nav.stop_event = None
     nav._control_lock = threading.Lock()
+    nav.traj_running_event = threading.Event()
     nav._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
     nav._velocity_override_active = False
     nav._navigation_control_updated_at = time.monotonic()
@@ -97,6 +99,7 @@ def test_missing_fresh_pose_rejects_navigation():
 def test_basepoint_calibration_delegates_to_lio():
     provider = Provider([(0, 0, 0, True)])
     nav = navigation(provider)
+    nav.fc.state.unlock.value = False
     assert np.array_equal(nav.calibrate_basepoint(wait=False), [0, 0])
     assert provider.calibrations == 1
     assert nav.lio_pose.get_pose() is not None

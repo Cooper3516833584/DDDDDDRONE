@@ -29,7 +29,9 @@ The driver source is `src/livox_ros_driver2` at
 `21445540f0d100dc86a7e6df312dd70bbdb4afdf`. FAST-LIO is
 `src/FAST_LIO_ROS2` at `2fffc570a25d0df172720bac034fbdb6a13d2162`.
 The project patch is `patches/fast_lio_highrate.patch`. Rerunning setup does
-not apply it twice.
+not apply it twice; the setup script also reverses the recorded earlier patch
+before applying a newer version, and can migrate the original project patch.
+If unrelated local source edits conflict with an upgrade, setup stops.
 
 The host NIC must use `192.168.1.50/24`; the MID360S address is
 `192.168.1.194`. The official MID360S JSON retains its original ports and
@@ -53,16 +55,20 @@ ros2 launch fast_lio mapping.launch.py \
   config_file:=mid360s_bench_extrinsic_estimation.yaml rviz:=false
 ros2 topic hz /Odometry
 ros2 topic hz /Odometry_highrate
+ros2 topic hz /LioHealth
 ```
 
 Record stationary drift, hand translation/rotation direction, monotonic
-high-rate timestamps, and the four actual topic rates. Exercise LiDAR loss,
+high-rate timestamps, and the five actual topic rates. Exercise LiDAR loss,
 FAST-LIO restart, and stale odometry with propellers removed.
 
-## Verified on the flight computer
+## Flight computer checks
 
-Checked on the upgraded flight computer with no LiDAR link, so these are
-launch-time facts only, not rate or drift measurements:
+The initial checks below were made before the sensor link was available.
+The later sensor-on rates and raw timestamp measurements are recorded in
+`../docs/mid360s_c1_progress.md`; offline LIO replay results are in
+`../docs/mid360s_c2_progress.md`, `../docs/mid360s_c3_progress.md`, and
+`../docs/mid360s_c4_c5_progress.md`.
 
 - `livox_ros_driver2` and `fast_lio` build on Ubuntu 22.04 with Humble.
 - Both nodes register: `/livox_lidar_publisher` and `/laser_mapping`.
@@ -76,9 +82,9 @@ launch-time facts only, not rate or drift measurements:
   delivers data, so the four topics only carry a `laser_mapping` subscription
   until the MID360S is connected.
 
-The following remain unmeasured: IMU message rate and continuity, FAST-LIO
-odometry rates, stationary drift, motion direction, and behavior after sensor
-loss/restart.
+Dynamic drift, motion direction, and sensor loss/restart on the flight computer
+remain unmeasured. The offline replay rates do not establish live delay or
+navigation readiness.
 
 ### Live MID360S check (2026-09-27)
 
@@ -100,19 +106,19 @@ matches the live host and the other deployment records.
 
 ## Production measurements required
 
-Two spatial transforms must be measured and reviewed before production
+Two spatial transforms must be reviewed before production
 localization can start. In the notation below, `T_A_B` maps coordinates from
 frame B into frame A.
 
 | Transform | Meaning and storage | How to measure |
 | --- | --- | --- |
-| `T_I_L` | Pose of the LiDAR frame L in the built-in IMU frame I. FAST-LIO's `mapping.extrinsic_T` is `t_I_L` in metres and `mapping.extrinsic_R` is `R_I_L` as nine row-major values, satisfying `p_I = R_I_L p_L + t_I_L`. | Rigidly fixture the sensor on a bench with propellers removed. Once IMU messages are flowing, use `mid360s_bench_extrinsic_estimation.yaml` (`extrinsic_est_en: true`) and move the whole fixture through varied translations and rotations about all three axes. Let the estimate settle; record the patch's `BENCH LiDAR-to-IMU` output across several runs and compare the resulting transforms. Do not use the zero/identity seed as a measurement. |
+| `T_I_L` | Pose of the LiDAR frame L in the built-in IMU frame I. FAST-LIO's `mapping.extrinsic_T` is `t_I_L` in metres and `mapping.extrinsic_R` is `R_I_L` as nine row-major values, satisfying `p_I = R_I_L p_L + t_I_L`. The plan fixes `t_I_L=[-0.011,-0.02329,0.04412] m` and `R_I_L=I`. | Validate the fixed manufacturer geometry on the bench. The optional estimation YAML starts from a zero/identity seed and must never be used as production geometry. |
 | `T_I_B` | Pose of the aircraft body frame B in IMU frame I. In `mid360s_mount.json`, `translation_m` is the body-origin position expressed in I, and `quaternion_xyzw` represents `R_I_B`. The runtime computes `T_WB = T_WI T_I_B`. | Define the project body origin and axes first. Survey the installed LiDAR frame L relative to that body datum as `T_L_B`, using the official Livox frame origin/axis definition and measured mounting geometry; compose it with the measured FAST-LIO transform: `T_I_B = T_I_L T_L_B`. If manufacturer data identifies the IMU origin/axes directly, survey `T_I_B` from that reference instead. A survey that gives IMU pose in body coordinates (`T_B_I`) must be inverted: `R_I_B = R_B_I^T`, `t_I_B = -R_B_I^T t_B_I`. Store translation in metres and a normalized x-y-z-w quaternion. Do not substitute the task startup/basepoint for the rigid body datum. |
 
-For `T_I_L`, compare repeated estimates from different motions and, where
-available, an independent geometric/reference measurement. For `T_I_B`, record
+For `T_I_L`, compare bench observations with the fixed manufacturer geometry.
+For `T_I_B`, record
 the body datum, axis convention, measured dimensions, and any inverse used.
-After filling the ignored production files, set
+After filling the ignored production files, keep
 `extrinsic_est_en: false`, rerun the setup overlay, and validate pose direction,
 stationary drift, timestamps, and all four topic rates. The live check above
 did not measure either transform; the missing IMU messages also block FAST-LIO's

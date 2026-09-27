@@ -18,5 +18,5 @@ exec(compile(ast.fix_missing_locations(ast.Module(body=gate, type_ignores=[])),
 
 def test_missing_topics_are_reported_and_all_topics_pass():
     missing = namespace["missing_lio_topics"]
-    assert missing(["/livox/lidar", "/Odometry"]) == ["/livox/imu", "/Odometry_highrate"]
+    assert missing(["/livox/lidar", "/Odometry"]) == ["/livox/imu", "/Odometry_highrate", "/LioHealth"]
     assert missing(namespace["REQUIRED_LIO_TOPICS"]) == []

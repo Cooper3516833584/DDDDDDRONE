@@ -146,10 +146,13 @@ class Navigation(object):
         """
         将当前 LIO body 位姿设为 startup-local 原点。
         """
+        disarmed = not bool(self.fc.state.unlock.value)
+        if hasattr(self.lio_pose, "reset_ground"):
+            self.lio_pose.reset_ground(disarmed=disarmed)
         deadline = time.monotonic() + (1.0 if wait else 0.0)
         while True:
             try:
-                self.lio_pose.calibrate_basepoint()
+                self.lio_pose.calibrate_basepoint(disarmed=disarmed)
                 break
             except RuntimeError:
                 if time.monotonic() >= deadline:
@@ -220,7 +223,9 @@ class Navigation(object):
         if self._lio_listener is None:
             from FlightController.Components.RosNode import LioListenNode, RosNodeRunner
 
-            self._lio_listener = LioListenNode(self.lio_pose.on_odometry)
+            self._lio_listener = LioListenNode(
+                self.lio_pose.on_odometry, self.lio_pose.on_health, self.lio_pose.on_imu
+            )
             RosNodeRunner().add_nodes().run()
         self.running = True
         self._velocity_override_active = False
@@ -523,6 +528,11 @@ class Navigation(object):
                     self.update_realtime_control(
                         vel_x=0, vel_y=0, yaw=0, _source="navigation"
                     )
+                    self.navigation_flag = False
+                    self.navi_x_pid.set_auto_mode(False)
+                    self.navi_y_pid.set_auto_mode(False)
+                    self.yaw_pid.set_auto_mode(False)
+                    self.traj_running_event.clear()
                     if pose_available:
                         logger.warning("[NAVI] Navigation pose not available")
                         pose_available = False

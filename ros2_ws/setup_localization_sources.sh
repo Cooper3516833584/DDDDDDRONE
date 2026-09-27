@@ -23,11 +23,31 @@ clone_at https://github.com/Ericsii/FAST_LIO_ROS2.git ros2 \
 
 fast_lio="$ROOT/src/FAST_LIO_ROS2"
 patch="$ROOT/patches/fast_lio_highrate.patch"
+applied_marker="$fast_lio/.mid360s_applied.patch"
 if git -C "$fast_lio" apply --unidiff-zero --reverse --check "$patch" 2>/dev/null; then
   echo "FAST-LIO high-rate patch already applied"
+  cp "$patch" "$applied_marker"
 else
-  git -C "$fast_lio" apply --unidiff-zero --check "$patch"
+  previous_patch=""
+  if [[ -f "$applied_marker" ]] &&
+     git -C "$fast_lio" apply --unidiff-zero --reverse --check "$applied_marker" 2>/dev/null; then
+    previous_patch="$applied_marker"
+  elif git -C "$fast_lio" apply --unidiff-zero --reverse --check \
+      "$ROOT/patches/fast_lio_legacy.patch" 2>/dev/null; then
+    previous_patch="$ROOT/patches/fast_lio_legacy.patch"
+  fi
+  if [[ -n "$previous_patch" ]]; then
+    git -C "$fast_lio" apply --unidiff-zero --reverse "$previous_patch"
+  fi
+  if ! git -C "$fast_lio" apply --unidiff-zero --check "$patch"; then
+    if [[ -n "$previous_patch" ]]; then
+      git -C "$fast_lio" apply --unidiff-zero "$previous_patch"
+    fi
+    echo "FAST-LIO source has local changes that prevent the project patch" >&2
+    exit 1
+  fi
   git -C "$fast_lio" apply --unidiff-zero "$patch"
+  cp "$patch" "$applied_marker"
 fi
 
 cp "$ROOT/config/MID360s_config.json" "$ROOT/src/livox_ros_driver2/config/MID360s_config.json"
