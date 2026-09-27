@@ -23,6 +23,7 @@ FUSION_ROS_CALIBRATION_INTERVAL = 1.0
 FUSION_ROS_MAX_POSITION_CORRECTION_CM = 2.0
 FUSION_ROS_MAX_YAW_CORRECTION_DEG = 1.0
 NAVIGATION_CONTROL_STALE_TIMEOUT = 0.30
+LIO_CALIBRATION_WAIT_SECONDS = 3.0
 VELOCITY_OVERRIDE_ZERO_FLUSH_FRAMES = 3
 VELOCITY_OVERRIDE_ZERO_FLUSH_INTERVAL = 0.05
 
@@ -149,7 +150,7 @@ class Navigation(object):
         disarmed = not bool(self.fc.state.unlock.value)
         if hasattr(self.lio_pose, "reset_ground"):
             self.lio_pose.reset_ground(disarmed=disarmed)
-        deadline = time.monotonic() + (1.0 if wait else 0.0)
+        deadline = time.monotonic() + (LIO_CALIBRATION_WAIT_SECONDS if wait else 0.0)
         while True:
             try:
                 self.lio_pose.calibrate_basepoint(disarmed=disarmed)

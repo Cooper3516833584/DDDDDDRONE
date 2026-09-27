@@ -73,10 +73,13 @@ class LioPoseProvider:
             mount_path = Path(__file__).resolve().parents[2] / "config" / "mid360s_mount.json"
         p, q = self.LIDAR_ORIGIN_IN_IMU_M, self.ALIGNED_QUATERNION
         self._reference_frame = "lidar"
+        self._mount_reviewed = False
         mount_file = Path(mount_path)
         if mount_file.exists():
             try:
                 data = json.loads(mount_file.read_text(encoding="utf-8"))
+                if "T_I_B" in data and data.get("radar_height_above_body_origin_m") is not None:
+                    raise ValueError("Conflicting body mount definitions")
                 if "T_I_B" in data:
                     mount = data["T_I_B"]
                     p = tuple(float(v) for v in mount["translation_m"])
@@ -90,8 +93,9 @@ class LioPoseProvider:
                     self._reference_frame = "body"
                 if len(p) != 3 or not all(math.isfinite(v) for v in p):
                     raise ValueError("Invalid mount translation")
-            except (OSError, KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError("Invalid optional MID360S mount configuration") from exc
+                self._mount_reviewed = data.get("reviewed") is True and self._reference_frame == "body"
+            except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("Invalid MID360S mount configuration") from exc
         self._mount = (p, q)
         self._ceiling_estimator = None
         self._require_health = require_health
@@ -105,7 +109,7 @@ class LioPoseProvider:
         self._world_basis = None
         self._health = None
         self._health_received_at = 0.0
-        self._correction_received_at = 0.0
+        self._valid_correction_received_at = 0.0
         self._health_epoch = None
         self._correction_seq = 0
         self._anchor_ns = 0
@@ -119,6 +123,10 @@ class LioPoseProvider:
     @staticmethod
     def _stamp_ns(stamp):
         return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+    @property
+    def mount_reviewed(self):
+        return self._mount_reviewed
 
     def set_ceiling_clearance_estimator(self, estimator):
         """Register an on-demand LiDAR point-cloud estimator; no background work."""
@@ -145,22 +153,23 @@ class LioPoseProvider:
         g = math.sqrt(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z)
         w = math.sqrt(gyro.x * gyro.x + gyro.y * gyro.y + gyro.z * gyro.z)
         with self._lock:
-            if self._stationary_ready:
-                return
-            if (stamp_ns <= self._last_imu_ns or
-                    (self._last_imu_ns and stamp_ns - self._last_imu_ns > 20_000_000) or
-                    not math.isfinite(g) or not math.isfinite(w) or
-                    not 0.8 <= g <= 1.2 or w > 0.02):
+            monotonic = stamp_ns > self._last_imu_ns
+            gap_ok = not self._last_imu_ns or stamp_ns - self._last_imu_ns <= 20_000_000
+            stationary_sample = (math.isfinite(g) and math.isfinite(w) and
+                                 0.8 <= g <= 1.2 and w <= 0.02)
+            if not monotonic or not gap_ok or not stationary_sample:
                 self._imu_window.clear()
+                self._stationary_ready = False
             self._last_imu_ns = stamp_ns
-            if 0.8 <= g <= 1.2 and w <= 0.02:
+            if monotonic and stationary_sample:
                 self._imu_window.append((stamp_ns, g))
             while self._imu_window and stamp_ns - self._imu_window[0][0] > 2_500_000_000:
                 self._imu_window.popleft()
-            if (self._imu_window and stamp_ns - self._imu_window[0][0] >= 2_000_000_000 and
-                    max(item[1] for item in self._imu_window) -
-                    min(item[1] for item in self._imu_window) <= 0.05):
-                self._stationary_ready = True
+            self._stationary_ready = bool(
+                self._imu_window and
+                stamp_ns - self._imu_window[0][0] >= 2_000_000_000 and
+                max(item[1] for item in self._imu_window) -
+                min(item[1] for item in self._imu_window) <= 0.05)
 
     def on_health(self, health):
         state_ns = self._stamp_ns(health.state_stamp)
@@ -176,6 +185,7 @@ class LioPoseProvider:
                     (seq > self._correction_seq and anchor_ns <= self._anchor_ns)):
                 self._lost_latched = True
                 self._base = None
+                self._world_basis = None
                 return
             new_correction = seq > self._correction_seq
             self._health_epoch = epoch
@@ -184,8 +194,6 @@ class LioPoseProvider:
             self._state_ns = state_ns
             self._health = health
             self._health_received_at = now
-            if new_correction:
-                self._correction_received_at = now
             gravity = health.gravity_o
             gravity_values = (float(gravity.x), float(gravity.y), float(gravity.z))
             gravity_norm = math.sqrt(sum(v * v for v in gravity_values))
@@ -198,33 +206,46 @@ class LioPoseProvider:
                     5.0 <= gravity_norm <= 15.0)
             if not good:
                 self._good_corrections = 0
-                self._base = None
             elif new_correction:
+                self._valid_correction_received_at = now
                 self._good_corrections += 1
             if int(health.state) == 3:
                 self._lost_latched = True
                 self._base = None
+                self._world_basis = None
 
     def reset_ground(self, *, disarmed):
         if not disarmed:
             raise RuntimeError("Ground reset requires verified disarmed state")
         with self._lock:
             if not self._lost_latched:
-                return
+                return False
+            self._latest = None
+            self._latest_twist = None
+            self._received_at = 0.0
+            self._stamp = None
+            self._stamp_ns_value = None
             self._health = None
+            self._health_received_at = 0.0
             self._health_epoch = None
             self._correction_seq = 0
             self._anchor_ns = 0
             self._state_ns = 0
             self._good_corrections = 0
-            self._correction_received_at = 0.0
+            self._valid_correction_received_at = 0.0
             self._lost_latched = False
             self._base = None
             self._world_basis = None
+            self._imu_window.clear()
+            self._stationary_ready = False
+            self._last_imu_ns = 0
+            return True
 
     def _healthy(self, now):
         if not self._require_health:
             return self._latest is not None and now - self._received_at <= self.STALE_SECONDS
+        if not self._mount_reviewed or self._reference_frame != "body":
+            return False
         if self._lost_latched or self._health is None or self._latest is None:
             return False
         if self._stamp_ns_value is None or self._state_ns != self._stamp_ns_value:
@@ -233,15 +254,18 @@ class LioPoseProvider:
         if source_age < -0.01 or source_age > self.STALE_SECONDS:
             self._lost_latched = True
             self._base = None
+            self._world_basis = None
             return False
         if (now - self._received_at > self.STALE_SECONDS or
                 now - self._health_received_at > self.STALE_SECONDS or
-                now - self._correction_received_at > self.CORRECTION_STALE_SECONDS or
+                now - self._valid_correction_received_at > self.CORRECTION_STALE_SECONDS or
                 (self._state_ns - self._anchor_ns) * 1e-9 > self.CORRECTION_STALE_SECONDS or
                 self._good_corrections < 10 or not self._stationary_ready):
-            if now - self._correction_received_at > self.CORRECTION_STALE_SECONDS:
+            if now - self._valid_correction_received_at > self.CORRECTION_STALE_SECONDS or (
+                    self._state_ns - self._anchor_ns) * 1e-9 > self.CORRECTION_STALE_SECONDS:
                 self._lost_latched = True
                 self._base = None
+                self._world_basis = None
             return False
         return int(self._health.state) == 1
 
@@ -282,12 +306,11 @@ class LioPoseProvider:
             if self._stamp is not None and stamp <= self._stamp:
                 self._latest = None
                 self._base = None
+                self._world_basis = None
                 self._stamp = None
                 self._stamp_ns_value = None
                 self._lost_latched = True
                 return
-            if self._received_at and now - self._received_at > self.STALE_SECONDS:
-                self._base = None
             self._latest = (p, q)
             self._latest_twist = (v_imu, omega_imu)
             self._stamp = stamp

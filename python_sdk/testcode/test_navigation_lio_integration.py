@@ -31,7 +31,8 @@ class Logger:
 
 
 namespace = {"np": np, "time": time, "logger": Logger(), "logger_dbg": Logger(),
-             "NAVIGATION_CONTROL_STALE_TIMEOUT": 0.30}
+             "NAVIGATION_CONTROL_STALE_TIMEOUT": 0.30,
+             "LIO_CALIBRATION_WAIT_SECONDS": 3.0}
 exec(compile(module, str(SOURCE), "exec"), namespace)
 Navigation = namespace["Navigation"]
 
@@ -103,6 +104,31 @@ def test_basepoint_calibration_delegates_to_lio():
     assert np.array_equal(nav.calibrate_basepoint(wait=False), [0, 0])
     assert provider.calibrations == 1
     assert nav.lio_pose.get_pose() is not None
+
+
+def test_waited_calibration_allows_new_two_second_stationary_window(monkeypatch):
+    class Clock:
+        value = 0.0
+
+        def monotonic(self):
+            return self.value
+
+        def sleep(self, duration):
+            self.value += duration
+
+    clock = Clock()
+
+    class DelayedProvider(Provider):
+        def calibrate_basepoint(self, *, disarmed):
+            if clock.value < 2.1:
+                raise RuntimeError("Stationary window incomplete")
+            super().calibrate_basepoint(disarmed=disarmed)
+
+    nav = navigation(DelayedProvider([(0, 0, 0, True)]))
+    nav.fc.state.unlock.value = False
+    monkeypatch.setitem(namespace, "time", clock)
+    assert np.array_equal(nav.calibrate_basepoint(wait=True), [0, 0])
+    assert 2.1 <= clock.value < 3.0
 
 
 def test_stale_pose_zeros_previous_horizontal_and_yaw_commands(monkeypatch):
