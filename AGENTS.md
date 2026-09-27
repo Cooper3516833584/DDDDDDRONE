@@ -418,9 +418,9 @@ stablize
 
 如果任务使用 `Navigation`，不得把 `server_ros.py` 正在运行等同于定位链已经启动。必须先启动 MID360S ROS2 driver 和 FAST-LIO2，并确认 `/livox/lidar`、`/livox/imu`、`/Odometry`、`/Odometry_highrate` 均持续输出。
 
-生产任务使用方案固定的 MID360S LiDAR↔内置 IMU 外参。用户已确认雷达与机体同轴（前 X 正、左 Y 正、上 Z 正），雷达原点位于机体中轴线上方；雷达到机体原点的高度可选，未提供时定位参考点为雷达原点，不得称其为机体原点。进入导航闭环前，`Navigation` 必须取得 fresh LIO pose 并成功执行 `calibrate_basepoint()`。缺少这些定位健康条件时必须拒绝启动任务或进入闭环。T265、RealSense、Cartographer、LD06/D500 不属于当前 `Navigation` 定位链要求。
+生产任务使用方案固定的 MID360S LiDAR↔内置 IMU 外参。用户已确认雷达与机体同轴（前 X 正、左 Y 正、上 Z 正），雷达原点位于机体中轴线上方。未提供机体安装外参时可用雷达原点做录包和诊断，但不得进入生产 `Navigation`。生产任务需要实测高度或完整 `T_I_B`，并在 `mid360s_mount.json` 中明确 `reviewed: true`；进入导航闭环前，`Navigation` 还必须取得 fresh LIO pose 并成功执行 `calibrate_basepoint()`。缺少这些条件时必须拒绝启动任务或进入闭环。T265、RealSense、Cartographer、LD06/D500 不属于当前 `Navigation` 定位链要求。
 
-外参录入必须按变换方向核对：`T_A_B` 表示把 B 坐标变换到 A。FAST-LIO 的 `mapping.extrinsic_T`、`mapping.extrinsic_R` 表示 LiDAR 点到 IMU 坐标的变换 `p_I = R_I_L p_L + t_I_L`；平移单位为米，旋转按行优先 9 个数填写。可选机载 `mid360s_mount.json` 中的高度表示雷达原点到机体原点的正向竖直距离；若使用旧式完整 `T_I_B`，平移单位为米，四元数顺序为 x-y-z-w，并核对变换方向。FAST-LIO 在线外参估计只用于无桨台架测量；生产配置使用方案固定的厂家数值并关闭 `extrinsic_est_en`。驱动宣布已启用 IMU 不等于 `/livox/imu` 已有数据，必须实际检查消息与频率。
+外参录入必须按变换方向核对：`T_A_B` 表示把 B 坐标变换到 A。FAST-LIO 的 `mapping.extrinsic_T`、`mapping.extrinsic_R` 表示 LiDAR 点到 IMU 坐标的变换 `p_I = R_I_L p_L + t_I_L`；平移单位为米，旋转按行优先 9 个数填写。`mid360s_mount.json` 中的高度表示雷达原点到机体原点的正向竖直距离；若使用完整 `T_I_B`，平移单位为米，四元数顺序为 x-y-z-w，并核对变换方向。两种表达不得同时填写；生产配置必须由实测值复核。FAST-LIO 在线外参估计只用于无桨台架测量；生产配置使用方案固定的厂家数值并关闭 `extrinsic_est_en`。驱动宣布已启用 IMU 不等于 `/livox/imu` 已有数据，必须实际检查消息与频率。
 
 ---
 

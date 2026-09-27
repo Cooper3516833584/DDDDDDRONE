@@ -113,15 +113,25 @@ LiDAR-to-IMU transform is `T_I_L`: `t_I_L=[-0.011,-0.02329,0.04412] m`,
 template if no custom `mid360s_drone.yaml` exists.
 
 The installed LiDAR axes match the aircraft axes: +X forward, +Y left, +Z up.
-The LiDAR is on the aircraft centreline, above the body origin. Without an
-optional `python_sdk/config/mid360s_mount.json`, the bridge reports the LiDAR
-origin as its localization reference and does not claim body-origin position.
-If the vertical distance is known, set `radar_height_above_body_origin_m` in
-that JSON; the bridge then reports the body origin using
-`t_I_B=t_I_L+[0,0,-height]` and aligned axes. A legacy explicit `T_I_B`
-JSON is still accepted. The snapshot's `reference_frame` identifies which
-origin is reported. Basepoint calibration establishes a local frame at that
-same reference point; it does not reset FAST-LIO or apply a field transform.
+The LiDAR is on the aircraft centreline, above the body origin. For recording
+and diagnostics, an absent `python_sdk/config/mid360s_mount.json` leaves the
+bridge at the LiDAR origin (`reference_frame: lidar`). This fallback cannot
+authorize production Navigation. Production Navigation requires a measured,
+reviewed body mount JSON with `"reviewed": true`, using either explicit `T_I_B`
+or `radar_height_above_body_origin_m`. For the height form, the aligned axes
+give `t_I_B=t_I_L+[0,0,-height]`. Conflicting or invalid mount entries fail
+closed. `ros_boot` can still start the driver and FAST-LIO for diagnostics;
+`mis_boot` requires the reviewed mount. Basepoint calibration establishes a
+local frame at that body reference point; it does not reset FAST-LIO or apply
+a field transform. The height or full `T_I_B` must be measured before mission
+startup; this repository does not supply a production value.
+
+`correction_seq` and `anchor_stamp` advance only on quality-valid laser
+corrections. A bad scan immediately marks health DEGRADED without refreshing
+the valid anchor. After 250 ms without a valid correction, health becomes
+LOST. DEGRADED pauses Navigation while retaining its base; recovery requires
+10 distinct valid corrections. LOST clears the base and latches until a
+disarmed ground reset, after which a new 2 s stationary window is required.
 
 The bridge exposes `set_ceiling_clearance_estimator()` and
 `estimate_ceiling_clearance_m(points)` for optional LiDAR-to-ceiling distance.
