@@ -1,0 +1,2 @@
+ros2_ws/setup_localization_sources.sh text eol=lf
+ros2_ws/patches/*.patch text eol=lf

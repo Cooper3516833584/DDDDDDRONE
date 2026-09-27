@@ -105,7 +105,7 @@ index f35378f..d001ede 100644
 +  if (dt > 0.0)
 +    kf_state.predict(dt, Q, in);
 diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
-index d441261..8d13291 100644
+index d441261..7504202 100644
 --- a/src/laserMapping.cpp
 +++ b/src/laserMapping.cpp
 @@ -35,0 +36,3 @@
@@ -426,7 +426,7 @@ index d441261..8d13291 100644
 @@ -631 +907 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 -    odomAftMapped.child_frame_id = "body";
 +    odomAftMapped.child_frame_id = "imu";
-@@ -634,3 +910,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
+@@ -634,3 +910,23 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 -    pubOdomAftMapped->publish(odomAftMapped);
 -    auto P = kf.get_P();
 -    for (int i = 0; i < 6; i ++)
@@ -436,19 +436,12 @@ index d441261..8d13291 100644
 +    odomAftMapped.twist.twist.linear.y = v_imu.y();
 +    odomAftMapped.twist.twist.linear.z = v_imu.z();
 +    if (!Measures.imu.empty())
-@@ -638,7 +917,4 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
--        int k = i < 3 ? i + 3 : i - 3;
--        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
--        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
--        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
--        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
--        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
--        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
++    {
 +        const auto &gyro = Measures.imu.back()->angular_velocity;
 +        odomAftMapped.twist.twist.angular.x = gyro.x - state_point.bg.x();
 +        odomAftMapped.twist.twist.angular.y = gyro.y - state_point.bg.y();
 +        odomAftMapped.twist.twist.angular.z = gyro.z - state_point.bg.z();
-@@ -645,0 +922,19 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
++    }
 +    const auto P = kf.get_P();
 +    Eigen::Matrix<double, 6, 6> J_pose = Eigen::Matrix<double, 6, 6>::Identity();
 +    J_pose.block<3, 3>(3, 3) = R; // Filter rotation error is in the IMU frame.
@@ -460,13 +453,20 @@ index d441261..8d13291 100644
 +    for (int axis = 0; axis < 3; ++axis)
 +        P_twist(3 + axis, 3 + axis) += gyr_cov;
 +    for (int row = 0; row < 6; ++row)
-+    {
+@@ -638,7 +934,5 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
+-        int k = i < 3 ? i + 3 : i - 3;
+-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
+-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
+-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
+-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
+-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
+-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
 +        for (int col = 0; col < 6; ++col)
 +        {
 +            odomAftMapped.pose.covariance[row * 6 + col] = P_pose(row, col);
 +            odomAftMapped.twist.covariance[row * 6 + col] = P_twist(row, col);
 +        }
-+    }
+@@ -645,0 +940 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 +    pubOdomAftMapped->publish(odomAftMapped);
 @@ -650 +945 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 -    trans.child_frame_id = "body";
@@ -513,15 +513,22 @@ index d441261..8d13291 100644
 +            synchronized = sync_packages(Measures);
 +        }
 +        if(synchronized)
-@@ -1052 +1376,6 @@ private:
+@@ -1052 +1376,13 @@ private:
 -            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
 +            const bool laser_corrected = kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
 +            if (!laser_corrected)
 +            {
++                {
++                    lock_guard<mutex> lock(mtx_highrate_odom);
++                    correction_matches = 0;
++                    correction_rms = 0.0;
++                    correction_geometry_ratio = 0.0;
++                    correction_status = fast_lio::msg::LioHealth::DEGRADED;
++                }
 +                RCLCPP_WARN(this->get_logger(), "No valid laser match, skip correction output");
 +                return;
 +            }
-@@ -1053,0 +1383,51 @@ private:
+@@ -1053,0 +1390,60 @@ private:
 +            if (extrinsic_est_en)
 +            {
 +                const M3D R = state_point.offset_R_L_I.toRotationMatrix();
@@ -534,19 +541,28 @@ index d441261..8d13291 100644
 +            if (p_imu->imu_ready() && !Measures.imu.empty())
 +            {
 +                lock_guard<mutex> lock(mtx_highrate_odom);
-+                ++correction_seq;
-+                correction_anchor_ns = get_ros_time(lidar_end_time).nanoseconds();
 +                correction_matches = model_matches;
 +                correction_rms = model_rms;
 +                correction_geometry_ratio = model_geometry_ratio;
-+                correction_status =
++                const bool correction_valid =
 +                    correction_matches >= 200 && std::isfinite(correction_rms) &&
-+                    correction_rms <= 0.15 && std::isfinite(correction_geometry_ratio) &&
-+                    correction_geometry_ratio > 1e-4
-+                    ? fast_lio::msg::LioHealth::TRACKING
-+                    : fast_lio::msg::LioHealth::DEGRADED;
++                    correction_rms >= 0.0 && correction_rms <= 0.15 &&
++                    std::isfinite(correction_geometry_ratio) &&
++                    correction_geometry_ratio > 1e-4 &&
++                    correction_geometry_ratio <= 1.000001;
 +                const auto anchor_ns = get_ros_time(lidar_end_time).nanoseconds();
-+                if (highrate_imu_history.empty() ||
++                correction_status = correction_valid ? fast_lio::msg::LioHealth::TRACKING
++                                                     : fast_lio::msg::LioHealth::DEGRADED;
++                if (correction_valid)
++                {
++                    ++correction_seq;
++                    correction_anchor_ns = anchor_ns;
++                }
++                if (correction_seq == 0)
++                {
++                    highrate_odom_ready = false;
++                }
++                else if (highrate_imu_history.empty() ||
 +                    rclcpp::Time(highrate_imu_history.front()->header.stamp).nanoseconds() > anchor_ns)
 +                {
 +                    highrate_odom_ready = false;
@@ -573,12 +589,12 @@ index d441261..8d13291 100644
 +                    }
 +                }
 +            }
-@@ -1074 +1454 @@ private:
+@@ -1074 +1470 @@ private:
 -            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
 +            if (scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
-@@ -1138,0 +1519 @@ private:
+@@ -1138,0 +1535 @@ private:
 +    rclcpp::CallbackGroup::SharedPtr imu_group_;
-@@ -1163 +1544,4 @@ int main(int argc, char** argv)
+@@ -1163 +1560,4 @@ int main(int argc, char** argv)
 -    rclcpp::spin(std::make_shared<LaserMappingNode>());
 +    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
 +    auto node = std::make_shared<LaserMappingNode>();
