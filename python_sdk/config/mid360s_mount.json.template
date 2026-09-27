@@ -1,8 +1,4 @@
 {
-  "note": "MEASURED VALUE REQUIRED. T_I_B maps body-frame coordinates into the IMU frame; translation_m is the body origin expressed in IMU axes, and quaternion_xyzw is R_I_B. Do not use placeholder values for production.",
-  "reviewed": false,
-  "T_I_B": {
-    "translation_m": ["REQUIRED_MEASURED_X", "REQUIRED_MEASURED_Y", "REQUIRED_MEASURED_Z"],
-    "quaternion_xyzw": ["REQUIRED_MEASURED_QX", "REQUIRED_MEASURED_QY", "REQUIRED_MEASURED_QZ", "REQUIRED_MEASURED_QW"]
-  }
+  "note": "Optional. LiDAR and aircraft axes are aligned (+X forward, +Y left, +Z up). Without a height value, localization tracks the LiDAR origin. Set the height only when the body origin below the LiDAR is known.",
+  "radar_height_above_body_origin_m": null
 }

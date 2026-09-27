@@ -1,4 +1,4 @@
-"""Convert FAST-LIO IMU odometry to the Navigation startup-local body pose."""
+"""Convert FAST-LIO IMU odometry to the startup-local aircraft reference."""
 
 import json
 import math
@@ -64,22 +64,36 @@ def _normalize(v):
 class LioPoseProvider:
     STALE_SECONDS = 0.05
     CORRECTION_STALE_SECONDS = 0.25
+    # Manufacturer T_I_L. User confirmed L and aircraft axes are aligned.
+    LIDAR_ORIGIN_IN_IMU_M = (-0.011, -0.02329, 0.04412)
+    ALIGNED_QUATERNION = (0.0, 0.0, 0.0, 1.0)
 
     def __init__(self, mount_path=None, *, require_health=True):
         if mount_path is None:
             mount_path = Path(__file__).resolve().parents[2] / "config" / "mid360s_mount.json"
-        try:
-            data = json.loads(Path(mount_path).read_text(encoding="utf-8"))
-            mount = data["T_I_B"]
-            if require_health and data.get("reviewed") is not True:
-                raise ValueError("Mount measurements require explicit review")
-            p = tuple(float(v) for v in mount["translation_m"])
-            q = _unit(tuple(float(v) for v in mount["quaternion_xyzw"]))
-            if len(p) != 3 or not all(math.isfinite(v) for v in p):
-                raise ValueError("Invalid mount translation")
-        except (OSError, KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("Measured MID360S IMU-to-body mount is required") from exc
+        p, q = self.LIDAR_ORIGIN_IN_IMU_M, self.ALIGNED_QUATERNION
+        self._reference_frame = "lidar"
+        mount_file = Path(mount_path)
+        if mount_file.exists():
+            try:
+                data = json.loads(mount_file.read_text(encoding="utf-8"))
+                if "T_I_B" in data:
+                    mount = data["T_I_B"]
+                    p = tuple(float(v) for v in mount["translation_m"])
+                    q = _unit(tuple(float(v) for v in mount["quaternion_xyzw"]))
+                    self._reference_frame = "body"
+                elif data.get("radar_height_above_body_origin_m") is not None:
+                    height = float(data["radar_height_above_body_origin_m"])
+                    if not math.isfinite(height) or height < 0:
+                        raise ValueError("Invalid radar height")
+                    p = (p[0], p[1], p[2] - height)
+                    self._reference_frame = "body"
+                if len(p) != 3 or not all(math.isfinite(v) for v in p):
+                    raise ValueError("Invalid mount translation")
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("Invalid optional MID360S mount configuration") from exc
         self._mount = (p, q)
+        self._ceiling_estimator = None
         self._require_health = require_health
         self._lock = threading.Lock()
         self._latest = None
@@ -105,6 +119,24 @@ class LioPoseProvider:
     @staticmethod
     def _stamp_ns(stamp):
         return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+    def set_ceiling_clearance_estimator(self, estimator):
+        """Register an on-demand LiDAR point-cloud estimator; no background work."""
+        if estimator is not None and not callable(estimator):
+            raise TypeError("Ceiling estimator must be callable or None")
+        self._ceiling_estimator = estimator
+
+    def estimate_ceiling_clearance_m(self, lidar_points_xyz):
+        """Return LiDAR-to-ceiling distance only when explicitly requested."""
+        if self._ceiling_estimator is None:
+            return None
+        distance = self._ceiling_estimator(lidar_points_xyz)
+        if distance is None:
+            return None
+        distance = float(distance)
+        if not math.isfinite(distance) or distance <= 0:
+            raise ValueError("Invalid ceiling clearance")
+        return distance
 
     def on_imu(self, imu):
         stamp_ns = self._stamp_ns(imu.header.stamp)
@@ -262,19 +294,19 @@ class LioPoseProvider:
             self._stamp_ns_value = stamp_ns
             self._received_at = now
 
-    def _body_pose(self):
+    def _reference_pose(self):
         p, q = self._latest
         mp, mq = self._mount
         offset = _rotate(q, mp)
         return (tuple(p[i] + offset[i] for i in range(3)), _mul(q, mq))
 
     def get_snapshot(self):
-        """Return one validated six-degree body snapshot in startup-local W."""
+        """Return one validated reference-point snapshot in startup-local W."""
         with self._lock:
             if self._base is None or not self._healthy(time.monotonic()):
                 return None
-            body_p, body_q = self._body_pose()
-            delta = tuple(body_p[i] - self._base[0][i] for i in range(3))
+            reference_p, reference_q = self._reference_pose()
+            delta = tuple(reference_p[i] - self._base[0][i] for i in range(3))
             axes = self._world_basis
             if axes is None:
                 base_q = self._base[1]
@@ -285,26 +317,27 @@ class LioPoseProvider:
             velocity_o = _rotate(self._latest[1], tuple(v_imu[i] + lever[i]
                                                           for i in range(3)))
             mount_q = self._mount[1]
-            omega_body = _rotate((-mount_q[0], -mount_q[1], -mount_q[2], mount_q[3]),
-                                 omega_imu)
-            basis = tuple(tuple(_dot(row, _rotate(body_q, axis)) for axis in
+            omega_reference = _rotate((-mount_q[0], -mount_q[1], -mount_q[2], mount_q[3]),
+                                      omega_imu)
+            basis = tuple(tuple(_dot(row, _rotate(reference_q, axis)) for axis in
                                 ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
                           for row in axes)
             return {
                 "stamp_ns": self._stamp_ns_value,
                 "epoch": self._health_epoch,
                 "correction_seq": self._correction_seq,
+                "reference_frame": self._reference_frame,
                 "position_m": tuple(_dot(axis, delta) for axis in axes),
                 "rotation_w_b": basis,
                 "velocity_w_mps": tuple(_dot(axis, velocity_o) for axis in axes),
-                "angular_velocity_b_radps": omega_body,
+                "angular_velocity_b_radps": omega_reference,
             }
 
     def calibrate_basepoint(self, *, disarmed=False):
         with self._lock:
             if not disarmed or not self._healthy(time.monotonic()):
                 raise RuntimeError("Disarmed, stationary and healthy LIO are required")
-            self._base = self._body_pose()
+            self._base = self._reference_pose()
             if self._require_health:
                 try:
                     gravity = self._health.gravity_o
@@ -324,14 +357,14 @@ class LioPoseProvider:
             if self._base is None or not self._healthy(time.monotonic()):
                 return None
             if self._world_basis is None:
-                position, q = _relative(self._base, self._body_pose())
+                position, q = _relative(self._base, self._reference_pose())
                 yaw_ccw = math.degrees(math.atan2(2 * (q[3] * q[2] + q[0] * q[1]),
                                                    1 - 2 * (q[1] ** 2 + q[2] ** 2)))
             else:
-                body_p, body_q = self._body_pose()
-                delta = tuple(body_p[i] - self._base[0][i] for i in range(3))
+                reference_p, reference_q = self._reference_pose()
+                delta = tuple(reference_p[i] - self._base[0][i] for i in range(3))
                 position = tuple(_dot(axis, delta) for axis in self._world_basis)
-                forward = _rotate(body_q, (1.0, 0.0, 0.0))
+                forward = _rotate(reference_q, (1.0, 0.0, 0.0))
                 yaw_ccw = math.degrees(math.atan2(_dot(forward, self._world_basis[1]),
                                                    _dot(forward, self._world_basis[0])))
         return position[0] * 100, position[1] * 100, -yaw_ccw, True

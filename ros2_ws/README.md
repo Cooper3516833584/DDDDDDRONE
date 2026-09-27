@@ -104,30 +104,34 @@ The deployed checkout is `/home/fc/dddddrone` (five `d` characters before
 `rone`), and its ROS workspace is `/home/fc/dddddrone/ros2_ws`. This spelling
 matches the live host and the other deployment records.
 
-## Production measurements required
+## Production coordinate setup
 
-Two spatial transforms must be reviewed before production
-localization can start. In the notation below, `T_A_B` maps coordinates from
-frame B into frame A.
+`T_A_B` maps coordinates from frame B into frame A. The fixed manufacturer
+LiDAR-to-IMU transform is `T_I_L`: `t_I_L=[-0.011,-0.02329,0.04412] m`,
+`R_I_L=I`. The production FAST-LIO template contains these values with
+`extrinsic_est_en: false`. `setup_localization_sources.sh` installs that
+template if no custom `mid360s_drone.yaml` exists.
 
-| Transform | Meaning and storage | How to measure |
-| --- | --- | --- |
-| `T_I_L` | Pose of the LiDAR frame L in the built-in IMU frame I. FAST-LIO's `mapping.extrinsic_T` is `t_I_L` in metres and `mapping.extrinsic_R` is `R_I_L` as nine row-major values, satisfying `p_I = R_I_L p_L + t_I_L`. The plan fixes `t_I_L=[-0.011,-0.02329,0.04412] m` and `R_I_L=I`. | Validate the fixed manufacturer geometry on the bench. The optional estimation YAML starts from a zero/identity seed and must never be used as production geometry. |
-| `T_I_B` | Pose of the aircraft body frame B in IMU frame I. In `mid360s_mount.json`, `translation_m` is the body-origin position expressed in I, and `quaternion_xyzw` represents `R_I_B`. The runtime computes `T_WB = T_WI T_I_B`. | Define the project body origin and axes first. Survey the installed LiDAR frame L relative to that body datum as `T_L_B`, using the official Livox frame origin/axis definition and measured mounting geometry; compose it with the measured FAST-LIO transform: `T_I_B = T_I_L T_L_B`. If manufacturer data identifies the IMU origin/axes directly, survey `T_I_B` from that reference instead. A survey that gives IMU pose in body coordinates (`T_B_I`) must be inverted: `R_I_B = R_B_I^T`, `t_I_B = -R_B_I^T t_B_I`. Store translation in metres and a normalized x-y-z-w quaternion. Do not substitute the task startup/basepoint for the rigid body datum. |
+The installed LiDAR axes match the aircraft axes: +X forward, +Y left, +Z up.
+The LiDAR is on the aircraft centreline, above the body origin. Without an
+optional `python_sdk/config/mid360s_mount.json`, the bridge reports the LiDAR
+origin as its localization reference and does not claim body-origin position.
+If the vertical distance is known, set `radar_height_above_body_origin_m` in
+that JSON; the bridge then reports the body origin using
+`t_I_B=t_I_L+[0,0,-height]` and aligned axes. A legacy explicit `T_I_B`
+JSON is still accepted. The snapshot's `reference_frame` identifies which
+origin is reported. Basepoint calibration establishes a local frame at that
+same reference point; it does not reset FAST-LIO or apply a field transform.
 
-For `T_I_L`, compare bench observations with the fixed manufacturer geometry.
-For `T_I_B`, record
-the body datum, axis convention, measured dimensions, and any inverse used.
-After filling the ignored production files, keep
-`extrinsic_est_en: false`, rerun the setup overlay, and validate pose direction,
-stationary drift, timestamps, and all four topic rates. The live check above
-did not measure either transform; the missing IMU messages also block FAST-LIO's
-online `T_I_L` estimate. `T_I_B` can be surveyed mechanically once the body
-datum and sensor-frame reference are established.
-`common.time_offset_lidar_to_imu` is a separate temporal offset, not a spatial
-extrinsic; the current zero value also needs validation. `server_ros.py`
-rejects production FAST-LIO and mission startup while required measurement
-files or values are absent.
+The bridge exposes `set_ceiling_clearance_estimator()` and
+`estimate_ceiling_clearance_m(points)` for optional LiDAR-to-ceiling distance.
+No estimator is registered by default, and no point-cloud subscription or
+background computation is started for this interface. A caller must supply
+an estimator and explicitly request a result.
+
+Before flight, validate actual pose direction, stationary drift, timestamps,
+topic rates, dynamic motion, and failure handling on the assembled aircraft.
+The current zero `common.time_offset_lidar_to_imu` also needs validation.
 
 Only after all bench gates pass, the runtime launch pair is:
 
@@ -139,5 +143,5 @@ ros2 launch fast_lio mapping.launch.py config_file:=mid360s_drone.yaml rviz:=fal
 `server_ros.py` uses the same launch pair through the existing `RosManager`.
 It does not start RealSense, Cartographer, or LD06 localization. The aircraft
 Navigation subscribes to `/Odometry_highrate` through the existing rclpy
-executor. **Do not use a propeller-on closed loop until both transforms and
-the remaining bench checks are measured and passed.**
+executor. **Do not use a propeller-on closed loop until the assembled aircraft
+passes the remaining bench and dynamic checks.**

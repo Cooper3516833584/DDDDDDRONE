@@ -6,8 +6,8 @@
 #   (LiDAR coordinates into IMU coordinates; translation in metres;
 #    rotation is a row-major 3x3 matrix)
 #
-# Validate this fixed internal transform on the bench before flight. The separate
-# IMU-to-aircraft-body installation T_I_B must be measured and reviewed.
+# Validate this fixed internal transform on the bench before flight. LiDAR and
+# aircraft axes are aligned; body-origin height is optional in the Python bridge.
 
  /**:
     ros__parameters:

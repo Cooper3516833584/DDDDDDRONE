@@ -53,7 +53,7 @@ def require_production_localization():
                 raise ValueError(key)
         except (TypeError, ValueError, SyntaxError):
             raise RuntimeError(f"Valid MID360S {key} is required")
-    LioPoseProvider()  # Measured IMU-to-body mounting transform is mandatory.
+    LioPoseProvider()  # Optional mount config, validated if present.
 
 
 def run_item(item, kill_exist=True):

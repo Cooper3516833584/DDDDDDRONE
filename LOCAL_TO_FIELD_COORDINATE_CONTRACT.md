@@ -36,18 +36,17 @@ heading is `(-current_yaw) % 360`.
 
 The MID360S ROS2 localization path consumes FAST-LIO's `/Odometry_highrate` as
 the IMU pose `T_WI`. Transform notation is `T_A_B`: it maps coordinates from
-frame B into frame A. Thus `T_I_B` is the pose of aircraft body frame B
-expressed in IMU frame I: its translation is the body-origin position in I,
-and its rotation maps body axes into I. A measured `T_I_B` gives the aircraft
-body pose `T_WB = T_WI * T_I_B`. `calibrate_basepoint()` saves the current
-`T_WB0`; Navigation receives `inverse(T_WB0) * T_WB` in centimetres, with
-clockwise-positive yaw. This does not reset FAST-LIO's world frame and does
-not apply a FIELD transform on the aircraft. Missing measured LiDAR-to-IMU or
-IMU-to-body transforms prohibit propeller-on closed-loop flight.
-
-When the aircraft installation is surveyed relative to the LiDAR frame as
-`T_L_B`, derive the mount transform with `T_I_B = T_I_L * T_L_B`. Do not
-confuse either rigid transform with the task startup basepoint `T_WB0`.
+frame B into frame A. The LiDAR axes match aircraft axes (+X forward, +Y left,
++Z up), and its origin is on the centreline above the aircraft body origin.
+By default the bridge computes `T_WL = T_WI * T_I_L` using the fixed
+manufacturer `T_I_L` and reports LiDAR-origin position. The body-origin height
+offset is optional: if its vertical distance below the LiDAR is known, the
+bridge instead uses `T_I_B = T_I_L * translation(0,0,-height)`. A legacy full
+`T_I_B` is also supported. `calibrate_basepoint()` saves the current chosen
+reference pose; Navigation receives its startup-local motion in centimetres,
+with clockwise-positive yaw. This does not reset FAST-LIO's world frame or
+apply a FIELD transform. Before propeller-on closed-loop flight, validate the
+assembled installation, motion direction, timing and failure handling.
 
 For this integration, the task-level attachment must use
 `position_transform=None` and `heading_offset_deg=0.0`. It must not start

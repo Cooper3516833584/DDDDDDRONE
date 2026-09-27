@@ -60,6 +60,8 @@ cp "$ROOT/config/mid360s_bench_extrinsic_estimation.yaml" \
   "$fast_lio/config/mid360s_bench_extrinsic_estimation.yaml"
 if [[ -f "$ROOT/config/mid360s_drone.yaml" ]]; then
   cp "$ROOT/config/mid360s_drone.yaml" "$fast_lio/config/mid360s_drone.yaml"
+else
+  cp "$ROOT/config/mid360s_drone.yaml.template" "$fast_lio/config/mid360s_drone.yaml"
 fi
 
 echo "Pinned MID360S ROS2 sources and project overlays installed."

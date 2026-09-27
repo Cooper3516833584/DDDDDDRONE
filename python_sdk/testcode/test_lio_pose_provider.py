@@ -71,13 +71,42 @@ def test_stale_and_timestamp_rewind_invalidate_origin(tmp_path):
     assert p.get_pose() is None
 
 
-def test_missing_mount_and_wrong_frame_fail_closed(tmp_path):
-    with pytest.raises(RuntimeError):
-        LioPoseProvider(tmp_path / "missing.json")
+def test_optional_mount_and_wrong_frame_fail_closed(tmp_path):
+    default = LioPoseProvider(tmp_path / "missing.json", require_health=False)
+    assert default._reference_frame == "lidar"
+    assert default._mount == (LioPoseProvider.LIDAR_ORIGIN_IN_IMU_M,
+                              LioPoseProvider.ALIGNED_QUATERNION)
+    default.on_odometry(odom(1))
+    default.calibrate_basepoint(disarmed=True)
+    assert default.get_snapshot()["reference_frame"] == "lidar"
     p = provider(tmp_path)
     p.on_odometry(odom(1, frame="unexpected"))
     with pytest.raises(RuntimeError):
         p.calibrate_basepoint(disarmed=True)
+
+
+def test_optional_radar_height_and_on_demand_ceiling(tmp_path):
+    mount = tmp_path / "height.json"
+    mount.write_text(json.dumps({"radar_height_above_body_origin_m": 0.25}),
+                     encoding="utf-8")
+    p = LioPoseProvider(mount, require_health=False)
+    assert p._reference_frame == "body"
+    assert p._mount[0] == pytest.approx((-0.011, -0.02329, 0.04412 - 0.25))
+    assert p._mount[1] == (0, 0, 0, 1)
+    calls = []
+
+    def estimator(points):
+        calls.append(points)
+        return 1.4
+
+    assert p.estimate_ceiling_clearance_m([]) is None
+    p.set_ceiling_clearance_estimator(estimator)
+    assert calls == []
+    assert p.estimate_ceiling_clearance_m([(0, 0, 1.4)]) == pytest.approx(1.4)
+    assert len(calls) == 1
+    p.set_ceiling_clearance_estimator(None)
+    assert p.estimate_ceiling_clearance_m([]) is None
+    assert len(calls) == 1
 
 
 def test_health_requires_stable_corrections_and_watchdog(tmp_path):
