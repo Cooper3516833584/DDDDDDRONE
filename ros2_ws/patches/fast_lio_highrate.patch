@@ -45,23 +45,75 @@ index f35378f..98f46ce 100644
 +}
 +
 diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
-index d441261..ee900cb 100644
+index d441261..139e781 100644
 --- a/src/laserMapping.cpp
 +++ b/src/laserMapping.cpp
-@@ -135,0 +136,5 @@ state_ikfom state_point;
+@@ -35,0 +36,2 @@
++#include <algorithm>
++#include <cstdint>
+@@ -36,0 +39 @@
++#include <stdexcept>
+@@ -107,0 +111 @@ deque<double>                     time_buffer;
++deque<double>                     end_time_buffer;
+@@ -135,0 +140,5 @@ state_ikfom state_point;
 +state_ikfom state_highrate;
 +mutex mtx_highrate_odom;
 +bool highrate_odom_ready = false;
 +sensor_msgs::msg::Imu::ConstSharedPtr last_highrate_imu;
 +rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomHighrate;
-@@ -370 +375 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+@@ -292,0 +302,3 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
++        time_buffer.clear();
++        end_time_buffer.clear();
++        lidar_pushed = false;
+@@ -302,0 +315 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
++    end_time_buffer.push_back(-1.0); // Legacy PointCloud2 timing path.
+@@ -312,0 +326,19 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
++    if (p_pre->mid360s_mode)
++    {
++        // The pinned driver sets both fields from the first point's device ns.
++        if (msg->point_num != msg->points.size() || msg->points.empty() ||
++            msg->timebase == 0 ||
++            msg->timebase != static_cast<uint64_t>(rclcpp::Time(msg->header.stamp).nanoseconds()))
++        {
++            std::cerr << "Invalid MID360S frame header/count, dropping scan" << std::endl;
++            return;
++        }
++        for (const auto &point : msg->points)
++        {
++            if (point.offset_time > 150000000U)
++            {
++                std::cerr << "MID360S point offset exceeds 150 ms, dropping scan" << std::endl;
++                return;
++            }
++        }
++    }
+@@ -320,0 +353,3 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
++        time_buffer.clear();
++        end_time_buffer.clear();
++        lidar_pushed = false;
+@@ -340,0 +376,4 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
++    uint32_t raw_end_offset_ns = 0;
++    if (p_pre->mid360s_mode)
++        for (const auto &point : msg->points)
++            raw_end_offset_ns = std::max(raw_end_offset_ns, point.offset_time);
+@@ -341,0 +381,6 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
++    if (p_pre->mid360s_mode && ptr->empty())
++    {
++        mtx_buffer.unlock();
++        std::cerr << "MID360S frame has no valid points, dropping scan" << std::endl;
++        return;
++    }
+@@ -343,0 +389,2 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
++    end_time_buffer.push_back(p_pre->mid360s_mode ?
++                              last_timestamp_lidar + double(raw_end_offset_ns) * 1e-9 : -1.0);
+@@ -370 +417 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 -        std::cerr << "lidar loop back, clear buffer" << std::endl;
 +        std::cerr << "imu loop back, clear buffer" << std::endl;
-@@ -371,0 +377,3 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+@@ -371,0 +419,3 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 +        lock_guard<mutex> lock(mtx_highrate_odom);
 +        highrate_odom_ready = false;
 +        last_highrate_imu.reset();
-@@ -378,0 +387,37 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+@@ -378,0 +429,37 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 +
 +    state_ikfom snapshot;
 +    V3D gyr_unbiased = Zero3d;
@@ -99,9 +151,32 @@ index d441261..ee900cb 100644
 +        odom.twist.twist.angular.z = gyr_unbiased.z();
 +        pubOdomHighrate->publish(odom);
 +    }
-@@ -934,0 +980 @@ public:
+@@ -385 +472 @@ bool sync_packages(MeasureGroup &meas)
+-    if (lidar_buffer.empty() || imu_buffer.empty()) {
++    if (lidar_buffer.empty() || end_time_buffer.empty() || imu_buffer.empty()) {
+@@ -394 +481,5 @@ bool sync_packages(MeasureGroup &meas)
+-        if (meas.lidar->points.size() <= 1) // time too little
++        if (end_time_buffer.front() >= 0.0)
++        {
++            lidar_end_time = end_time_buffer.front();
++        }
++        else if (meas.lidar->points.size() <= 1) // time too little
+@@ -432,0 +524 @@ bool sync_packages(MeasureGroup &meas)
++    end_time_buffer.pop_front();
+@@ -824,0 +917 @@ public:
++        this->declare_parameter<string>("preprocess.livox_model", "");
+@@ -860,0 +954,5 @@ public:
++        string livox_model;
++        this->get_parameter_or<string>("preprocess.livox_model", livox_model, "");
++        if (livox_model != "" && livox_model != "mid360s")
++            throw std::runtime_error("Unsupported Livox model");
++        p_pre->mid360s_mode = livox_model == "mid360s";
+@@ -865,0 +964,2 @@ public:
++        if (p_pre->mid360s_mode && p_pre->feature_enabled)
++            throw std::runtime_error("MID360S raw point path requires feature extraction disabled");
+@@ -934,0 +1035 @@ public:
 +        pubOdomHighrate = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry_highrate", 20);
-@@ -1053,0 +1100,18 @@ private:
+@@ -1053,0 +1155,18 @@ private:
 +            if (extrinsic_est_en)
 +            {
 +                const M3D R = state_point.offset_R_L_I.toRotationMatrix();
@@ -120,6 +195,55 @@ index d441261..ee900cb 100644
 +                last_highrate_imu = anchor;
 +                highrate_odom_ready = true;
 +            }
-@@ -1115 +1179 @@ private:
--    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
-+    void map_save_callback(std_srvs::srv::Trigger::Request::SharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+@@ -1074 +1193 @@ private:
+-            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
++            if (scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
+diff --git a/src/preprocess.cpp b/src/preprocess.cpp
+index 88444f4..b4a182a 100644
+--- a/src/preprocess.cpp
++++ b/src/preprocess.cpp
+@@ -3,0 +4,2 @@
++#include <algorithm>
++#include <cmath>
+@@ -49 +51,2 @@ void Preprocess::process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg
+-  avia_handler(msg);
++  if (mid360s_mode) mid360s_handler(msg);
++  else avia_handler(msg);
+@@ -52,0 +56,29 @@ void Preprocess::process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg
++void Preprocess::mid360s_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg)
++{
++  pl_surf.clear();
++  if (feature_enabled || point_filter_num <= 0) return;
++  pl_surf.reserve(msg->points.size() / point_filter_num + 1);
++  std::size_t valid = 0;
++  for (const auto &raw : msg->points)
++  {
++    // MID360S tag: each two-bit confidence must be 0 or 1; bits 7:6 reserved.
++    const auto tag = raw.tag;
++    if ((tag & 0xC0U) != 0U || ((tag >> 4U) & 3U) >= 2U ||
++        ((tag >> 2U) & 3U) >= 2U || (tag & 3U) >= 2U) continue;
++    const double range_sq = double(raw.x) * raw.x + double(raw.y) * raw.y + double(raw.z) * raw.z;
++    if (!std::isfinite(raw.x) || !std::isfinite(raw.y) || !std::isfinite(raw.z) ||
++        !std::isfinite(range_sq) || range_sq <= blind * blind) continue;
++    if (valid++ % static_cast<std::size_t>(point_filter_num) != 0U) continue;
++    PointType point{};
++    point.x = raw.x;
++    point.y = raw.y;
++    point.z = raw.z;
++    point.intensity = raw.reflectivity;
++    point.curvature = static_cast<float>(double(raw.offset_time) * 1e-6);
++    pl_surf.push_back(point);
++  }
++  // Undistortion expects time-ordered points; filtering must not change frame end.
++  std::stable_sort(pl_surf.points.begin(), pl_surf.points.end(),
++                   [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
++}
++
+diff --git a/src/preprocess.h b/src/preprocess.h
+index 7f7d7a1..47bbe6b 100644
+--- a/src/preprocess.h
++++ b/src/preprocess.h
+@@ -170,0 +171 @@ class Preprocess
++  bool mid360s_mode = false;
+@@ -175,0 +177 @@ private:
++  void mid360s_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg);
