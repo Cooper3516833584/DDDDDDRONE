@@ -153,3 +153,24 @@ C:\Users\TZDEZACR\Desktop\ground_station\Ground_Station\components
 - STOP 命令必须保持高优先级和幂等处理。
 - 测试完成后关闭串口和 SSH 会话。
 - 无法完成真实距离、飞行中干扰、高吞吐或长期稳定性测试时，必须明确标记为未验证。
+
+## 8. 2026-09-27 MID360S 实机检查
+
+目标机为 `fc-ubuntu`（`192.168.31.176`）。实机部署目录为
+`/home/fc/dddddrone`，ROS 工作区为 `/home/fc/dddddrone/ros2_ws`；路径中的
+`dddddrone` 在 `r` 前有 5 个 `d`。已从该工作区解析到 `livox_ros_driver2`
+和 `fast_lio` 包。
+
+本次网络检查及短时雷达驱动检查结果：
+
+- `enp3s0` 载波为 1，链路 `LOWER_UP`，地址为 `192.168.1.50/24`。
+- 雷达 `192.168.1.194` 邻居表状态为 `REACHABLE`；3 次 ping 全部成功，丢包 0%，时延约 0.9–1.9 ms。
+- Livox 驱动 1.2.8 使用 `MID360s_config.json` 成功初始化，识别雷达，切换到 Normal 模式并报告已启用雷达 IMU。
+- ROS 图中出现 `/livox/lidar`（`livox_ros_driver2/msg/CustomMsg`）和 `/livox/imu`（`sensor_msgs/msg/Imu`）。点云实测约 9.98 Hz，符合配置的 10 Hz；4 秒订阅期间 IMU 话题没有收到消息。
+- 本机没有运行 FAST-LIO；生产文件 `/home/fc/dddddrone/ros2_ws/src/FAST_LIO_ROS2/config/mid360s_drone.yaml` 和 `/home/fc/dddddrone/python_sdk/config/mid360s_mount.json` 均未找到。因此未产生或验证 `/Odometry`、`/Odometry_highrate`，也未运行任务或飞行控制程序。
+- 检查后停止了短时驱动。SDK 报告完成清理，但 ROS launch 在关闭时报告进程退出码 `-7`；该关闭异常尚未定位。
+
+**当前判断：**以太网、雷达发现和点云数据通路已验证；IMU 数据、FAST-LIO 里程计及生产定位外参仍未验收。后续先查明 `/livox/imu` 无消息的原因，再进行 FAST-LIO 台架测量；不得把台架估计初值直接当作生产外参。
+
+两组外参的坐标方向、字段单位和台架测量步骤见
+`ros2_ws/README.md` 的 “Production measurements required” 一节。

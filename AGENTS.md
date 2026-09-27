@@ -420,6 +420,8 @@ stablize
 
 生产任务必须具备已测定的 MID360S LiDAR↔内置 IMU 外参，以及已测定的 MID360S IMU↔无人机 body 安装外参。进入导航闭环前，`Navigation` 必须取得 fresh LIO pose 并成功执行 `calibrate_basepoint()`。缺少任一条件时必须拒绝启动任务或进入闭环。T265、RealSense、Cartographer、LD06/D500 不属于当前 `Navigation` 定位链要求。
 
+外参录入必须按变换方向核对：`T_A_B` 表示把 B 坐标变换到 A。FAST-LIO 的 `mapping.extrinsic_T`、`mapping.extrinsic_R` 表示 LiDAR 点到 IMU 坐标的变换 `p_I = R_I_L p_L + t_I_L`；平移单位为米，旋转按行优先 9 个数填写。机载 `mid360s_mount.json` 中的 `T_I_B` 表示 body 原点及 body 轴在 IMU 坐标中的位姿，平移单位为米，四元数顺序为 x-y-z-w。不得把反方向测量结果原样填入，须先求逆。FAST-LIO 在线外参估计只用于无桨台架测量；生产配置必须写入复核后的数值并关闭 `extrinsic_est_en`。驱动宣布已启用 IMU 不等于 `/livox/imu` 已有数据，必须实际检查消息与频率。
+
 ---
 
 ## 7. 线程、事件与资源管理

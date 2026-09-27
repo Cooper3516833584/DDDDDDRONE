@@ -2,6 +2,9 @@
 # - exactly one project profile
 # - algorithm constants remain internal
 # - measured LiDAR/IMU extrinsic is intentionally NOT guessed here
+# - mapping.extrinsic_T/R encode T_I_L: p_I = R_I_L * p_L + t_I_L
+#   (LiDAR coordinates into IMU coordinates; translation in metres;
+#    rotation is a row-major 3x3 matrix)
 #
 # Before flight, replace the REQUIRED_MEASURED placeholders with measured values
 # and set extrinsic_est_en: false.

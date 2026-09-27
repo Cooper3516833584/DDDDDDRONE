@@ -286,7 +286,7 @@ systemctl set-default multi-user.target
 - ROS 2 Humble 由官方 `ros2-apt-source_1.3.0~jammy` 配置（keyring 内嵌），写入
   `/etc/apt/sources.list.d/ros2.sources`；已安装 `ros-humble-ros-base`、`ros-dev-tools`、`pcl_ros`、
   `pcl_conversions`、`rosbag2`、`libpcl-dev`、`libeigen3-dev`、`libapr1-dev` 等。
-- 定位工作区 `~/ddddrone/ros2_ws` 在 Humble 下重新编译通过：`livox_ros_driver2` 与 `fast_lio` 构建成功，
+- 定位工作区 `~/dddddrone/ros2_ws` 在 Humble 下重新编译通过：`livox_ros_driver2` 与 `fast_lio` 构建成功，
   产出 `livox_ros_driver2_node`、`fastlio_mapping`；`ros2 pkg list` 与 `rclpy` 正常。
 - 升级时停用的第三方 apt 源以 `*.disabled-for-jammy-upgrade` 形式保留在 `/etc/apt/sources.list.d/`
   （ros-fish、librealsense、nemh、graphics-drivers），未删除、未启用。
@@ -301,7 +301,8 @@ systemctl set-default multi-user.target
   pyzbar 0.1.9、pyserial 3.5、loguru 0.5.3、simple-pid 2.0.0、attrs 21.4.0。
   `pyrealsense2` 改用可供 cp310 安装的 2.53.1.4623；`torch`/`torchvision`
   用 CPU 轮子（N97 无 NVIDIA GPU），版本为 2.3.1 / 0.18.1。`pip check` 无冲突。
-  定位与 FleetBus 的 61 项纯逻辑测试通过；真实相机、雷达和飞控操作未验证。
+  定位与 FleetBus 的 61 项纯逻辑测试通过；在系统升级检查当时，真实相机、雷达和飞控操作未验证。
+  2026-09-27 随后完成 MID360S 网络/驱动/点云实测，但 IMU 话题无消息、FAST-LIO 及两组生产外参仍未验证；详见 `details.md` 第 8 节与 `ros2_ws/README.md`。
 - `~/.bashrc` 和 `~/.zshrc` 均加载 Humble 与项目工作区；干净的新 bash/zsh 会话均可解析
   `fast_lio`、`livox_ros_driver2`。`/opt/ros/foxy` 目录仍存在，但不再由登录 shell 加载。
 - 升级后唯一失败服务 `casper-md5check` 属安装介质校验：机器从已安装的根分区启动，
