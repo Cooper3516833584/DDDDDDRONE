@@ -1,3 +1,15 @@
+diff --git a/include/IKFoM_toolkit/esekfom/esekfom.hpp b/include/IKFoM_toolkit/esekfom/esekfom.hpp
+index 7547584..118d93e 100755
+--- a/include/IKFoM_toolkit/esekfom/esekfom.hpp
++++ b/include/IKFoM_toolkit/esekfom/esekfom.hpp
+@@ -1619 +1619 @@ public:
+-	void update_iterated_dyn_share_modified(double R, double &solve_time) {
++	bool update_iterated_dyn_share_modified(double R, double &solve_time) {
+@@ -1927 +1927 @@ public:
+-				return;
++				return true;
+@@ -1930,0 +1931 @@ public:
++		return false;
 diff --git a/launch/mapping.launch.py b/launch/mapping.launch.py
 index 25dad7d..3cad4eb 100644
 --- a/launch/mapping.launch.py
@@ -6,16 +18,18 @@ index 25dad7d..3cad4eb 100644
 -        'config_file', default_value='mid360.yaml',
 +        'config_file', default_value='mid360s_drone.yaml',
 diff --git a/src/IMU_Processing.hpp b/src/IMU_Processing.hpp
-index f35378f..98f46ce 100644
+index f35378f..f9ec5c9 100644
 --- a/src/IMU_Processing.hpp
 +++ b/src/IMU_Processing.hpp
-@@ -50,0 +51,5 @@ class ImuProcess
+@@ -4,0 +5 @@
++#include <stdexcept>
+@@ -50,0 +52,5 @@ class ImuProcess
 +  bool imu_ready() const { return !imu_need_init_; }
 +  bool PropagateHighRateState(const sensor_msgs::msg::Imu::ConstSharedPtr &last_imu,
 +                              const sensor_msgs::msg::Imu::ConstSharedPtr &cur_imu,
 +                              state_ikfom &state_io, V3D &gyr_unbiased,
 +                              double max_dt = 0.1);
-@@ -155,0 +161,28 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
+@@ -155,0 +162,28 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
 +bool ImuProcess::PropagateHighRateState(
 +    const sensor_msgs::msg::Imu::ConstSharedPtr &last_imu,
 +    const sensor_msgs::msg::Imu::ConstSharedPtr &cur_imu,
@@ -44,8 +58,17 @@ index f35378f..98f46ce 100644
 +  return true;
 +}
 +
+@@ -293,3 +327,5 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
+-  double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
+-  dt = note * (pcl_end_time - imu_end_time);
+-  kf_state.predict(dt, Q, in);
++  dt = pcl_end_time - imu_end_time;
++  if (dt < -1e-6)
++    throw std::runtime_error("IMU integration passed LiDAR frame end");
++  if (dt > 0.0)
++    kf_state.predict(dt, Q, in);
 diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
-index d441261..139e781 100644
+index d441261..c163035 100644
 --- a/src/laserMapping.cpp
 +++ b/src/laserMapping.cpp
 @@ -35,0 +36,2 @@
@@ -55,19 +78,22 @@ index d441261..139e781 100644
 +#include <stdexcept>
 @@ -107,0 +111 @@ deque<double>                     time_buffer;
 +deque<double>                     end_time_buffer;
-@@ -135,0 +140,5 @@ state_ikfom state_point;
+@@ -109,0 +114 @@ deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
++sensor_msgs::msg::Imu::ConstSharedPtr last_synced_imu;
+@@ -135,0 +141,5 @@ state_ikfom state_point;
 +state_ikfom state_highrate;
 +mutex mtx_highrate_odom;
 +bool highrate_odom_ready = false;
 +sensor_msgs::msg::Imu::ConstSharedPtr last_highrate_imu;
 +rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomHighrate;
-@@ -292,0 +302,3 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
+@@ -292,0 +303,4 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 +        time_buffer.clear();
 +        end_time_buffer.clear();
 +        lidar_pushed = false;
-@@ -302,0 +315 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
++        last_synced_imu.reset();
+@@ -302,0 +317 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 +    end_time_buffer.push_back(-1.0); // Legacy PointCloud2 timing path.
-@@ -312,0 +326,19 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+@@ -312,0 +328,19 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 +    if (p_pre->mid360s_mode)
 +    {
 +        // The pinned driver sets both fields from the first point's device ns.
@@ -87,33 +113,47 @@ index d441261..139e781 100644
 +            }
 +        }
 +    }
-@@ -320,0 +353,3 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+@@ -320,0 +355,4 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 +        time_buffer.clear();
 +        end_time_buffer.clear();
 +        lidar_pushed = false;
-@@ -340,0 +376,4 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
++        last_synced_imu.reset();
+@@ -340,0 +379,4 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 +    uint32_t raw_end_offset_ns = 0;
 +    if (p_pre->mid360s_mode)
 +        for (const auto &point : msg->points)
 +            raw_end_offset_ns = std::max(raw_end_offset_ns, point.offset_time);
-@@ -341,0 +381,6 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+@@ -341,0 +384,6 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 +    if (p_pre->mid360s_mode && ptr->empty())
 +    {
 +        mtx_buffer.unlock();
 +        std::cerr << "MID360S frame has no valid points, dropping scan" << std::endl;
 +        return;
 +    }
-@@ -343,0 +389,2 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+@@ -343,0 +392,2 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 +    end_time_buffer.push_back(p_pre->mid360s_mode ?
 +                              last_timestamp_lidar + double(raw_end_offset_ns) * 1e-9 : -1.0);
-@@ -370 +417 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+@@ -368 +418 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+-    if (timestamp < last_timestamp_imu)
++    if (timestamp <= last_timestamp_imu)
+@@ -370 +420,6 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 -        std::cerr << "lidar loop back, clear buffer" << std::endl;
-+        std::cerr << "imu loop back, clear buffer" << std::endl;
-@@ -371,0 +419,3 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
++        if (timestamp == last_timestamp_imu)
++        {
++            mtx_buffer.unlock();
++            return; // Duplicate device sample is never integrated twice.
++        }
++        std::cerr << "imu loop back, clear sensor buffers" << std::endl;
+@@ -371,0 +427,8 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
++        lidar_buffer.clear();
++        time_buffer.clear();
++        end_time_buffer.clear();
++        lidar_pushed = false;
++        last_synced_imu.reset();
 +        lock_guard<mutex> lock(mtx_highrate_odom);
 +        highrate_odom_ready = false;
 +        last_highrate_imu.reset();
-@@ -378,0 +429,37 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
+@@ -378,0 +442,37 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 +
 +    state_ikfom snapshot;
 +    V3D gyr_unbiased = Zero3d;
@@ -151,32 +191,155 @@ index d441261..139e781 100644
 +        odom.twist.twist.angular.z = gyr_unbiased.z();
 +        pubOdomHighrate->publish(odom);
 +    }
-@@ -385 +472 @@ bool sync_packages(MeasureGroup &meas)
+@@ -385 +485 @@ bool sync_packages(MeasureGroup &meas)
 -    if (lidar_buffer.empty() || imu_buffer.empty()) {
 +    if (lidar_buffer.empty() || end_time_buffer.empty() || imu_buffer.empty()) {
-@@ -394 +481,5 @@ bool sync_packages(MeasureGroup &meas)
+@@ -394 +494,5 @@ bool sync_packages(MeasureGroup &meas)
 -        if (meas.lidar->points.size() <= 1) // time too little
 +        if (end_time_buffer.front() >= 0.0)
 +        {
 +            lidar_end_time = end_time_buffer.front();
 +        }
 +        else if (meas.lidar->points.size() <= 1) // time too little
-@@ -432,0 +524 @@ bool sync_packages(MeasureGroup &meas)
+@@ -415 +519 @@ bool sync_packages(MeasureGroup &meas)
+-    if (last_timestamp_imu < lidar_end_time)
++    if (last_timestamp_imu <= lidar_end_time)
+@@ -419,0 +524,67 @@ bool sync_packages(MeasureGroup &meas)
++    if (p_pre->mid360s_mode)
++    {
++        const auto stamp = [](const sensor_msgs::msg::Imu::ConstSharedPtr &sample) {
++            return get_time_sec(sample->header.stamp);
++        };
++        const auto discard_scan = []() {
++            lidar_buffer.pop_front();
++            time_buffer.pop_front();
++            end_time_buffer.pop_front();
++            lidar_pushed = false;
++        };
++        // Keep real samples on both sides of scan start; a gap is not coverage.
++        auto start_before = last_synced_imu;
++        double start_after_time = -1.0;
++        for (const auto &sample : imu_buffer)
++        {
++            const double t = stamp(sample);
++            if (t <= meas.lidar_beg_time) start_before = sample;
++            else { start_after_time = t; break; }
++        }
++        if (!start_before || start_after_time < 0.0 ||
++            start_after_time - stamp(start_before) > 0.1)
++        {
++            std::cerr << "MID360S scan has no continuous IMU start boundary" << std::endl;
++            discard_scan();
++            return false;
++        }
++
++        meas.imu.clear();
++        auto before = last_synced_imu;
++        while (!imu_buffer.empty() && stamp(imu_buffer.front()) <= lidar_end_time)
++        {
++            before = imu_buffer.front();
++            meas.imu.push_back(before);
++            imu_buffer.pop_front();
++        }
++        if (!before || imu_buffer.empty())
++        {
++            discard_scan();
++            return false;
++        }
++        const auto after = imu_buffer.front();
++        const double t0 = stamp(before), t1 = stamp(after);
++        if (t1 <= t0 || t1 - t0 > 0.1 || t0 > lidar_end_time)
++        {
++            std::cerr << "MID360S scan has no continuous IMU end boundary" << std::endl;
++            discard_scan();
++            return false;
++        }
++        if (t0 < lidar_end_time)
++        {
++            const double a = (lidar_end_time - t0) / (t1 - t0);
++            auto boundary = std::make_shared<sensor_msgs::msg::Imu>(*before);
++            boundary->header.stamp = get_ros_time(lidar_end_time);
++            boundary->angular_velocity.x += a * (after->angular_velocity.x - before->angular_velocity.x);
++            boundary->angular_velocity.y += a * (after->angular_velocity.y - before->angular_velocity.y);
++            boundary->angular_velocity.z += a * (after->angular_velocity.z - before->angular_velocity.z);
++            boundary->linear_acceleration.x += a * (after->linear_acceleration.x - before->linear_acceleration.x);
++            boundary->linear_acceleration.y += a * (after->linear_acceleration.y - before->linear_acceleration.y);
++            boundary->linear_acceleration.z += a * (after->linear_acceleration.z - before->linear_acceleration.z);
++            meas.imu.push_back(boundary);
++        }
++        last_synced_imu = before;
++        discard_scan();
++        return !meas.imu.empty();
++    }
++
+@@ -432,0 +604 @@ bool sync_packages(MeasureGroup &meas)
 +    end_time_buffer.pop_front();
-@@ -824,0 +917 @@ public:
+@@ -629,0 +802 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
++    odomAftMapped = nav_msgs::msg::Odometry();
+@@ -634,3 +807,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
+-    pubOdomAftMapped->publish(odomAftMapped);
+-    auto P = kf.get_P();
+-    for (int i = 0; i < 6; i ++)
++    const M3D R = state_point.rot.toRotationMatrix();
++    const V3D v_imu = R.transpose() * state_point.vel;
++    odomAftMapped.twist.twist.linear.x = v_imu.x();
++    odomAftMapped.twist.twist.linear.y = v_imu.y();
++    odomAftMapped.twist.twist.linear.z = v_imu.z();
++    if (!Measures.imu.empty())
+@@ -638,7 +814,4 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
+-        int k = i < 3 ? i + 3 : i - 3;
+-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
+-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
+-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
+-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
+-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
+-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
++        const auto &gyro = Measures.imu.back()->angular_velocity;
++        odomAftMapped.twist.twist.angular.x = gyro.x - state_point.bg.x();
++        odomAftMapped.twist.twist.angular.y = gyro.y - state_point.bg.y();
++        odomAftMapped.twist.twist.angular.z = gyro.z - state_point.bg.z();
+@@ -645,0 +819,19 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
++    const auto P = kf.get_P();
++    Eigen::Matrix<double, 6, 6> J_pose = Eigen::Matrix<double, 6, 6>::Identity();
++    J_pose.block<3, 3>(3, 3) = R; // Filter rotation error is in the IMU frame.
++    const Eigen::Matrix<double, 6, 6> P_pose = J_pose * P.block<6, 6>(0, 0) * J_pose.transpose();
++    Eigen::Matrix<double, 6, 6> J_twist = Eigen::Matrix<double, 6, 6>::Zero();
++    J_twist.block<3, 3>(0, 0) = R.transpose();
++    J_twist.block<3, 3>(3, 3) = -M3D::Identity();
++    Eigen::Matrix<double, 6, 6> P_twist = J_twist * P.block<6, 6>(12, 12) * J_twist.transpose();
++    for (int axis = 0; axis < 3; ++axis)
++        P_twist(3 + axis, 3 + axis) += gyr_cov;
++    for (int row = 0; row < 6; ++row)
++    {
++        for (int col = 0; col < 6; ++col)
++        {
++            odomAftMapped.pose.covariance[row * 6 + col] = P_pose(row, col);
++            odomAftMapped.twist.covariance[row * 6 + col] = P_twist(row, col);
++        }
++    }
++    pubOdomAftMapped->publish(odomAftMapped);
+@@ -824,0 +1017 @@ public:
 +        this->declare_parameter<string>("preprocess.livox_model", "");
-@@ -860,0 +954,5 @@ public:
+@@ -860,0 +1054,5 @@ public:
 +        string livox_model;
 +        this->get_parameter_or<string>("preprocess.livox_model", livox_model, "");
 +        if (livox_model != "" && livox_model != "mid360s")
 +            throw std::runtime_error("Unsupported Livox model");
 +        p_pre->mid360s_mode = livox_model == "mid360s";
-@@ -865,0 +964,2 @@ public:
+@@ -865,0 +1064,2 @@ public:
 +        if (p_pre->mid360s_mode && p_pre->feature_enabled)
 +            throw std::runtime_error("MID360S raw point path requires feature extraction disabled");
-@@ -934,0 +1035 @@ public:
+@@ -934,0 +1135 @@ public:
 +        pubOdomHighrate = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry_highrate", 20);
-@@ -1053,0 +1155,18 @@ private:
+@@ -1052 +1253,6 @@ private:
+-            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
++            const bool laser_corrected = kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
++            if (!laser_corrected)
++            {
++                RCLCPP_WARN(this->get_logger(), "No valid laser match, skip correction output");
++                return;
++            }
+@@ -1053,0 +1260,18 @@ private:
 +            if (extrinsic_est_en)
 +            {
 +                const M3D R = state_point.offset_R_L_I.toRotationMatrix();
@@ -195,7 +358,7 @@ index d441261..139e781 100644
 +                last_highrate_imu = anchor;
 +                highrate_odom_ready = true;
 +            }
-@@ -1074 +1193 @@ private:
+@@ -1074 +1298 @@ private:
 -            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
 +            if (scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
 diff --git a/src/preprocess.cpp b/src/preprocess.cpp
