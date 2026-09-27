@@ -318,6 +318,18 @@ def test_imu_gap_and_rewind_reset_stationarity(tmp_path):
     assert not p._stationary_ready and not p._imu_window
 
 
+def test_imu_gap_before_ready_cannot_join_old_window(tmp_path):
+    p = reviewed_provider(tmp_path)
+    for i in range(300):
+        p.on_imu(imu_ns(1_000_000_000 + i * 5_000_000))
+    assert not p._stationary_ready
+    p.on_imu(imu_ns(2_600_000_000))
+    assert len(p._imu_window) == 1
+    for i in range(1, 100):
+        p.on_imu(imu_ns(2_600_000_000 + i * 5_000_000))
+    assert not p._stationary_ready
+
+
 def test_ground_reset_clears_imu_and_message_history(tmp_path):
     p, _ = tracking_provider(tmp_path)
     assert p.reset_ground(disarmed=True) is False
@@ -330,20 +342,37 @@ def test_ground_reset_clears_imu_and_message_history(tmp_path):
     assert p._latest is None and p._health is None and p._base is None
     with pytest.raises(RuntimeError):
         p.calibrate_basepoint(disarmed=True)
-    stationary_window(p, 10_000_000_000)
-    assert p._stationary_ready
+    for i in range(380):
+        p.on_imu(imu_ns(10_000_000_000 + i * 5_000_000))
+    assert not p._stationary_ready
     now_ns = time.time_ns()
     for seq in range(1, 11):
         state_ns = now_ns - 30_000_000 + seq * 1_000_000
         p.on_health(health_ns(state_ns, seq, state_ns - 1_000_000))
     p.on_odometry(odom_ns(now_ns - 20_000_000))
+    with pytest.raises(RuntimeError, match="stationary"):
+        p.calibrate_basepoint(disarmed=True)
+    for i in range(380, 401):
+        p.on_imu(imu_ns(10_000_000_000 + i * 5_000_000))
+    assert p._stationary_ready
     p.calibrate_basepoint(disarmed=True)
     assert p.get_pose() is not None
 
 
 def test_mount_review_gate_and_invalid_configs(tmp_path):
+    def feed_ready_inputs(p):
+        stationary_window(p)
+        now_ns = time.time_ns()
+        for seq in range(1, 11):
+            state_ns = now_ns - 30_000_000 + seq * 1_000_000
+            p.on_health(health_ns(state_ns, seq, state_ns - 1_000_000))
+        p.on_odometry(odom_ns(now_ns - 20_000_000))
+        assert p._good_corrections == 10
+
     missing = LioPoseProvider(tmp_path / "missing.json")
     assert missing._reference_frame == "lidar" and not missing.mount_reviewed
+    feed_ready_inputs(missing)
+    assert not missing._healthy(time.monotonic())
     with pytest.raises(RuntimeError):
         missing.calibrate_basepoint(disarmed=True)
 
@@ -358,6 +387,8 @@ def test_mount_review_gate_and_invalid_configs(tmp_path):
         "translation_m": [1, 0, 0], "quaternion_xyzw": [0, 0, 0, 1]}}), encoding="utf-8")
     unreviewed = LioPoseProvider(mount)
     assert not unreviewed.mount_reviewed
+    feed_ready_inputs(unreviewed)
+    assert not unreviewed._healthy(time.monotonic())
     with pytest.raises(RuntimeError):
         unreviewed.calibrate_basepoint(disarmed=True)
 
