@@ -36,7 +36,7 @@ def missing_lio_topics(topics):
     return [topic for topic in REQUIRED_LIO_TOPICS if topic not in available]
 
 
-def require_production_localization():
+def require_production_localization(*, require_mount=False):
     config = os.path.join(PATH, "../ros2_ws/src/FAST_LIO_ROS2/config/mid360s_drone.yaml")
     if not os.path.isfile(config):
         raise RuntimeError("MID360S production LIO config is missing")
@@ -53,7 +53,9 @@ def require_production_localization():
                 raise ValueError(key)
         except (TypeError, ValueError, SyntaxError):
             raise RuntimeError(f"Valid MID360S {key} is required")
-    LioPoseProvider()  # Optional mount config, validated if present.
+    provider = LioPoseProvider()
+    if require_mount and not provider.mount_reviewed:
+        raise RuntimeError("Reviewed MID360S body mount is required for production navigation")
 
 
 def run_item(item, kill_exist=True):
@@ -158,7 +160,7 @@ def callback(cmd: str):
                 mis_tmux.kill_session()
             scr.set_widget_value("main_info.txt", f'"已结束任务"')
         elif cmd.startswith("mis_boot="):
-            require_production_localization()
+            require_production_localization(require_mount=True)
             mis_num = int(cmd.split("=")[1]) + 1
             if not os.path.exists(f"{PATH}/mission{mis_num}.py"):
                 scr.set_widget_value("main_info.txt", f'"任务{mis_num}不存在"')

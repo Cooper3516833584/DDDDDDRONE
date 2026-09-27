@@ -1,4 +1,4 @@
 {
-  "note": "Optional. LiDAR and aircraft axes are aligned (+X forward, +Y left, +Z up). Without a height value, localization tracks the LiDAR origin. Set the height only when the body origin below the LiDAR is known.",
+  "note": "Diagnostic fallback is the LiDAR origin. Production Navigation requires a measured height or full T_I_B plus reviewed: true. LiDAR and aircraft axes are aligned (+X forward, +Y left, +Z up).",
   "radar_height_above_body_origin_m": null
 }
