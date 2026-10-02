@@ -2,6 +2,7 @@ import os
 import ast
 import math
 import re
+import subprocess
 import time
 from typing import List, Literal
 
@@ -28,6 +29,9 @@ packages = [
 ]
 REQUIRED_LIO_TOPICS = (
     "/livox/lidar", "/livox/imu", "/Odometry", "/Odometry_highrate", "/LioHealth"
+)
+LOCALIZATION_SERVICES = (
+    "mid360s-driver.service", "mid360s-fastlio.service",
 )
 
 
@@ -58,15 +62,53 @@ def require_production_localization(*, require_mount=False):
         raise RuntimeError("Reviewed MID360S body mount is required for production navigation")
 
 
-def run_item(item, kill_exist=True):
-    if item[1][0] == "fast_lio":
+def systemd_service_active(service: str) -> bool:
+    try:
+        return subprocess.run(
+            ["systemctl", "is-active", "--quiet", service],
+            check=False, timeout=2,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("[US] Cannot query localization service: {}", service)
+        return False
+
+
+def selected_localization_services(idx):
+    if idx == 0:
+        return LOCALIZATION_SERVICES
+    if idx not in (1, 2):
+        raise ValueError("Invalid localization service index")
+    return (LOCALIZATION_SERVICES[idx - 1],)
+
+
+def report_localization_status(idx=0):
+    services = selected_localization_services(idx)
+    if LOCALIZATION_SERVICES[1] in services:
         require_production_localization()
-    for dev in item[2]:
-        rm.chmod(dev)
-    if item[0] == 0:
-        rm.launch_package(*item[1], kill_exist=kill_exist)
-    else:
-        rm.run_package(*item[1], kill_exist=kill_exist)
+    inactive = [service for service in services if not systemd_service_active(service)]
+    if inactive:
+        logger.warning("[US] Localization services inactive: {}", ", ".join(inactive))
+        scr.set_widget_value("main_info.txt", '"定位服务未启动"')
+        return
+    topics = rm.get_running_topics()
+    required = ("/livox/lidar", "/livox/imu") if idx == 1 else REQUIRED_LIO_TOPICS
+    missing = [topic for topic in required if topic not in topics]
+    scr.set_widget_value("main_info.txt", '"定位话题未就绪"' if missing else '"定位服务运行中"')
+    # Topic presence is diagnostic only; Navigation checks fresh paired data.
+    logger.info("[US] systemd localization active; missing topics: {}", missing)
+
+
+def localization_service_log(service, lines):
+    try:
+        result = subprocess.run(
+            ["journalctl", "-b", "-u", service, "-n", str(lines), "--no-pager", "-o", "cat"],
+            check=False, capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0:
+            return result.stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ["> Localization journal unavailable"]
 
 
 def set_ellipse(name: str, state: Literal[0, 1, 2]):
@@ -76,15 +118,6 @@ def set_ellipse(name: str, state: Literal[0, 1, 2]):
         "0xff33DB33",  # 2: ok
     ]
     scr.set_widget_value(f"ellipse_{name}.fColor", CMP[state])
-
-
-def check_pack(pack, wname):
-    if not rm.is_running(pack):
-        set_ellipse(wname, 0)
-    elif not rm.is_live(pack):
-        set_ellipse(wname, 1)
-    else:
-        set_ellipse(wname, 2)
 
 
 sending_log = False
@@ -98,28 +131,16 @@ def callback(cmd: str):
             return
         if cmd.startswith("ros_boot="):
             idx = int(cmd.split("=")[1])
-            if idx == 0:
-                for item in packages:
-                    run_item(item)
-            else:
-                run_item(packages[idx - 1])
+            report_localization_status(idx)
         elif cmd.startswith("ros_kill="):
-            idx = int(cmd.split("=")[1])
-            if idx == 0:
-                for item in packages:
-                    rm.kill_package(item[1][0])
-            else:
-                rm.kill_package(packages[idx - 1][1][0])
+            logger.warning("[US] Localization stop refused; lifecycle is systemd-managed")
+            scr.set_widget_value("main_info.txt", '"定位服务由systemd管理"')
         elif cmd.startswith("ros_log="):
             idx = int(cmd.split("=")[1])
             lines: List[str] = []
-            if idx == 0:
-                for item in packages:
-                    lines.append(f"\n> {item[1][0]}:\n\n")
-                    log = rm.get_log(item[1][0], 2)
-                    lines.extend([line.replace("\n", "").replace("\r", "") for line in log])
-            else:
-                lines.extend(rm.get_log(packages[idx - 1][1][0], 10))
+            for service in selected_localization_services(idx):
+                lines.append(f"\n> {service}:\n\n")
+                lines.extend(localization_service_log(service, 2 if idx == 0 else 10))
             if len(lines) == 0:
                 lines.append("> No log")
             sending_log = True
@@ -134,10 +155,12 @@ def callback(cmd: str):
             sending_log = False
         elif cmd.startswith("ros_state"):
             topics = rm.get_running_topics()
-            set_ellipse("scan", 2 if "/livox/lidar" in topics else 0)
-            set_ellipse("camera", 2 if "/livox/imu" in topics else 0)
-            set_ellipse("map", 2 if "/Odometry" in topics else 0)
-            set_ellipse("radar", 2 if "/Odometry_highrate" in topics else 0)
+            driver_active = systemd_service_active(LOCALIZATION_SERVICES[0])
+            lio_active = systemd_service_active(LOCALIZATION_SERVICES[1])
+            set_ellipse("scan", 2 if driver_active and "/livox/lidar" in topics else 0)
+            set_ellipse("camera", 2 if driver_active and "/livox/imu" in topics else 0)
+            set_ellipse("map", 2 if lio_active and "/Odometry" in topics else 0)
+            set_ellipse("radar", 2 if lio_active and "/Odometry_highrate" in topics else 0)
             set_ellipse("t265", 0)
             set_ellipse("cart", 0)
             set_ellipse("tf2", 0)
@@ -161,6 +184,10 @@ def callback(cmd: str):
             scr.set_widget_value("main_info.txt", f'"已结束任务"')
         elif cmd.startswith("mis_boot="):
             require_production_localization(require_mount=True)
+            if not all(systemd_service_active(service) for service in LOCALIZATION_SERVICES):
+                logger.error("[US] Mission refused; localization services inactive")
+                scr.set_widget_value("main_info.txt", '"定位服务未启动"')
+                return
             mis_num = int(cmd.split("=")[1]) + 1
             if not os.path.exists(f"{PATH}/mission{mis_num}.py"):
                 scr.set_widget_value("main_info.txt", f'"任务{mis_num}不存在"')
@@ -190,9 +217,6 @@ def callback(cmd: str):
 
 
 scr.register_report_callback(lambda x: threading.Thread(target=callback, args=(x,)).start())
-
-# for item in packages:
-#     run_item(item, False)
 
 fc.start_listen_serial(print_state=True, block_until_connected=True)
 fc.serve_forever(indicator=True)
