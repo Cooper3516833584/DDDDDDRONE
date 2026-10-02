@@ -1,0 +1,27 @@
+[Unit]
+Description=MID360S Livox ROS2 Driver
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=fc
+Group=fc
+WorkingDirectory=@REPO_DIR@/ros2_ws
+Environment=HOME=/home/fc
+ExecStartPre=/usr/bin/test -r @REPO_DIR@/ros2_ws/src/livox_ros_driver2/config/MID360s_config.json
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source @REPO_DIR@/ros2_ws/install/setup.bash && export LD_LIBRARY_PATH=/usr/local/lib:$${LD_LIBRARY_PATH:-} && exec ros2 run livox_ros_driver2 livox_ros_driver2_node --ros-args -p xfer_format:=1 -p multi_topic:=0 -p data_src:=0 -p publish_freq:=10.0 -p output_data_type:=0 -p frame_id:=livox_frame -p user_config_path:=@REPO_DIR@/ros2_ws/src/livox_ros_driver2/config/MID360s_config.json -p cmdline_input_bd_code:=livox0000000001'
+KillSignal=SIGINT
+KillMode=control-group
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=multi-user.target

@@ -1,2 +1,4 @@
 ros2_ws/setup_localization_sources.sh text eol=lf
 ros2_ws/patches/*.patch text eol=lf
+deploy/install_mid360s_localization_services.sh text eol=lf
+deploy/mid360s-*.service.in text eol=lf

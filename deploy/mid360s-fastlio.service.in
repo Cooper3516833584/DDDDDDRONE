@@ -1,0 +1,27 @@
+[Unit]
+Description=MID360S FAST-LIO Localization
+Requires=mid360s-driver.service
+After=mid360s-driver.service
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=fc
+Group=fc
+WorkingDirectory=@REPO_DIR@/ros2_ws
+Environment=HOME=/home/fc
+ExecStartPre=/usr/bin/test -r @REPO_DIR@/ros2_ws/src/FAST_LIO_ROS2/config/mid360s_drone.yaml
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source @REPO_DIR@/ros2_ws/install/setup.bash && exec ros2 run fast_lio fastlio_mapping --ros-args --params-file @REPO_DIR@/ros2_ws/src/FAST_LIO_ROS2/config/mid360s_drone.yaml -p use_sim_time:=false'
+KillSignal=SIGINT
+KillMode=control-group
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=multi-user.target

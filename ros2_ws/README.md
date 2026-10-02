@@ -120,7 +120,7 @@ authorize production Navigation. Production Navigation requires a measured,
 reviewed body mount JSON with `"reviewed": true`, using either explicit `T_I_B`
 or `radar_height_above_body_origin_m`. For the height form, the aligned axes
 give `t_I_B=t_I_L+[0,0,-height]`. Conflicting or invalid mount entries fail
-closed. `ros_boot` can still start the driver and FAST-LIO for diagnostics;
+closed. Systemd can start the driver and FAST-LIO without a mount for diagnostics;
 `mis_boot` requires the reviewed mount. Basepoint calibration establishes a
 local frame at that body reference point; it does not reset FAST-LIO or apply
 a field transform. The height or full `T_I_B` must be measured before mission
@@ -143,15 +143,125 @@ Before flight, validate actual pose direction, stationary drift, timestamps,
 topic rates, dynamic motion, and failure handling on the assembled aircraft.
 The current zero `common.time_offset_lidar_to_imu` also needs validation.
 
-Only after all bench gates pass, the runtime launch pair is:
+For manually owned bench sessions only, with both systemd units stopped and
+no other localization owner, the launch pair is:
 
 ```bash
 ros2 launch livox_ros_driver2 msg_MID360s_launch.py
 ros2 launch fast_lio mapping.launch.py config_file:=mid360s_drone.yaml rviz:=false
 ```
 
-`server_ros.py` uses the same launch pair through the existing `RosManager`.
-It does not start RealSense, Cartographer, or LD06 localization. The aircraft
+`server_ros.py` checks systemd services and topics without launching another chain.
+The aircraft
 Navigation subscribes to `/Odometry_highrate` through the existing rclpy
 executor. **Do not use a propeller-on closed loop until the assembled aircraft
 passes the remaining bench and dynamic checks.**
+
+## Production boot
+
+Production localization has one owner: `mid360s-driver.service` and
+`mid360s-fastlio.service`. Both run as `fc`, with `HOME=/home/fc`, the ROS
+workspace as their working directory, and explicit Humble/overlay environments.
+They run the nodes directly via `ros2 run`, without tmux, launch or RViz.
+`ros_boot=0/1/2` checks both/driver/FAST-LIO respectively, never uses sudo and
+never launches a fallback. `ros_kill` is refused; `ros_log` reads the journal.
+Service/topic presence is diagnostic only. Navigation still checks reviewed
+mount, fresh exact-stamp data, health and disarmed ground calibration.
+
+### Update, rebuild and install
+
+Before deployment, remove propellers, disarm and stop missions. Inspect system
+and user services, desktop autostart, cron, `/etc/rc.local`, tmux and node process
+owners. Safely stop any previous localization owner; keep T265 disabled.
+
+```bash
+cd /home/fc/dddddrone
+git status --short                    # stop if dirty or diverged
+git pull --ff-only
+cd ros2_ws
+source /opt/ros/humble/setup.bash
+bash setup_localization_sources.sh
+bash setup_localization_sources.sh    # idempotency check
+rosdep install --from-paths src --ignore-src -y
+colcon build --symlink-install --cmake-args -DROS_EDITION=ROS2 -DDISTRO_ROS=humble
+source install/setup.bash
+cd ..
+sudo bash deploy/install_mid360s_localization_services.sh
+```
+
+Pull alone does not update the ignored source or binaries: apply the overlay
+and rebuild. The installer checks configs/overlays, refuses active units or
+unmanaged localization nodes, verifies rendered units, backs up previous units
+and enable states under `/var/backups/mid360s-localization-*`, installs and
+enables. It does not start or restart nodes. Ambiguous repository paths
+(spaces or shell metacharacters) are rejected.
+
+```bash
+sudo systemctl start mid360s-driver.service
+sudo systemctl start mid360s-fastlio.service
+systemctl status mid360s-driver.service mid360s-fastlio.service --no-pager
+journalctl -b -u mid360s-driver.service --no-pager
+journalctl -b -u mid360s-fastlio.service --no-pager
+sudo systemctl stop mid360s-fastlio.service
+sudo systemctl stop mid360s-driver.service
+sudo systemctl disable mid360s-fastlio.service mid360s-driver.service
+```
+
+Stopping the driver also stops FAST-LIO through `Requires`; start both after
+a driver stop/restart. `Restart=on-failure`, `RestartSec=2`, at most 5 starts
+in 30 s, and journal rate limits prevent rapid failure loops. After hitting a
+start limit, fix the sensor/network, then `sudo systemctl reset-failed
+mid360s-driver.service mid360s-fastlio.service` and start both.
+`network-online.target` does not guarantee radar connectivity: `enp3s0` needs
+carrier and `192.168.1.50/24`; MID360S must be reachable at `192.168.1.194`.
+
+Rollback: stop and disable both units. If previous units were replaced,
+restore them from the printed backup, run `sudo systemctl daemon-reload` and
+restore the recorded enable states. Do not launch a second chain via tmux.
+
+### Acceptance of the latest deployed HEAD
+
+Report three levels separately: static checks, ROS build, aircraft bench checks.
+Passing static checks and compilation does not establish bench acceptance.
+
+1. With propellers removed and no mission, perform one controlled `sudo reboot`.
+   After reconnecting, check both `systemctl is-active`, `tmux ls` and
+   `ros2 node list`. No `livox_ros_driver2_0` or `fast_lio_0` duplicate owner.
+   Source Humble and the overlay in the checking shell.
+2. Check `ros2 topic info /Odometry_highrate -v` and
+   `ros2 topic info /LioHealth -v`: exactly one expected FAST-LIO publisher each.
+   Use `timeout 10 ros2 topic hz TOPIC` for all five topics: lidar ~10 Hz,
+   IMU ~200 Hz, lowrate odom at successful correction rate, highrate odom and
+   health ~200 Hz.
+3. Run `python3 python_sdk/testcode/lio_latency_probe.py --seconds 60`.
+   This passive probe sends no FC commands and does not start Navigation.
+   It compares source ROS epoch to callback system wall clock: real time,
+   synchronized clocks and `use_sim_time=false` are required. Verify exact
+   pairs, monotonic timestamps, rates, latency and unmatched counts. Shutdown
+   boundary pending messages may cause a small mismatch; persistent mismatch
+   needs investigation. Quantiles use up to the latest 120000 samples/topic;
+   total counts, late counts, min/max and rewind counts cover the full run.
+4. Without mount JSON, diagnostic services can run but `mis_boot`, calibration
+   and Navigation enable must refuse. Never invent a reviewed mount.
+5. Use controlled rejected-update replay/scene. An actual rejected iteration
+   restores prediction, marks DEGRADED, leaves valid seq/anchor unchanged,
+   skips lowrate odom/TF and map insertion, and continues housekeeping.
+   A successful update failing the stricter quality gate can still publish
+   lowrate odom and insert points; DEGRADED alone does not prove rejection.
+6. With a measured reviewed mount and disarmed FC, verify 2 s stationarity,
+   >=10 distinct valid corrections, fresh paired TRACKING data and calibration.
+   Driver loss must invalidate pose and latch LOST; FAST-LIO restart changes
+   epoch and requires ground reset, stationarity, valid corrections and a new
+   basepoint. No flight actions are needed for these checks.
+7. For >=5 min, run actual competition visual models, both cameras, server and
+   mission-equivalent background threads **without mission flight actions**,
+   alongside the probe with `--seconds 300`. Record P99, max, >50 ms and >100 ms
+   counts. `STALE_SECONDS=0.05` stays fixed in this release. If overruns occur,
+   investigate CPU contention, callback/executor delays, vision load, frequency
+   and thermal throttling before changing it. P99 <40 ms with essentially no
+   >50 ms events supports retaining the threshold.
+
+`laser_corrected` gates lowrate odom/TF and map insertion. `correction_valid`
+separately gates new valid seq/anchor and TRACKING authorization. Rejected
+frames do not return early. Dynamic precision, sensor-loss control and parallel
+vision latency cannot be inferred from these static checks.

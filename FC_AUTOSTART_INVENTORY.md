@@ -18,10 +18,12 @@
 
 ## 2. 结论摘要
 
-2026-09-27 起全机**没有任何项目自启入口**：唯一的 T265 bring-up 已停用。定位链（MID360S + FAST-LIO）不在自启动清单里，由 `python_sdk/server_ros.py` 在需要时按需启动。
+2026-09-27 盘点时，T265 bring-up 已停用，没有项目自启入口。本轮新增 MID360S + FAST-LIO systemd 资源；执行安装器后才成为机上已启用入口，运行态和重启效果需单独核验。生产定位链由 systemd 管理，`server_ros.py` 只查询服务/话题和日志，不再启动第二套节点。
 
 | 入口 | 类型 | 状态 | 作用 |
 |---|---|---|---|
+| `mid360s-driver.service` | 系统级 systemd，`User=fc` | 本轮新增；安装后 enable，运行态待核验 | MID360S 驱动 |
+| `mid360s-fastlio.service` | 系统级 systemd，`User=fc` | 本轮新增；安装后 enable，运行态待核验 | FAST-LIO，Requires/After driver |
 | `t265-boot-init.service` | 系统级 systemd（`Type=oneshot`, `User=root`） | `disabled` + `inactive` | 启动/插入时把 T265 从 VPU 带起来并验证位姿，成功即退出；新定位链已不使用 T265 |
 | `t265-boot-init.timer` | 系统级 timer | `disabled` + `inactive` | 每 30 秒轻量健康检查（原为兜底） |
 | `/etc/udev/rules.d/99-t265-boot-init.rules.disabled` | udev | 已停用（改名保留） | 原为插入边沿触发上面的 service |
@@ -40,6 +42,20 @@ flowchart TD
 其余各层都是空的：`~/.config/autostart` 0 项；没有用户级 systemd 单元；`fc`/`root` 无 crontab；`atq` 为空；`/etc/rc.local` 0 字节且非可执行；`/etc/xdg/autostart` 与 `/etc/profile.d` 只有发行版内容；没有项目相关的 timer 之外的东西。
 
 2026-09-26 之前的主角 `d-task-drone-dispatcher.service` 已整体移除，见第 4 节。
+
+### MID360S 入口配置与回退
+
+- 模板：`deploy/mid360s-driver.service.in`、`deploy/mid360s-fastlio.service.in`；安装器 `sudo bash deploy/install_mid360s_localization_services.sh` 预检查、备份、渲染、verify 后安装并 enable，不自动 start。
+- unit 路径：`/etc/systemd/system/mid360s-driver.service`、`/etc/systemd/system/mid360s-fastlio.service`。
+- 两服务：`User=fc`、`Group=fc`、`WantedBy=multi-user.target`、`HOME=/home/fc`；工作区 `/home/fc/dddddrone/ros2_ws`。
+- 环境：显式 source `/opt/ros/humble/setup.bash` 和工作区 `install/setup.bash`；驱动追加 `/usr/local/lib`。
+- 监督：直接 `ros2 run` 节点，`KillSignal=SIGINT`、`KillMode=control-group`；不使用 tmux/launch。
+- 重启：`Restart=on-failure`、`RestartSec=2`；两服务均最多 30 秒内 5 次启动，日志每 30 秒最多 100 条。
+- 网络前提：`enp3s0` 有载波、静态 IP `192.168.1.50/24`，雷达地址 `192.168.1.194`。
+- 日志：`journalctl -b -u mid360s-driver.service` / `-u mid360s-fastlio.service`，沿用第 7 节 journal 存储上限。
+- 备份：安装器打印 `/var/backups/mid360s-localization-*`，保存旧 unit（若存在）及 enable 状态。
+- 回退：先 `sudo systemctl stop mid360s-fastlio.service mid360s-driver.service`，再 `sudo systemctl disable mid360s-fastlio.service mid360s-driver.service`；如替换过旧 unit，按备份恢复并 `sudo systemctl daemon-reload`，恢复原 enable 状态。
+- 真实重启、唯一 publisher、频率、配对、失效及双视觉延迟验收见 `ros2_ws/README.md`；完成前不能标记机载无桨验收完成。T265 保持 disabled。
 
 ## 3. 已停用的入口：`t265-boot-init`（2026-09-27 停用）
 
