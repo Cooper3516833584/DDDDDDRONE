@@ -42,7 +42,9 @@ def provider(tmp_path, translation=(0, 0, 0)):
         "translation_m": translation,
         "quaternion_xyzw": [0, 0, 0, 1],
     }}), encoding="utf-8")
-    return LioPoseProvider(mount, require_health=False)
+    p = LioPoseProvider(mount, require_health=False)
+    stationary_window(p)
+    return p
 
 
 def test_mount_and_startup_local_coordinates(tmp_path):
@@ -76,6 +78,7 @@ def test_optional_mount_and_wrong_frame_fail_closed(tmp_path):
     assert default._mount == (LioPoseProvider.LIDAR_ORIGIN_IN_IMU_M,
                               LioPoseProvider.ALIGNED_QUATERNION)
     default.on_odometry(odom(1))
+    stationary_window(default)
     default.calibrate_basepoint(disarmed=True)
     assert default.get_snapshot()["reference_frame"] == "lidar"
     p = provider(tmp_path)
@@ -304,6 +307,32 @@ def test_stationarity_revoked_by_motion_and_requires_new_two_seconds(tmp_path):
     for i in range(380, 401):
         p.on_imu(imu_ns(3_010_000_000 + i * 5_000_000))
     assert p._stationary_ready
+
+
+def test_motion_after_calibration_does_not_invalidate_tracking(tmp_path):
+    p, now_ns = tracking_provider(tmp_path)
+    base, basis = p._base, p._world_basis
+    p.on_imu(imu_ns(3_005_000_000, angular=0.5))
+    assert not p._stationary_ready
+    state_ns = now_ns - 19_000_000
+    p.on_health(health_ns(state_ns, 11, state_ns - 1_000_000))
+    p.on_odometry(odom_ns(state_ns, (0.1, 0, 0)))
+    assert p.get_pose() == pytest.approx((10, 0, 0, True))
+    assert not p._lost_latched
+    assert p._base == base and p._world_basis == basis
+    with pytest.raises(RuntimeError, match="stationary"):
+        p.calibrate_basepoint(disarmed=True)
+    for i in range(380):
+        p.on_imu(imu_ns(3_010_000_000 + i * 5_000_000))
+    with pytest.raises(RuntimeError, match="stationary"):
+        p.calibrate_basepoint(disarmed=True)
+    assert p.get_pose() is not None
+    for i in range(380, 401):
+        p.on_imu(imu_ns(3_010_000_000 + i * 5_000_000))
+    with pytest.raises(RuntimeError, match="disarmed"):
+        p.calibrate_basepoint(disarmed=False)
+    p.calibrate_basepoint(disarmed=True)
+    assert p.get_pose() == pytest.approx((0, 0, 0, True))
 
 
 def test_imu_gap_and_rewind_reset_stationarity(tmp_path):

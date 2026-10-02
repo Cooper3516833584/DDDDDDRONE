@@ -260,7 +260,7 @@ class LioPoseProvider:
                 now - self._health_received_at > self.STALE_SECONDS or
                 now - self._valid_correction_received_at > self.CORRECTION_STALE_SECONDS or
                 (self._state_ns - self._anchor_ns) * 1e-9 > self.CORRECTION_STALE_SECONDS or
-                self._good_corrections < 10 or not self._stationary_ready):
+                self._good_corrections < 10):
             if now - self._valid_correction_received_at > self.CORRECTION_STALE_SECONDS or (
                     self._state_ns - self._anchor_ns) * 1e-9 > self.CORRECTION_STALE_SECONDS:
                 self._lost_latched = True
@@ -358,8 +358,12 @@ class LioPoseProvider:
 
     def calibrate_basepoint(self, *, disarmed=False):
         with self._lock:
-            if not disarmed or not self._healthy(time.monotonic()):
-                raise RuntimeError("Disarmed, stationary and healthy LIO are required")
+            if not disarmed:
+                raise RuntimeError("Ground calibration requires disarmed state")
+            if not self._stationary_ready:
+                raise RuntimeError("Ground calibration requires 2 s stationary IMU")
+            if not self._healthy(time.monotonic()):
+                raise RuntimeError("Healthy LIO tracking is required")
             self._base = self._reference_pose()
             if self._require_health:
                 try:
