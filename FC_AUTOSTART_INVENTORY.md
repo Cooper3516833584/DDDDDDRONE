@@ -18,12 +18,12 @@
 
 ## 2. 结论摘要
 
-2026-09-27 盘点时，T265 bring-up 已停用，没有项目自启入口。本轮新增 MID360S + FAST-LIO systemd 资源；执行安装器后才成为机上已启用入口，运行态和重启效果需单独核验。生产定位链由 systemd 管理，`server_ros.py` 只查询服务/话题和日志，不再启动第二套节点。
+2026-09-27 盘点时，T265 bring-up 已停用，没有项目自启入口。2026-10-02 已通过仓库安装器安装并启用 MID360S + FAST-LIO systemd 单元；安装时未启动节点，真实重启效果仍待验收。生产定位链由 systemd 管理，`server_ros.py` 只查询服务/话题和日志，不再启动第二套节点。
 
 | 入口 | 类型 | 状态 | 作用 |
 |---|---|---|---|
-| `mid360s-driver.service` | 系统级 systemd，`User=fc` | 本轮新增；安装后 enable，运行态待核验 | MID360S 驱动 |
-| `mid360s-fastlio.service` | 系统级 systemd，`User=fc` | 本轮新增；安装后 enable，运行态待核验 | FAST-LIO，Requires/After driver |
+| `mid360s-driver.service` | 系统级 systemd，`User=fc` | 已安装并 enabled；本次未启动 | MID360S 驱动 |
+| `mid360s-fastlio.service` | 系统级 systemd，`User=fc` | 已安装并 enabled；本次未启动 | FAST-LIO，Requires/After driver |
 | `t265-boot-init.service` | 系统级 systemd（`Type=oneshot`, `User=root`） | `disabled` + `inactive` | 启动/插入时把 T265 从 VPU 带起来并验证位姿，成功即退出；新定位链已不使用 T265 |
 | `t265-boot-init.timer` | 系统级 timer | `disabled` + `inactive` | 每 30 秒轻量健康检查（原为兜底） |
 | `/etc/udev/rules.d/99-t265-boot-init.rules.disabled` | udev | 已停用（改名保留） | 原为插入边沿触发上面的 service |
@@ -45,6 +45,7 @@ flowchart TD
 
 ### MID360S 入口配置与回退
 
+- 2026-10-02 安装记录：`fc-ubuntu` 部署代码 `f0e0a89`，旧定位进程和 tmux 会话均不存在；安装器验证成功（宿主 snapd 单元有无关 `RestartMode` 提示），备份目录为 `/var/backups/mid360s-localization-q3KTgt28`。未重启或启动节点；雷达网口仍无载波，实机验收延期。T265 两入口继续 disabled。
 - 模板：`deploy/mid360s-driver.service.in`、`deploy/mid360s-fastlio.service.in`；安装器 `sudo bash deploy/install_mid360s_localization_services.sh` 预检查、备份、渲染、verify 后安装并 enable，不自动 start。
 - unit 路径：`/etc/systemd/system/mid360s-driver.service`、`/etc/systemd/system/mid360s-fastlio.service`。
 - 两服务：`User=fc`、`Group=fc`、`WantedBy=multi-user.target`、`HOME=/home/fc`；工作区 `/home/fc/dddddrone/ros2_ws`。
