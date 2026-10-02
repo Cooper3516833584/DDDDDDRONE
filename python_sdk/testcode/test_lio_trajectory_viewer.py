@@ -170,6 +170,7 @@ def test_session_start_failure_still_closes_owned_nodes(monkeypatch, tmp_path):
 
 
 def test_actual_3d_draw_handles_nan_gaps_empty_reset_and_clipping():
+    pytest.importorskip("matplotlib")
     import numpy as np
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
