@@ -116,3 +116,13 @@ def test_wsl_translation_bypasses_shell_backslash_processing(monkeypatch):
     assert viewer.LocalWslConnection.translate_path(source) == "/mnt/c/viewer.py"
     assert calls[0][:4] == ["wsl.exe", "--exec", "wslpath", "-a"]
     assert "\\" not in calls[0][-1]
+
+
+def test_lost_reason_is_visible_without_creating_an_origin(tmp_path, monkeypatch):
+    monkeypatch.setattr(viewer.time, "time", lambda: 100.0)
+    model = viewer.TrajectoryModel(tmp_path / "missing.json")
+    pair = messages(0, state=3)
+    pair[1].reason = "laser_correction_stale"
+    deliver(model, pair)
+    assert model.snapshot()[1] is None
+    assert model.snapshot()[2] == "LOST - laser_correction_stale"

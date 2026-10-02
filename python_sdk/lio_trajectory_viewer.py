@@ -123,6 +123,9 @@ class TrajectoryModel:
             return
         if int(health.state) != 1:
             self.status = {0: "INIT", 2: "DEGRADED", 3: "LOST"}.get(int(health.state), "UNKNOWN HEALTH")
+            reason = getattr(health, "reason", "")
+            if reason:
+                self.status += " - " + reason
             self.break_pending = True
             return
         if odom.header.frame_id != "camera_init" or odom.child_frame_id != "imu":
@@ -348,7 +351,9 @@ def main():
     import matplotlib
     if args.save_preview:
         matplotlib.use("Agg")
-    elif matplotlib.get_backend().lower() == "agg":
+    else:
+        # VSCode/interactive settings may select an inline backend. This entry
+        # point always needs a standalone window, including direct file runs.
         matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
@@ -433,7 +438,7 @@ def main():
         else:
             animation = FuncAnimation(fig, redraw, interval=50, cache_frame_data=False)
             fig.canvas.mpl_connect("close_event", lambda event: stop.set())
-            plt.show()
+            plt.show(block=True)
     finally:
         stop.set()
         if connection is not None:

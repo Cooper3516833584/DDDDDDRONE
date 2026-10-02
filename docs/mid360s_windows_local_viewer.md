@@ -43,6 +43,15 @@ ros2 run fast_lio fastlio_mapping --ros-args \
 
 Windows VSCode 选择 `livox` 解释器，直接运行 `python_sdk/lio_trajectory_viewer.py`。本地 `.vscode/settings.json` 默认解释器也已配置，此文件不提交。若 VSCode 已记住其他解释器，使用“Python: Select Interpreter”选择上述路径。
 
+Windows PowerShell 和 PowerShell 7 的用户 `profile.ps1` 已加入 Conda 初始化。配置后关闭旧终端、打开新终端，再运行：
+
+```powershell
+conda activate livox
+python .\python_sdk\lio_trajectory_viewer.py
+```
+
+旧终端可先执行 `(& 'C:\Users\TZDEZACR\miniconda3\Scripts\conda.exe' 'shell.powershell' 'hook') | Out-String | Invoke-Expression`，然后激活。查看器固定使用 Tk 独立窗口，并等待窗口关闭；不依赖 VSCode 的 inline/interactive 后端设置。
+
 窗口显示相对首次新鲜 TRACKING 样本的 XYZ 米坐标：启动时机头向前为 X 正，左为 Y 正，重力反方向为 Z 正。按钮只重置显示原点。关闭窗口会停止它创建的 WSL 订阅；驱动和 FAST-LIO 继续运行。查看器不会自动启动驱动或任务。
 
 未加载复核过的安装外参时，状态显示 `LIDAR ORIGIN`，坐标对应雷达原点。可用 `--mount 路径` 指定现有安装文件；不可把显示原点用于 Navigation 标定。源数据仍按原来的 50 ms 新鲜度门控，Windows 的 250 ms 管道超时只用于窗口断流显示。
@@ -55,6 +64,12 @@ Windows VSCode 选择 `livox` 解释器，直接运行 `python_sdk/lio_trajector
 - Windows 查看器实际收到 TRACKING 三维坐标；显示归零后恢复更新；订阅线程退出、WSL 子进程正常退出（返回码 0）。实时窗口已打开并响应。
 
 此结果只验证本机接收、静态定位和显示。动态尺量精度、长时间视觉并行负载、断流控制及飞行未验证。未修改 `python_sdk/FlightController/**`。
+
+### LOST 且 XYZ 显示空值
+
+若窗口一直显示 `LOST - laser_correction_stale`，表示 FAST-LIO 已收到 IMU，但有效点云修正过期；查看器没有有效 TRACKING 原点时保持空值。2026-10-02 实测曾出现持续 `No Effective Points!`，停止旧 FAST-LIO 并重新建图后恢复 TRACKING；复测健康消息为 `geometry_pass`，有效匹配点 719。具体诱因尚未确认。
+
+保持雷达静止、周围有可扫描的场景，在 FAST-LIO 所属终端 Ctrl+C 停止后重新执行上述终端二命令，再重开查看器建立新的显示原点。确认旧节点已退出，避免重复实例。“Reset display origin”仅重置显示，不能修复 FAST-LIO 的地图匹配。健康门控仍然保留。
 
 ## 撤回网络设置
 
