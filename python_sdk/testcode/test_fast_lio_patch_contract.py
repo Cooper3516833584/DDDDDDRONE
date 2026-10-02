@@ -80,3 +80,17 @@ def test_rejected_frames_cannot_increment_map_and_clear_frame_statistics():
     assert "add_point_size = 0;" in rejected
     assert "kdtree_incremental_time = 0.0;" in rejected
     assert "return;" not in rejected
+
+
+def test_rejected_laser_frame_cannot_publish_lowrate_odometry():
+    text = mapping_additions()
+    accepted, end = block_after(text, "if (laser_corrected)")
+    call = "publish_odometry(pubOdomAftMapped_, tf_broadcaster_);"
+    assert call in accepted
+    assert "map_incremental();" in accepted
+    assert text.count(call) == 1
+    assert "correction_valid" not in accepted
+    assert accepted.index(call) < accepted.index("map_incremental();")
+    rejected, _ = block_after(text[end:], "else")
+    for forbidden in ("publish_odometry", "map_incremental", "return;"):
+        assert forbidden not in rejected
