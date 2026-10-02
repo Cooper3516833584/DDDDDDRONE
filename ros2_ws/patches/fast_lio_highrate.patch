@@ -105,7 +105,7 @@ index f35378f..d001ede 100644
 +  if (dt > 0.0)
 +    kf_state.predict(dt, Q, in);
 diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
-index d441261..7504202 100644
+index d441261..a2136a2 100644
 --- a/src/laserMapping.cpp
 +++ b/src/laserMapping.cpp
 @@ -35,0 +36,3 @@
@@ -513,11 +513,16 @@ index d441261..7504202 100644
 +            synchronized = sync_packages(Measures);
 +        }
 +        if(synchronized)
-@@ -1052 +1376,13 @@ private:
+@@ -1052 +1376,17 @@ private:
 -            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
++            auto predicted_state = kf.get_x();
++            auto predicted_covariance = kf.get_P();
 +            const bool laser_corrected = kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
 +            if (!laser_corrected)
 +            {
++                // A rejected iteration must not leave a partial laser update.
++                kf.change_x(predicted_state);
++                kf.change_P(predicted_covariance);
 +                {
 +                    lock_guard<mutex> lock(mtx_highrate_odom);
 +                    correction_matches = 0;
@@ -525,10 +530,9 @@ index d441261..7504202 100644
 +                    correction_geometry_ratio = 0.0;
 +                    correction_status = fast_lio::msg::LioHealth::DEGRADED;
 +                }
-+                RCLCPP_WARN(this->get_logger(), "No valid laser match, skip correction output");
-+                return;
++                RCLCPP_WARN(this->get_logger(), "No valid laser match, retain IMU prediction for frame output");
 +            }
-@@ -1053,0 +1390,60 @@ private:
+@@ -1053,0 +1394,60 @@ private:
 +            if (extrinsic_est_en)
 +            {
 +                const M3D R = state_point.offset_R_L_I.toRotationMatrix();
@@ -538,7 +542,7 @@ index d441261..7504202 100644
 +                    T.x(), T.y(), T.z(), R(0,0), R(0,1), R(0,2),
 +                    R(1,0), R(1,1), R(1,2), R(2,0), R(2,1), R(2,2));
 +            }
-+            if (p_imu->imu_ready() && !Measures.imu.empty())
++            if (laser_corrected && p_imu->imu_ready() && !Measures.imu.empty())
 +            {
 +                lock_guard<mutex> lock(mtx_highrate_odom);
 +                correction_matches = model_matches;
@@ -589,12 +593,12 @@ index d441261..7504202 100644
 +                    }
 +                }
 +            }
-@@ -1074 +1470 @@ private:
+@@ -1074 +1474 @@ private:
 -            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
 +            if (scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
-@@ -1138,0 +1535 @@ private:
+@@ -1138,0 +1539 @@ private:
 +    rclcpp::CallbackGroup::SharedPtr imu_group_;
-@@ -1163 +1560,4 @@ int main(int argc, char** argv)
+@@ -1163 +1564,4 @@ int main(int argc, char** argv)
 -    rclcpp::spin(std::make_shared<LaserMappingNode>());
 +    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
 +    auto node = std::make_shared<LaserMappingNode>();
