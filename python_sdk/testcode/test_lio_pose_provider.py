@@ -451,3 +451,129 @@ def test_reviewed_full_mount_rotates_body_lever_arm(tmp_path):
     assert p._reference_pose()[0] == pytest.approx((1, 0, 0))
     p.on_odometry(odom(1.01, yaw_deg=90))
     assert p._reference_pose()[0] == pytest.approx((0, 1, 0))
+
+
+@pytest.mark.parametrize("first", ["health", "odom"])
+def test_single_topic_arrival_preserves_active_pair(tmp_path, first):
+    p, now_ns = tracking_provider(tmp_path)
+    previous = p.get_snapshot()
+    state_ns = now_ns - 19_000_000
+    callbacks = {
+        "health": lambda: p.on_health(health_ns(state_ns, 11, state_ns - 1_000_000)),
+        "odom": lambda: p.on_odometry(odom_ns(state_ns, (0.1, 0, 0))),
+    }
+    callbacks[first]()
+    assert p.get_pose() is not None
+    assert p.get_snapshot() == previous
+    callbacks["odom" if first == "health" else "health"]()
+    snapshot = p.get_snapshot()
+    assert snapshot["stamp_ns"] == state_ns
+    assert snapshot["correction_seq"] == 11
+    assert snapshot["position_m"] == pytest.approx((0.1, 0, 0))
+    assert not p._pending_health and not p._pending_odom
+
+
+def test_interleaved_health_frames_commit_matching_odom_only(tmp_path):
+    p, now_ns = tracking_provider(tmp_path)
+    previous_stamp = p.get_snapshot()["stamp_ns"]
+    for seq in (11, 12):
+        ns = now_ns - 30_000_000 + seq * 1_000_000
+        p.on_health(health_ns(ns, seq, ns - 1_000_000))
+        assert p.get_snapshot()["stamp_ns"] == previous_stamp
+    for seq in (11, 12):
+        ns = now_ns - 30_000_000 + seq * 1_000_000
+        p.on_odometry(odom_ns(ns, (seq / 100, 0, 0)))
+        snapshot = p.get_snapshot()
+        assert snapshot["stamp_ns"] == ns
+        assert snapshot["correction_seq"] == seq
+        assert snapshot["position_m"][0] == pytest.approx(seq / 100)
+
+
+@pytest.mark.parametrize("missing", ["health", "odom"])
+def test_single_topic_stream_cannot_extend_pair_freshness(tmp_path, monkeypatch, missing):
+    p, now_ns = tracking_provider(tmp_path)
+    clock = [time.monotonic(), now_ns * 1e-9]
+    monkeypatch.setattr(module, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], time=lambda: clock[1]))
+    for seq in (11, 12, 13):
+        ns = now_ns - 30_000_000 + seq * 1_000_000
+        if missing == "odom":
+            p.on_health(health_ns(ns, seq, ns - 1_000_000))
+        else:
+            p.on_odometry(odom_ns(ns))
+        assert p.get_pose() is not None
+    clock[0] += 0.051
+    clock[1] += 0.051
+    assert p.get_pose() is None
+    assert p._lost_latched and p._base is None and p._world_basis is None
+
+
+def test_delayed_pair_preserves_original_callback_receive_age(tmp_path, monkeypatch):
+    p, now_ns = tracking_provider(tmp_path)
+    clock = [time.monotonic()]
+    monkeypatch.setattr(module, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], time=lambda: now_ns * 1e-9))
+    ns = now_ns - 19_000_000
+    p.on_health(health_ns(ns, 11, ns - 1_000_000))
+    health_received_at = clock[0]
+    valid_received_at = p._valid_correction_received_at
+    clock[0] += 0.051
+    p.on_odometry(odom_ns(ns))
+    assert p._health_received_at == health_received_at
+    assert p._valid_correction_received_at == valid_received_at
+    assert p.get_pose() is None
+
+
+@pytest.mark.parametrize("fault", ["health_rewind", "odom_rewind", "epoch"])
+def test_pairing_preserves_rewind_and_epoch_lost_latch(tmp_path, fault):
+    p, now_ns = tracking_provider(tmp_path)
+    ns = now_ns - 19_000_000
+    p.on_health(health_ns(ns, 11, ns - 1_000_000))
+    p.on_odometry(odom_ns(ns))
+    if fault == "health_rewind":
+        p.on_health(health_ns(ns - 1, 11, ns - 1_000_000))
+    elif fault == "odom_rewind":
+        p.on_odometry(odom_ns(ns - 1))
+    else:
+        health = health_ns(ns + 1, 11, ns - 1_000_000)
+        health.epoch = 2
+        p.on_health(health)
+    assert p._lost_latched and p.get_pose() is None
+    assert p._base is None and p._world_basis is None
+    assert not p._pending_health and not p._pending_odom
+    later_ns = ns + 1_000_000
+    p.on_health(health_ns(later_ns, 12, later_ns - 1_000_000))
+    p.on_odometry(odom_ns(later_ns))
+    assert p.get_pose() is None
+
+
+def test_pair_cache_bound_and_ground_reset(tmp_path):
+    p, now_ns = tracking_provider(tmp_path)
+    active_ns = p._stamp_ns_value
+    for i in range(1, 33):
+        ns = active_ns + i * 100_000
+        p.on_health(health_ns(ns, 10, p._anchor_ns))
+    assert len(p._pending_health) == p._PAIR_CACHE_LIMIT
+    p.on_odometry(odom_ns(active_ns + 100_000))
+    assert p._stamp_ns_value == active_ns
+    assert len(p._pending_odom) == 1
+    p._lost_latched = True
+    assert p.reset_ground(disarmed=True)
+    assert not p._pending_health and not p._pending_odom
+    assert p._last_health_ns == p._last_odom_ns == 0
+
+
+def test_unpaired_recovery_cannot_reauthorize_pre_degraded_pair(tmp_path):
+    p, now_ns = tracking_provider(tmp_path)
+    base, basis = p._base, p._world_basis
+    bad_ns = now_ns - 19_000_000
+    p.on_health(health_ns(bad_ns, 10, p._anchor_ns, state=2))
+    assert p.get_pose() is None
+    for seq in range(11, 21):
+        ns = bad_ns + (seq - 10) * 1_000_000
+        p.on_health(health_ns(ns, seq, ns - 1_000_000))
+    assert p._good_corrections == 10
+    assert p.get_pose() is None
+    p.on_odometry(odom_ns(ns))
+    assert p.get_pose() is not None
+    assert p._base == base and p._world_basis == basis

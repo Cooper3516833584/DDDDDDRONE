@@ -4,7 +4,7 @@ import json
 import math
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 
 
@@ -64,6 +64,7 @@ def _normalize(v):
 class LioPoseProvider:
     STALE_SECONDS = 0.05
     CORRECTION_STALE_SECONDS = 0.25
+    _PAIR_CACHE_LIMIT = 16
     # Manufacturer T_I_L. User confirmed L and aircraft axes are aligned.
     LIDAR_ORIGIN_IN_IMU_M = (-0.011, -0.02329, 0.04412)
     ALIGNED_QUATERNION = (0.0, 0.0, 0.0, 1.0)
@@ -115,6 +116,15 @@ class LioPoseProvider:
         self._anchor_ns = 0
         self._state_ns = 0
         self._good_corrections = 0
+        self._paired_good_corrections = 0
+        self._last_degraded_ns = 0
+        self._last_health_ns = 0
+        self._last_odom_ns = 0
+        self._last_health_epoch = None
+        self._last_correction_seq = 0
+        self._last_anchor_ns = 0
+        self._pending_health = OrderedDict()
+        self._pending_odom = OrderedDict()
         self._lost_latched = False
         self._imu_window = deque()
         self._stationary_ready = False
@@ -179,21 +189,19 @@ class LioPoseProvider:
         now = time.monotonic()
         with self._lock:
             if (epoch < 1 or seq < 1 or state_ns < anchor_ns or anchor_ns <= 0 or
-                    (self._health_epoch is not None and epoch != self._health_epoch) or
-                    state_ns <= self._state_ns or seq < self._correction_seq or
-                    (seq == self._correction_seq and anchor_ns != self._anchor_ns) or
-                    (seq > self._correction_seq and anchor_ns <= self._anchor_ns)):
-                self._lost_latched = True
-                self._base = None
-                self._world_basis = None
+                    (self._last_health_epoch is not None and epoch != self._last_health_epoch) or
+                    state_ns <= self._last_health_ns or seq < self._last_correction_seq or
+                    (seq == self._last_correction_seq and anchor_ns != self._last_anchor_ns) or
+                    (seq > self._last_correction_seq and anchor_ns <= self._last_anchor_ns)):
+                self._latch_lost()
                 return
-            new_correction = seq > self._correction_seq
-            self._health_epoch = epoch
-            self._correction_seq = seq
-            self._anchor_ns = anchor_ns
-            self._state_ns = state_ns
-            self._health = health
-            self._health_received_at = now
+            if self._lost_latched:
+                return
+            new_correction = seq > self._last_correction_seq
+            self._last_health_epoch = epoch
+            self._last_correction_seq = seq
+            self._last_anchor_ns = anchor_ns
+            self._last_health_ns = state_ns
             gravity = health.gravity_o
             gravity_values = (float(gravity.x), float(gravity.y), float(gravity.z))
             gravity_norm = math.sqrt(sum(v * v for v in gravity_values))
@@ -206,13 +214,51 @@ class LioPoseProvider:
                     5.0 <= gravity_norm <= 15.0)
             if not good:
                 self._good_corrections = 0
+                self._last_degraded_ns = state_ns
             elif new_correction:
                 self._valid_correction_received_at = now
                 self._good_corrections += 1
             if int(health.state) == 3:
-                self._lost_latched = True
-                self._base = None
-                self._world_basis = None
+                self._latch_lost()
+                return
+            self._pending_health[state_ns] = (health, now, self._good_corrections)
+            self._try_commit_pair(state_ns)
+            self._prune_pair_cache()
+
+    def _latch_lost(self):
+        """Called with the provider lock held."""
+        self._lost_latched = True
+        self._base = None
+        self._world_basis = None
+        self._pending_health.clear()
+        self._pending_odom.clear()
+
+    def _try_commit_pair(self, stamp_ns):
+        """Publish a complete exact-stamp sample under the provider lock."""
+        if stamp_ns not in self._pending_health or stamp_ns not in self._pending_odom:
+            return
+        if self._stamp_ns_value is not None and stamp_ns <= self._stamp_ns_value:
+            return
+        health, health_received_at, good_corrections = self._pending_health[stamp_ns]
+        pose, twist, received_at = self._pending_odom[stamp_ns]
+        self._health = health
+        self._health_received_at = health_received_at
+        self._health_epoch = int(health.epoch)
+        self._correction_seq = int(health.correction_seq)
+        self._anchor_ns = self._stamp_ns(health.anchor_stamp)
+        self._paired_good_corrections = good_corrections
+        self._latest = pose
+        self._latest_twist = twist
+        self._received_at = received_at
+        self._stamp_ns_value = self._state_ns = stamp_ns
+        self._stamp = stamp_ns * 1e-9
+
+    def _prune_pair_cache(self):
+        for cache in (self._pending_health, self._pending_odom):
+            while cache and (len(cache) > self._PAIR_CACHE_LIMIT or
+                             (self._stamp_ns_value is not None and
+                              next(iter(cache)) <= self._stamp_ns_value)):
+                cache.popitem(last=False)
 
     def reset_ground(self, *, disarmed):
         if not disarmed:
@@ -232,6 +278,15 @@ class LioPoseProvider:
             self._anchor_ns = 0
             self._state_ns = 0
             self._good_corrections = 0
+            self._paired_good_corrections = 0
+            self._last_degraded_ns = 0
+            self._last_health_ns = 0
+            self._last_odom_ns = 0
+            self._last_health_epoch = None
+            self._last_correction_seq = 0
+            self._last_anchor_ns = 0
+            self._pending_health.clear()
+            self._pending_odom.clear()
             self._valid_correction_received_at = 0.0
             self._lost_latched = False
             self._base = None
@@ -252,20 +307,17 @@ class LioPoseProvider:
             return False
         source_age = time.time() - self._stamp
         if source_age < -0.01 or source_age > self.STALE_SECONDS:
-            self._lost_latched = True
-            self._base = None
-            self._world_basis = None
+            self._latch_lost()
             return False
         if (now - self._received_at > self.STALE_SECONDS or
                 now - self._health_received_at > self.STALE_SECONDS or
                 now - self._valid_correction_received_at > self.CORRECTION_STALE_SECONDS or
                 (self._state_ns - self._anchor_ns) * 1e-9 > self.CORRECTION_STALE_SECONDS or
-                self._good_corrections < 10):
+                self._good_corrections < 10 or self._paired_good_corrections < 10 or
+                self._state_ns < self._last_degraded_ns):
             if now - self._valid_correction_received_at > self.CORRECTION_STALE_SECONDS or (
                     self._state_ns - self._anchor_ns) * 1e-9 > self.CORRECTION_STALE_SECONDS:
-                self._lost_latched = True
-                self._base = None
-                self._world_basis = None
+                self._latch_lost()
             return False
         return int(self._health.state) == 1
 
@@ -303,13 +355,21 @@ class LioPoseProvider:
                 return
         now = time.monotonic()
         with self._lock:
-            if self._stamp is not None and stamp <= self._stamp:
+            if stamp_ns <= self._last_odom_ns:
                 self._latest = None
                 self._base = None
                 self._world_basis = None
                 self._stamp = None
                 self._stamp_ns_value = None
-                self._lost_latched = True
+                self._latch_lost()
+                return
+            if self._require_health and self._lost_latched:
+                return
+            self._last_odom_ns = stamp_ns
+            if self._require_health:
+                self._pending_odom[stamp_ns] = ((p, q), (v_imu, omega_imu), now)
+                self._try_commit_pair(stamp_ns)
+                self._prune_pair_cache()
                 return
             self._latest = (p, q)
             self._latest_twist = (v_imu, omega_imu)
