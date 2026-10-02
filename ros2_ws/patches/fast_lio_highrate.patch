@@ -105,7 +105,7 @@ index f35378f..d001ede 100644
 +  if (dt > 0.0)
 +    kf_state.predict(dt, Q, in);
 diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
-index d441261..a2136a2 100644
+index d441261..123ce63 100644
 --- a/src/laserMapping.cpp
 +++ b/src/laserMapping.cpp
 @@ -35,0 +36,3 @@
@@ -513,8 +513,9 @@ index d441261..a2136a2 100644
 +            synchronized = sync_packages(Measures);
 +        }
 +        if(synchronized)
-@@ -1052 +1376,17 @@ private:
+@@ -1052,2 +1376,78 @@ private:
 -            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+-            state_point = kf.get_x();
 +            auto predicted_state = kf.get_x();
 +            auto predicted_covariance = kf.get_P();
 +            const bool laser_corrected = kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
@@ -532,7 +533,7 @@ index d441261..a2136a2 100644
 +                }
 +                RCLCPP_WARN(this->get_logger(), "No valid laser match, retain IMU prediction for frame output");
 +            }
-@@ -1053,0 +1394,60 @@ private:
++            state_point = kf.get_x(); // Commit this scan before high-rate re-anchor.
 +            if (extrinsic_est_en)
 +            {
 +                const M3D R = state_point.offset_R_L_I.toRotationMatrix();
