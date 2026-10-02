@@ -446,6 +446,13 @@ def ros_worker(model, stop):
             context.shutdown()
 
 
+def set_line_xyz(artist, points):
+    """Use arrays so Matplotlib can mask trajectory gaps and clipped points."""
+    import numpy as np
+    coordinates = np.asarray(points, dtype=float).reshape(-1, 3).T
+    artist.set_data_3d(*coordinates)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--demo", action="store_true", help="Synthetic GUI preview; no ROS/hardware")
@@ -541,15 +548,12 @@ def main():
             else:
                 points, position, status, reference = model.snapshot()
             xyz = [point[1] for point in points]
-            if xyz:
-                line.set_data_3d(*zip(*xyz))
-            else:
-                line.set_data_3d([], [], [])
+            set_line_xyz(line, xyz)
             if position is not None:
-                marker.set_data_3d([position[0]], [position[1]], [position[2]])
+                set_line_xyz(marker, [position])
                 coordinates.set_text("X: {:+.3f} m   Y: {:+.3f} m   Z: {:+.3f} m".format(*position))
             else:
-                marker.set_data_3d([], [], [])
+                set_line_xyz(marker, [])
                 coordinates.set_text("X: --   Y: --   Z: --")
             status_text.set_text(status + " | " + reference)
             status_text.set_color("#168aad" if status.startswith(("TRACKING", "DEMO")) else "#bb3e03")

@@ -167,3 +167,22 @@ def test_session_start_failure_still_closes_owned_nodes(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="existing FAST-LIO"):
         viewer.stream_local_ros(viewer.TrajectoryModel(tmp_path / "missing.json"), new_map=True)
     assert closed == [True]
+
+
+def test_actual_3d_draw_handles_nan_gaps_empty_reset_and_clipping():
+    import numpy as np
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    figure = Figure()
+    canvas = FigureCanvasAgg(figure)
+    axes = figure.add_subplot(projection="3d")
+    line, = axes.plot([], [], [])
+    marker, = axes.plot([], [], [], "o")
+    axes.set_xlim(-1, 1)
+    for points in ([(0, 0, 0), (np.nan,) * 3, (2, 1, 1)], [], [(0.2, 0.1, 0.3)]):
+        viewer.set_line_xyz(line, points)
+        viewer.set_line_xyz(marker, points[-1:] if points else [])
+        assert all(isinstance(values, np.ndarray) for values in line.get_data_3d())
+        for azimuth in (0, 45, 90):
+            axes.view_init(azim=azimuth)
+            canvas.draw()
