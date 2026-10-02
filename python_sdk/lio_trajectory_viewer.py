@@ -71,6 +71,7 @@ class TrajectoryModel:
         self.points = deque(maxlen=max_points)
         self.pending = (OrderedDict(), OrderedDict())
         self.origin = self.axes = self.epoch = None
+        self.last_correction_seq = None
         self.position = None
         self.last_stamp = 0
         self.received = 0.0
@@ -103,7 +104,9 @@ class TrajectoryModel:
 
     def _pair(self, odom, health, stamp_ns, received):
         epoch = int(health.epoch)
-        if self.epoch is not None and self.epoch != epoch:
+        seq = getattr(health, "correction_seq", None)
+        if ((self.epoch is not None and self.epoch != epoch) or
+                (seq is not None and self.last_correction_seq is not None and seq < self.last_correction_seq)):
             self.origin = self.axes = self.position = None
             self.points.clear()
             self.generation += 1
@@ -111,6 +114,7 @@ class TrajectoryModel:
             self.pending[0].clear()
             self.pending[1].clear()
         self.epoch = epoch
+        self.last_correction_seq = seq
         if stamp_ns <= self.last_stamp:
             self.status = "TIMESTAMP REWIND / DUPLICATE"
             self.break_pending = True

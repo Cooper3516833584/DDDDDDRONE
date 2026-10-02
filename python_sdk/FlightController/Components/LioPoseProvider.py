@@ -260,6 +260,11 @@ class LioPoseProvider:
                               next(iter(cache)) <= self._stamp_ns_value)):
                 cache.popitem(last=False)
 
+    def invalidate_for_restart(self):
+        """Revoke the old map/basepoint; this never authorizes pose or motion."""
+        with self._lock:
+            self._latch_lost()
+
     def reset_ground(self, *, disarmed):
         if not disarmed:
             raise RuntimeError("Ground reset requires verified disarmed state")

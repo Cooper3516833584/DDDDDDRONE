@@ -186,3 +186,16 @@ def test_actual_3d_draw_handles_nan_gaps_empty_reset_and_clipping():
         for azimuth in (0, 45, 90):
             axes.view_init(azim=azimuth)
             canvas.draw()
+
+
+def test_service_restart_sequence_rewind_resets_display_origin(tmp_path, monkeypatch):
+    monkeypatch.setattr(viewer.time, "time", lambda: 100.0)
+    model = viewer.TrajectoryModel(tmp_path / "missing.json")
+    old = messages(0, (1, 2, 3))
+    old[1].correction_seq = 100
+    deliver(model, old)
+    fresh = messages(1000000, (20, 30, 40))
+    fresh[1].correction_seq = 1
+    deliver(model, fresh)
+    assert model.snapshot()[1] == pytest.approx((0, 0, 0))
+    assert model.generation == 1

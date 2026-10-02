@@ -17,6 +17,19 @@ spec.loader.exec_module(module)
 LioPoseProvider = module.LioPoseProvider
 
 
+def test_restart_invalidation_revokes_basepoint_and_requires_ground_reset(tmp_path):
+    pose = LioPoseProvider(tmp_path / "missing.json")
+    pose._base = ((1, 2, 3), (0, 0, 0, 1))
+    pose._pending_odom[1] = object()
+    pose.invalidate_for_restart()
+    assert pose.get_snapshot() is None and pose._base is None
+    assert pose._lost_latched and not pose._pending_odom
+    with pytest.raises(RuntimeError):
+        pose.reset_ground(disarmed=False)
+    assert pose.reset_ground(disarmed=True)
+    assert pose.get_snapshot() is None
+
+
 def odom(stamp, xyz=(0, 0, 0), yaw_deg=0, frame="camera_init"):
     half = math.radians(yaw_deg) / 2
     return SimpleNamespace(
