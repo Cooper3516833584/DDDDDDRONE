@@ -126,3 +126,44 @@ def test_lost_reason_is_visible_without_creating_an_origin(tmp_path, monkeypatch
     deliver(model, pair)
     assert model.snapshot()[1] is None
     assert model.snapshot()[2] == "LOST - laser_correction_stale"
+
+
+def test_session_shutdown_escalates_only_owned_process_group(monkeypatch):
+    sent = []
+    monkeypatch.setattr(viewer.os, "killpg", lambda pid, sig: sent.append((pid, sig)), raising=False)
+    monkeypatch.setattr(viewer.signal, "SIGKILL", 9, raising=False)
+    waits = []
+
+    def wait(timeout):
+        waits.append(timeout)
+        if len(waits) == 1:
+            raise viewer.subprocess.TimeoutExpired("owned-node", timeout)
+
+    closed = []
+    process = NS(pid=123, poll=lambda: None, wait=wait, stdout=NS(close=lambda: closed.append(True)))
+    session = viewer.LocalLocalizationSession()
+    session.children.append((process, [], NS(join=lambda timeout: None)))
+    session.close()
+    session.close()
+    assert sent == [(123, viewer.signal.SIGINT), (123, viewer.signal.SIGTERM)]
+    assert waits == [4, 2] and closed == [True]
+
+
+def test_session_start_failure_still_closes_owned_nodes(monkeypatch, tmp_path):
+    closed = []
+    class Session:
+        def start(self):
+            raise RuntimeError("existing FAST-LIO")
+        def close(self):
+            closed.append(True)
+    class Thread:
+        ident = None
+        def __init__(self, **kwargs):
+            pass
+        def start(self):
+            pass
+    monkeypatch.setattr(viewer, "LocalLocalizationSession", Session)
+    monkeypatch.setattr(viewer.threading, "Thread", Thread)
+    with pytest.raises(RuntimeError, match="existing FAST-LIO"):
+        viewer.stream_local_ros(viewer.TrajectoryModel(tmp_path / "missing.json"), new_map=True)
+    assert closed == [True]

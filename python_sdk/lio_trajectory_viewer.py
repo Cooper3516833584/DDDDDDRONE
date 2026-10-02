@@ -1,10 +1,10 @@
-"""MID360S/FAST-LIO passive 3D viewer, relative to the first TRACKING sample.
+"""MID360S/FAST-LIO diagnostic 3D viewer, relative to the first TRACKING sample.
 
 On the flight computer's graphical desktop/NoMachine, run this file directly
 from VSCode. ROS2 Humble and the repository overlay are loaded automatically.
 
 Windows/local GUI preview without ROS: python lio_trajectory_viewer.py --demo
-Windows live mode uses local WSL ROS2, with the window in this Python environment.
+Windows live mode starts a fresh local WSL map and stops it when the window closes.
 This diagnostic origin is independent of Navigation calibration and authorization.
 """
 
@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
@@ -182,11 +183,108 @@ class TrajectoryModel:
             self.received = time.monotonic()
 
 
-def stream_local_ros(model):
-    """Local WSL stdout transport; no GUI, SSH or flight commands."""
+class LocalLocalizationSession:
+    """Own only nodes started for this test; never stop existing ROS services."""
+    def __init__(self):
+        self.children = []
+        self.session_lock = None
+
+    @staticmethod
+    def running(executable):
+        found = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                if (entry / "exe").resolve().name == executable:
+                    found.append(int(entry.name))
+            except OSError:
+                continue
+        return found
+
+    def launch(self, command):
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, errors="replace", start_new_session=True)
+        tail = deque(maxlen=30)
+        def drain():
+            for index, line in enumerate(process.stdout):
+                tail.append(line.rstrip())
+                if index < 20:
+                    print(f"[{Path(command[0]).name}] {line.rstrip()}", file=sys.stderr, flush=True)
+        reader = threading.Thread(target=drain, daemon=True)
+        self.children.append((process, tail, reader))
+        reader.start()
+
+    def start(self):
+        import fcntl
+        import hashlib
+        from ament_index_python.packages import get_package_prefix
+        repo = Path(__file__).resolve().parents[1]
+        config = repo / "ros2_ws/src/FAST_LIO_ROS2/config/mid360s_drone.yaml"
+        driver_config = repo / "ros2_ws/src/livox_ros_driver2/config/MID360s_config.json"
+        for path in (config, driver_config):
+            if not path.is_file():
+                raise RuntimeError(f"Localization configuration missing: {path}")
+        key = hashlib.sha256(str(repo).encode()).hexdigest()[:16]
+        self.session_lock = open(f"/tmp/lio-viewer-{os.getuid()}-{key}.lock", "a")
+        try:
+            fcntl.flock(self.session_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another trajectory window is running; close it first")
+        existing = self.running("fastlio_mapping")
+        if existing:
+            raise RuntimeError(f"FAST-LIO already running (PID {existing}); stop its terminal/service first")
+        mapping = Path(get_package_prefix("fast_lio")) / "lib/fast_lio/fastlio_mapping"
+        driver = Path(get_package_prefix("livox_ros_driver2")) / "lib/livox_ros_driver2/livox_ros_driver2_node"
+        for executable in (mapping, driver):
+            if not executable.is_file():
+                raise RuntimeError(f"ROS executable missing: {executable}")
+        if not self.running("livox_ros_driver2_node"):
+            self.launch(["/usr/bin/python3", "/opt/ros/humble/bin/ros2", "run", "livox_ros_driver2",
+                         "livox_ros_driver2_node", "--ros-args", "-p", "xfer_format:=1", "-p", "multi_topic:=0",
+                         "-p", "data_src:=0", "-p", "publish_freq:=10.0", "-p", "output_data_type:=0",
+                         "-p", "frame_id:=livox_frame", "-p", f"user_config_path:={driver_config}",
+                         "-p", "cmdline_input_bd_code:=livox0000000001"])
+        else:
+            print("Using an existing Livox driver; its owner must stop it separately.", file=sys.stderr)
+        self.launch(["/usr/bin/python3", "/opt/ros/humble/bin/ros2", "run", "fast_lio", "fastlio_mapping",
+                     "--ros-args", "--params-file", str(config),
+                     "-p", "use_sim_time:=false"])
+        print("Started a fresh FAST-LIO map; closing this window stops its owned ROS nodes.", file=sys.stderr)
+
+    def check(self):
+        for process, tail, _ in self.children:
+            if process.poll() is not None:
+                raise RuntimeError(f"Localization node exited ({process.returncode}): " + " | ".join(tail))
+
+    def close(self):
+        for process, _, reader in reversed(self.children):
+            if process.poll() is None:
+                for sig, timeout in ((signal.SIGINT, 4), (signal.SIGTERM, 2), (signal.SIGKILL, 1)):
+                    try:
+                        os.killpg(process.pid, sig)
+                        process.wait(timeout=timeout)
+                        break
+                    except ProcessLookupError:
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            reader.join(timeout=1)
+            process.stdout.close()
+        self.children.clear()
+        if self.session_lock is not None:
+            self.session_lock.close()
+            self.session_lock = None
+
+
+def stream_local_ros(model, new_map=False):
+    """Local WSL transport with optional owned ROS nodes; no flight commands."""
     stop = threading.Event()
     worker = threading.Thread(target=ros_worker, args=(model, stop), daemon=True)
-    worker.start()
+    session = LocalLocalizationSession() if new_map else None
+    previous_sigterm = None
+    if sys.platform == "linux" and threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
 
     def commands():
         for line in sys.stdin:
@@ -197,7 +295,12 @@ def stream_local_ros(model):
     threading.Thread(target=commands, daemon=True).start()
     last_stamp, generation = -1, -1
     try:
+        if session is not None:
+            session.start()
+        worker.start()
         while not stop.is_set():
+            if session is not None:
+                session.check()
             with model.lock:
                 points, position, status, reference = model.snapshot()
                 current_generation = model.generation
@@ -215,15 +318,21 @@ def stream_local_ros(model):
         pass
     finally:
         stop.set()
-        worker.join(timeout=2)
+        if worker.ident is not None:
+            worker.join(timeout=2)
+        if session is not None:
+            session.close()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 class LocalWslConnection:
-    def __init__(self, mount_path=None, max_points=6000):
+    def __init__(self, mount_path=None, max_points=6000, new_map=True):
         self.process = None
         self.lock = threading.Lock()
         self.mount_path = mount_path
         self.max_points = max_points
+        self.new_map = new_map
 
     @staticmethod
     def translate_path(path):
@@ -256,6 +365,8 @@ class LocalWslConnection:
             translated = self.translate_path(__file__)
             command = ["wsl.exe", "--exec", "/usr/bin/python3", "-u", translated,
                        "--stream", "--max-points", str(self.max_points)]
+            if self.new_map:
+                command.append("--new-map")
             if self.mount_path is not None:
                 command.extend(["--mount", self.translate_path(self.mount_path)])
             process = subprocess.Popen(
@@ -265,12 +376,15 @@ class LocalWslConnection:
             )
             with self.lock:
                 self.process = process
+            error_tail = deque(maxlen=4)
 
             def errors():
                 for line in process.stderr:
+                    error_tail.append(line.rstrip())
                     print("[WSL]", line.rstrip())
 
-            threading.Thread(target=errors, daemon=True).start()
+            error_reader = threading.Thread(target=errors, daemon=True)
+            error_reader.start()
             for line in process.stdout:
                 if stop.is_set():
                     break
@@ -281,7 +395,8 @@ class LocalWslConnection:
                 except (ValueError, AttributeError, KeyError):
                     print("[WSL]", line.rstrip())
             if not stop.is_set():
-                raise RuntimeError("Local WSL ROS subscription exited")
+                error_reader.join(timeout=0.5)
+                raise RuntimeError("Local WSL ROS subscription exited: " + " | ".join(error_tail))
         except Exception as exc:
             with model.lock:
                 model.status = "LOCAL WSL ERROR: " + str(exc)
@@ -292,7 +407,7 @@ class LocalWslConnection:
                 process = self.process
             if process is not None:
                 try:
-                    process.wait(timeout=3)
+                    process.wait(timeout=20)
                 except subprocess.TimeoutExpired:
                     process.terminate()
 
@@ -338,6 +453,8 @@ def main():
     parser.add_argument("--max-points", type=int, default=6000, help="Bounded trajectory history")
     parser.add_argument("--save-preview", type=Path, help="Save synthetic preview and exit (requires --demo)")
     parser.add_argument("--stream", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--new-map", action="store_true", help="Own a fresh local ROS test session (Linux opt-in)")
+    parser.add_argument("--subscribe-only", action="store_true", help="Windows: subscribe to existing ROS without restarting")
     args = parser.parse_args()
     if args.max_points < 2:
         parser.error("--max-points must be >=2")
@@ -346,7 +463,7 @@ def main():
     if not args.demo:
         prepare_ros_environment()
     if args.stream:
-        stream_local_ros(TrajectoryModel(args.mount, args.max_points))
+        stream_local_ros(TrajectoryModel(args.mount, args.max_points), args.new_map)
         return
     import matplotlib
     if args.save_preview:
@@ -362,7 +479,14 @@ def main():
     model = TrajectoryModel(args.mount, args.max_points)
     stop = threading.Event()
     worker = None
-    connection = LocalWslConnection(args.mount, args.max_points) if sys.platform == "win32" and not args.demo else None
+    connection = LocalWslConnection(args.mount, args.max_points, not args.subscribe_only) if sys.platform == "win32" and not args.demo else None
+    local_session = LocalLocalizationSession() if sys.platform == "linux" and args.new_map and not args.demo else None
+    if local_session is not None:
+        try:
+            local_session.start()
+        except BaseException:
+            local_session.close()
+            raise
     if not args.demo:
         if connection is not None:
             # Transport timeout only; WSL still applies the original 50 ms source gate.
@@ -400,6 +524,14 @@ def main():
         button.on_clicked(reset_display)
 
         def redraw(frame):
+            if local_session is not None:
+                try:
+                    local_session.check()
+                except RuntimeError as exc:
+                    with model.lock:
+                        model.status = "LOCAL ROS ERROR: " + str(exc)
+                        model.received = 0.0
+                    stop.set()
             if args.demo:
                 t = time.monotonic() - started if not args.save_preview else 12.0
                 points = [(i * 20000000, (0.08 * i / 50, 0.6 * math.sin(i / 50), 0.02 * i / 50))
@@ -444,7 +576,9 @@ def main():
         if connection is not None:
             connection.close()
         if worker is not None:
-            worker.join(timeout=4)
+            worker.join(timeout=22)
+        if local_session is not None:
+            local_session.close()
 
 
 if __name__ == "__main__":
