@@ -88,3 +88,31 @@ def test_vscode_bootstrap_sources_ros_and_uses_system_python(monkeypatch):
     assert executed[0][0] == "/usr/bin/python3"
     assert executed[0][2]["ROS_DISTRO"] == "humble"
     assert executed[0][2]["LIO_VIEWER_ROS_BOOTSTRAPPED"] == "1"
+
+
+def test_local_stream_preserves_gap_bounded_history_and_epoch_reset(tmp_path, monkeypatch):
+    model = viewer.TrajectoryModel(tmp_path / "missing.json", max_points=2)
+    packet = dict(generation=0, points=[(1, [0, 0, 0]), (2, None), (3, [1, 2, 3])],
+                  position=[1, 2, 3], status="DEGRADED", reference="LIDAR ORIGIN")
+    model.receive_packet(packet)
+    points, position, status, _ = model.snapshot()
+    assert len(points) == 2 and all(math.isnan(value) for value in points[0][1])
+    assert position == [1, 2, 3] and status == "DEGRADED"
+    monkeypatch.setattr(viewer.time, "monotonic", lambda: model.received + 1)
+    assert model.snapshot()[2] == "STALE / NO FRESH PAIRED DATA"
+    packet.update(generation=1, points=[(4, [0, 0, 0])], position=[0, 0, 0])
+    model.receive_packet(packet)
+    assert model.snapshot()[0] == [(4, (0, 0, 0))]
+
+
+def test_wsl_translation_bypasses_shell_backslash_processing(monkeypatch):
+    calls = []
+
+    def output(command, **kwargs):
+        calls.append(command)
+        return "/mnt/c/viewer.py\n"
+
+    monkeypatch.setattr(viewer.subprocess, "check_output", output)
+    assert viewer.LocalWslConnection.translate_path(source) == "/mnt/c/viewer.py"
+    assert calls[0][:4] == ["wsl.exe", "--exec", "wslpath", "-a"]
+    assert "\\" not in calls[0][-1]

@@ -4,12 +4,14 @@ On the flight computer's graphical desktop/NoMachine, run this file directly
 from VSCode. ROS2 Humble and the repository overlay are loaded automatically.
 
 Windows/local GUI preview without ROS: python lio_trajectory_viewer.py --demo
+Windows live mode uses local WSL ROS2, with the window in this Python environment.
 This diagnostic origin is independent of Navigation calibration and authorization.
 """
 
 import argparse
 from collections import OrderedDict, deque
 import importlib.util
+import json
 import math
 import os
 from pathlib import Path
@@ -64,7 +66,7 @@ class TrajectoryModel:
         self.reference = "BODY" if provider.mount_reviewed else "LIDAR / UNREVIEWED MOUNT"
         if provider._reference_frame == "lidar":
             self.reference = "LIDAR ORIGIN"
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.points = deque(maxlen=max_points)
         self.pending = (OrderedDict(), OrderedDict())
         self.origin = self.axes = self.epoch = None
@@ -73,11 +75,14 @@ class TrajectoryModel:
         self.received = 0.0
         self.status = "WAITING FOR ROS DATA"
         self.break_pending = False
+        self.generation = 0
+        self.freshness_timeout = POSE.LioPoseProvider.STALE_SECONDS
 
     def reset_origin(self):
         with self.lock:
             self.origin = self.axes = self.position = None
             self.points.clear()
+            self.generation += 1
             self.pending[0].clear()
             self.pending[1].clear()
             self.status = "WAITING FOR TRACKING ORIGIN"
@@ -100,6 +105,7 @@ class TrajectoryModel:
         if self.epoch is not None and self.epoch != epoch:
             self.origin = self.axes = self.position = None
             self.points.clear()
+            self.generation += 1
             self.last_stamp = 0
             self.pending[0].clear()
             self.pending[1].clear()
@@ -155,10 +161,137 @@ class TrajectoryModel:
     def snapshot(self):
         with self.lock:
             status = self.status
-            if self.received and time.monotonic() - self.received > POSE.LioPoseProvider.STALE_SECONDS:
+            if self.received and time.monotonic() - self.received > self.freshness_timeout:
                 status = "STALE / NO FRESH PAIRED DATA"
                 self.break_pending = True
             return list(self.points), self.position, status, self.reference
+
+    def receive_packet(self, packet):
+        with self.lock:
+            if packet["generation"] != self.generation:
+                self.points.clear()
+                self.generation = packet["generation"]
+            for stamp, position in packet["points"]:
+                self.points.append((stamp, tuple(position) if position is not None else (float("nan"),) * 3))
+            self.position = packet["position"]
+            self.status = packet["status"]
+            self.reference = packet["reference"]
+            self.received = time.monotonic()
+
+
+def stream_local_ros(model):
+    """Local WSL stdout transport; no GUI, SSH or flight commands."""
+    stop = threading.Event()
+    worker = threading.Thread(target=ros_worker, args=(model, stop), daemon=True)
+    worker.start()
+
+    def commands():
+        for line in sys.stdin:
+            if line.strip() == "reset":
+                model.reset_origin()
+        stop.set()
+
+    threading.Thread(target=commands, daemon=True).start()
+    last_stamp, generation = -1, -1
+    try:
+        while not stop.is_set():
+            with model.lock:
+                points, position, status, reference = model.snapshot()
+                current_generation = model.generation
+            if current_generation != generation:
+                last_stamp, generation = -1, current_generation
+            added = [(stamp, list(p) if all(math.isfinite(v) for v in p) else None)
+                     for stamp, p in points if stamp > last_stamp]
+            if added:
+                last_stamp = added[-1][0]
+            print(json.dumps({"type": "lio_trajectory", "generation": generation,
+                              "points": added, "position": position,
+                              "status": status, "reference": reference}), flush=True)
+            stop.wait(0.05)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        stop.set()
+        worker.join(timeout=2)
+
+
+class LocalWslConnection:
+    def __init__(self, mount_path=None, max_points=6000):
+        self.process = None
+        self.lock = threading.Lock()
+        self.mount_path = mount_path
+        self.max_points = max_points
+
+    @staticmethod
+    def translate_path(path):
+        return subprocess.check_output(
+            ["wsl.exe", "--exec", "wslpath", "-a", Path(path).resolve().as_posix()],
+            text=True, timeout=10,
+        ).strip()
+
+    def close(self):
+        with self.lock:
+            if self.process is not None and not self.process.stdin.closed:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
+
+    def reset(self, model):
+        model.reset_origin()
+        with self.lock:
+            if self.process is not None and self.process.poll() is None and not self.process.stdin.closed:
+                try:
+                    self.process.stdin.write("reset\n")
+                    self.process.stdin.flush()
+                except OSError as exc:
+                    with model.lock:
+                        model.status = "LOCAL WSL ERROR: " + str(exc)
+
+    def run(self, model, stop):
+        try:
+            translated = self.translate_path(__file__)
+            command = ["wsl.exe", "--exec", "/usr/bin/python3", "-u", translated,
+                       "--stream", "--max-points", str(self.max_points)]
+            if self.mount_path is not None:
+                command.extend(["--mount", self.translate_path(self.mount_path)])
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            with self.lock:
+                self.process = process
+
+            def errors():
+                for line in process.stderr:
+                    print("[WSL]", line.rstrip())
+
+            threading.Thread(target=errors, daemon=True).start()
+            for line in process.stdout:
+                if stop.is_set():
+                    break
+                try:
+                    packet = json.loads(line)
+                    if packet.get("type") == "lio_trajectory":
+                        model.receive_packet(packet)
+                except (ValueError, AttributeError, KeyError):
+                    print("[WSL]", line.rstrip())
+            if not stop.is_set():
+                raise RuntimeError("Local WSL ROS subscription exited")
+        except Exception as exc:
+            with model.lock:
+                model.status = "LOCAL WSL ERROR: " + str(exc)
+                model.received = 0.0
+        finally:
+            self.close()  # EOF stops only our ROS subscriber.
+            with self.lock:
+                process = self.process
+            if process is not None:
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
 
 
 def ros_worker(model, stop):
@@ -201,6 +334,7 @@ def main():
     parser.add_argument("--mount", type=Path, help="Optional existing mid360s_mount.json")
     parser.add_argument("--max-points", type=int, default=6000, help="Bounded trajectory history")
     parser.add_argument("--save-preview", type=Path, help="Save synthetic preview and exit (requires --demo)")
+    parser.add_argument("--stream", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.max_points < 2:
         parser.error("--max-points must be >=2")
@@ -208,6 +342,9 @@ def main():
         parser.error("--save-preview requires --demo")
     if not args.demo:
         prepare_ros_environment()
+    if args.stream:
+        stream_local_ros(TrajectoryModel(args.mount, args.max_points))
+        return
     import matplotlib
     if args.save_preview:
         matplotlib.use("Agg")
@@ -220,8 +357,13 @@ def main():
     model = TrajectoryModel(args.mount, args.max_points)
     stop = threading.Event()
     worker = None
+    connection = LocalWslConnection(args.mount, args.max_points) if sys.platform == "win32" and not args.demo else None
     if not args.demo:
-        worker = threading.Thread(target=ros_worker, args=(model, stop), daemon=True)
+        if connection is not None:
+            # Transport timeout only; WSL still applies the original 50 ms source gate.
+            model.freshness_timeout = 0.25
+        worker = threading.Thread(target=connection.run if connection else ros_worker,
+                                  args=(model, stop), daemon=True)
         worker.start()
     try:
         fig = plt.figure(figsize=(11, 8))
@@ -245,7 +387,10 @@ def main():
         def reset_display(event):
             nonlocal started
             started = time.monotonic()
-            model.reset_origin()
+            if connection is not None:
+                connection.reset(model)
+            else:
+                model.reset_origin()
 
         button.on_clicked(reset_display)
 
@@ -291,8 +436,10 @@ def main():
             plt.show()
     finally:
         stop.set()
+        if connection is not None:
+            connection.close()
         if worker is not None:
-            worker.join(timeout=2)
+            worker.join(timeout=4)
 
 
 if __name__ == "__main__":
