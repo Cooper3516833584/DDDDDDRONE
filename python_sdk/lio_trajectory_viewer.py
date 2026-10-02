@@ -1,9 +1,7 @@
 """MID360S/FAST-LIO passive 3D viewer, relative to the first TRACKING sample.
 
-On the flight computer's graphical desktop/NoMachine terminal:
-  source /opt/ros/humble/setup.bash
-  source /home/fc/dddddrone/ros2_ws/install/setup.bash
-  python3 /home/fc/dddddrone/python_sdk/lio_trajectory_viewer.py
+On the flight computer's graphical desktop/NoMachine, run this file directly
+from VSCode. ROS2 Humble and the repository overlay are loaded automatically.
 
 Windows/local GUI preview without ROS: python lio_trajectory_viewer.py --demo
 This diagnostic origin is independent of Navigation calibration and authorization.
@@ -13,7 +11,10 @@ import argparse
 from collections import OrderedDict, deque
 import importlib.util
 import math
+import os
 from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 
@@ -29,6 +30,30 @@ def load_pose_code():
 
 
 POSE = load_pose_code()
+
+
+def prepare_ros_environment():
+    """Use system ROS Python and setup scripts regardless of VSCode's shell."""
+    if sys.platform != "linux" or os.environ.get("LIO_VIEWER_ROS_BOOTSTRAPPED") == "1":
+        return
+    setup = Path("/opt/ros/humble/setup.bash")
+    overlay = Path(__file__).resolve().parents[1] / "ros2_ws/install/setup.bash"
+    for required in (setup, overlay):
+        if not required.is_file():
+            raise RuntimeError(f"ROS environment missing: {required}; build ros2_ws first")
+    result = subprocess.run(
+        ["/bin/bash", "-c", 'source "$1" && source "$2" && env -0',
+         "lio-viewer", str(setup), str(overlay)],
+        check=True, capture_output=True, timeout=10,
+    )
+    environment = dict(os.environ)
+    for entry in result.stdout.split(b"\0"):
+        if b"=" in entry:
+            key, value = entry.split(b"=", 1)
+            environment[os.fsdecode(key)] = os.fsdecode(value)
+    environment["LIO_VIEWER_ROS_BOOTSTRAPPED"] = "1"
+    # Ubuntu ROS Humble bindings target system Python 3.10, not a VSCode venv.
+    os.execve("/usr/bin/python3", ["/usr/bin/python3", str(Path(__file__).resolve()), *sys.argv[1:]], environment)
 
 
 class TrajectoryModel:
@@ -181,6 +206,8 @@ def main():
         parser.error("--max-points must be >=2")
     if args.save_preview and not args.demo:
         parser.error("--save-preview requires --demo")
+    if not args.demo:
+        prepare_ros_environment()
     import matplotlib
     if args.save_preview:
         matplotlib.use("Agg")

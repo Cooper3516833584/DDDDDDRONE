@@ -67,3 +67,24 @@ def test_stale_pair_and_manual_reset_do_not_reuse_old_origin(tmp_path, monkeypat
     deliver(model, messages(2000000, (6, 6, 7)))
     assert model.snapshot()[2] == "STALE / CLOCK MISMATCH"
     assert model.snapshot()[1] == pytest.approx((0, 0, 0))
+
+
+def test_vscode_bootstrap_sources_ros_and_uses_system_python(monkeypatch):
+    monkeypatch.setattr(viewer.sys, "platform", "linux")
+    monkeypatch.delenv("LIO_VIEWER_ROS_BOOTSTRAPPED", raising=False)
+    monkeypatch.setattr(viewer.Path, "is_file", lambda path: True)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return NS(stdout=b"ROS_DISTRO=humble\0PYTHONPATH=/ros/python\0")
+
+    monkeypatch.setattr(viewer.subprocess, "run", run)
+    executed = []
+    monkeypatch.setattr(viewer.os, "execve", lambda executable, args, env: executed.append((executable, args, env)))
+    viewer.prepare_ros_environment()
+    assert calls[0][-2].replace("\\", "/") == "/opt/ros/humble/setup.bash"
+    assert calls[0][-1].replace("\\", "/").endswith("ros2_ws/install/setup.bash")
+    assert executed[0][0] == "/usr/bin/python3"
+    assert executed[0][2]["ROS_DISTRO"] == "humble"
+    assert executed[0][2]["LIO_VIEWER_ROS_BOOTSTRAPPED"] == "1"
