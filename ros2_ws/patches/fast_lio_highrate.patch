@@ -105,7 +105,7 @@ index f35378f..d001ede 100644
 +  if (dt > 0.0)
 +    kf_state.predict(dt, Q, in);
 diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
-index d441261..123ce63 100644
+index d441261..76896ff 100644
 --- a/src/laserMapping.cpp
 +++ b/src/laserMapping.cpp
 @@ -35,0 +36,3 @@
@@ -594,12 +594,23 @@ index d441261..123ce63 100644
 +                    }
 +                }
 +            }
-@@ -1074 +1474 @@ private:
+@@ -1068 +1468,9 @@ private:
+-            map_incremental();
++            if (laser_corrected)
++            {
++                map_incremental();
++            }
++            else
++            {
++                add_point_size = 0;
++                kdtree_incremental_time = 0.0;
++            }
+@@ -1074 +1482 @@ private:
 -            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
 +            if (scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
-@@ -1138,0 +1539 @@ private:
+@@ -1138,0 +1547 @@ private:
 +    rclcpp::CallbackGroup::SharedPtr imu_group_;
-@@ -1163 +1564,4 @@ int main(int argc, char** argv)
+@@ -1163 +1572,4 @@ int main(int argc, char** argv)
 -    rclcpp::spin(std::make_shared<LaserMappingNode>());
 +    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
 +    auto node = std::make_shared<LaserMappingNode>();
