@@ -143,15 +143,30 @@ class FC_Application(FC_Protocol):
         """
         t0 = time.perf_counter()
         time.sleep(1)  # 等待加速完成
-        while self.state.vel_z.value < z_speed_threshold:
-            time.sleep(0.1)
-            if timeout_s > 0 and time.perf_counter() - t0 > timeout_s:
-                logger.warning("[FC] wait for takeoff done timeout")
+        climb_seen = False
+        while True:
+            if not self.connected or not self.state.is_fresh(0.5) or not self.state.unlock.value:
+                logger.warning("[FC] takeoff confirmation lost fresh connected/unlocked feedback")
                 return False
-        if self.state.alt_add.value < 10:
-            logger.warning("[FC] takeoff failed, low altitude")
-            return False
+            altitude = self.state.alt_add.value
+            speed = self.state.vel_z.value
+            if timeout_s > 0 and time.perf_counter() - t0 >= timeout_s:
+                logger.warning(
+                    "[FC] wait for takeoff done timeout: alt_add={}cm, vel_z={}cm/s, climb_seen={}",
+                    altitude, speed, climb_seen,
+                )
+                return False
+            # 上升速度可能先于离地高度达标；不能在速度刚达标时判低高度失败。
+            climb_seen = climb_seen or speed >= z_speed_threshold
+            if climb_seen and altitude >= 10:
+                break
+            time.sleep(0.1)
         time.sleep(1)  # 等待机身高度稳定
+        if (not self.connected or not self.state.is_fresh(0.5) or
+                not self.state.unlock.value or self.state.alt_add.value < 10):
+            logger.warning("[FC] takeoff confirmation lost during settling: alt_add={}cm",
+                           self.state.alt_add.value)
+            return False
         self._action_log("wait ok", "takeoff done")
         return True
 

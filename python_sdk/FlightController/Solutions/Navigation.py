@@ -1955,7 +1955,7 @@ class Navigation(object):
                 "Flight-controller telemetry became stale while unlocking"
             )
         self.fc.take_off(30)
-        if not self.fc.wait_for_takeoff_done(timeout_s=5):
+        if not self.fc.wait_for_takeoff_done(timeout_s=8):
             raise RuntimeError(
                 "Flight controller did not confirm takeoff; "
                 "closed-loop navigation remains disabled"
