@@ -232,7 +232,9 @@ def restart_localization_for_task(fc, navigation, *, timeout=45):
                 _run_recovery_command(["ros2", "daemon", "stop"])
                 _assert_dds_released()
                 require_ground_restart(fc, navigation)
-                _run_recovery_command(["fastdds", "shm", "clean"])
+                # ROS Humble ships fastdds as a shell wrapper without a
+                # shebang on this image; invoke the wrapper through bash.
+                _run_recovery_command(["bash", shutil.which("fastdds"), "shm", "clean"])
                 _assert_dds_released()
                 for service in (DRIVER_SERVICE, FASTLIO_SERVICE):
                     require_ground_restart(fc, navigation)
