@@ -34,6 +34,7 @@ class FlightLogicTests(unittest.TestCase):
         self.fc.land.side_effect = lambda: self.events.append("emergency_land")
         self.navi = MagicMock()
         self.navi.fc = self.fc
+        self.navi.lio_pose.mount_reviewed = True
         self.navi.navigation_flag = False
         self.navi.keep_height_flag = False
         self.navi._velocity_override_active = False
@@ -145,6 +146,14 @@ class FlightLogicTests(unittest.TestCase):
         self.navi.pose_is_fresh.return_value = False
         self.assertEqual(self.run_flight(), 1)
         self.navi.pointing_takeoff.assert_not_called()
+
+    def test_unreviewed_mount_never_starts_navigation_or_restarts(self):
+        self.navi.lio_pose.mount_reviewed = False
+        self.assertEqual(self.run_flight(), 1)
+        self.navi.start.assert_not_called()
+        self.restart.assert_not_called()
+        self.navi.pointing_takeoff.assert_not_called()
+        self.ros_runner.stop.assert_not_called()
 
     def test_height_failure_stops_and_lands_before_any_waypoint(self):
         self.navi.wait_for_height.return_value = False

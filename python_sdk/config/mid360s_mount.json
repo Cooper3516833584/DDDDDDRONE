@@ -1,0 +1,5 @@
+{
+  "note": "fc-ubuntu aircraft: LiDAR and body axes aligned; LiDAR origin is on the body centreline above the control origin. Vertical distance measured and confirmed by the user on 2026-10-03.",
+  "radar_height_above_body_origin_m": 0.15,
+  "reviewed": true
+}

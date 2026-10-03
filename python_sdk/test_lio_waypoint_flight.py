@@ -180,6 +180,13 @@ def main(argv=None):
         if not fc.connected or fc.state.unlock.value:
             raise RuntimeError("Connected disarmed aircraft is required before preparation")
         navi = Navigation(fc=fc, stop_event=stop_event)
+        if not navi.lio_pose.mount_reviewed:
+            mount_path = Path(__file__).resolve().parent / "config" / "mid360s_mount.json"
+            raise RuntimeError(
+                "机体安装外参缺失或未复核：{}。需要实测的雷达原点到机体控制原点"
+                "竖直距离（radar_height_above_body_origin_m，单位米），或完整 T_I_B，"
+                "并确认 reviewed: true；不可直接使用空模板或猜测值。".format(mount_path)
+            )
         ros_runner = RosNodeRunner()
         mission = Mission(fc, navi, stop_event)
         mission.prepare(args.pose_timeout)
