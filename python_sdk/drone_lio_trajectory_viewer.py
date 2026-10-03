@@ -6,7 +6,9 @@ available from fastlio_control and use the existing task FC/Navigation objects.
 
 import sys
 
-from fastlio_control import restart_fastlio_for_task, restart_and_calibrate_fastlio
+from fastlio_control import (
+    restart_fastlio_for_task, restart_and_calibrate_fastlio, restart_localization_for_task,
+)
 from lio_trajectory_viewer import main
 
 

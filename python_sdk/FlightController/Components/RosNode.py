@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import math
 import multiprocessing
 import threading
@@ -270,6 +271,88 @@ class RosNodeRunner:  # run all the listen nodes
         self._excuter.shutdown()
         self._thread.join()
         logger.info("[ROS] Executor stopped")
+
+    def validate_localization_recovery(self, listener):
+        """Refuse a context reset if it would destroy another ROS consumer.
+
+        Call from the task orchestration thread, never a ROS callback. The task
+        must serialize ROS node creation with recovery. Humble has no public
+        context node registry, so also inspect live Python Node objects, not
+        just this runner's registered nodes.
+        """
+        from rclpy.exceptions import InvalidHandle
+
+        if not isinstance(listener, LioListenNode):
+            raise RuntimeError("Recovery requires the task's LioListenNode")
+        if self._excuter is None or self._thread is None:
+            raise RuntimeError("ROS release was incomplete; restart the task process")
+        if (self._running_nodes != [listener] or _nodes_to_run != [listener] or
+                self._excuter.get_nodes() != [listener]):
+            raise RuntimeError("Close other task ROS nodes before DDS recovery")
+        pool = getattr(self._excuter, "_executor", None)
+        if (threading.current_thread() is self._thread or
+                threading.current_thread() in getattr(pool, "_threads", ())):
+            raise RuntimeError("DDS recovery cannot run in a ROS callback")
+        if listener.context is not rclpy.get_default_context():
+            raise RuntimeError("Unexpected LIO ROS context")
+        for node in gc.get_objects():
+            try:
+                is_node = isinstance(node, Node)
+            except ReferenceError:
+                continue  # A dead weak proxy is not a live ROS owner.
+            if not is_node or node is listener:
+                continue
+            try:
+                with node.handle:
+                    name = node.get_name()
+            except InvalidHandle:
+                continue
+            raise RuntimeError("Close other ROS node before DDS recovery: " + name)
+
+    def release_localization_context(self, listener, timeout=5):
+        """Drain callbacks before releasing the sole task DDS participant.
+
+        A timeout leaves recovery failed; callers must not clean SHM or claim
+        success. This method sends no FC commands and never resumes control.
+        """
+        self.validate_localization_recovery(listener)
+        self._recovery_domain = listener.context.get_domain_id()
+        if self._excuter.shutdown(timeout_sec=timeout) is False:
+            raise RuntimeError("ROS callbacks did not stop before DDS recovery")
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise RuntimeError("ROS executor did not stop before DDS recovery")
+        # Humble Executor.shutdown does not join the Python worker pool.
+        pool = getattr(self._excuter, "_executor", None)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+            for worker in tuple(pool._threads):
+                worker.join(timeout=timeout)
+                if worker.is_alive():
+                    raise RuntimeError("ROS worker did not stop before DDS recovery")
+        context = listener.context
+        listener.destroy_node()
+        _nodes_to_run.remove(listener)
+        self._running_nodes.clear()
+        self._excuter = None
+        self._thread = None
+        rclpy.shutdown()
+        context.destroy()
+        self._localization_released = True
+
+    def restore_localization_context(self, odometry_callback, health_callback, imu_callback):
+        """Create a new context, executor and listener after a completed release."""
+        if not getattr(self, "_localization_released", False):
+            raise RuntimeError("Task ROS context was not completely released")
+        if rclpy.ok() or _nodes_to_run:
+            raise RuntimeError("Another ROS owner appeared during DDS recovery")
+        rclpy.init(domain_id=self._recovery_domain)
+        self._excuter = rclpy.executors.MultiThreadedExecutor()
+        self._thread = threading.Thread(target=self._excuter.spin, daemon=True)
+        listener = LioListenNode(odometry_callback, health_callback, imu_callback)
+        self.add_nodes().run()
+        self._localization_released = False
+        return listener
 
 
 class LaserScanPubNode(Node):
