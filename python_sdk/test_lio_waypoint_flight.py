@@ -2,7 +2,7 @@
 
 在机载 Linux 上运行，复用已运行的 server_ros.py / FC_Server：
     cd python_sdk
-    python3 test_lio_waypoint_flight.py --confirm-flight
+    python3 test_lio_waypoint_flight.py
 
 流程：未解锁时重启 MID360S driver、FAST-LIO 和任务 DDS 上下文，等待
 新地图有效位姿及静止原点校准，再定点起飞到 100 cm，依次飞往
@@ -13,12 +13,13 @@
 
 需要已复核的 mid360s_mount.json、ROS 环境和现有非交互服务重启权限。
 运行前关闭其他使用定位 DDS 的任务、viewer 和 ROS 工具，并确认现场
-飞行条件；无需关闭只持有飞控串口的 FC_Server。未传 --confirm-flight
-时不连接飞控、不重启定位、不解锁。
+飞行条件；无需关闭只持有飞控串口的 FC_Server。
+直接运行本文件（包括 VS Code 运行按钮）就会执行真实飞行流程。
 """
 
 import argparse
 import math
+from pathlib import Path
 import sys
 import threading
 import time
@@ -42,7 +43,6 @@ def positive_timeout(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="MID360S 重启建图后 1 m 逐点飞行测试")
-    parser.add_argument("--confirm-flight", action="store_true", help="确认执行真实飞行")
     parser.add_argument("--host", default="127.0.0.1", help="本机 FC_Server 地址")
     parser.add_argument("--port", type=int, default=5654)
     parser.add_argument("--authkey", default="fc")
@@ -50,6 +50,29 @@ def parse_args(argv=None):
     parser.add_argument("--pose-timeout", type=positive_timeout, default=45.0,
                         help="重启完成后等待新地图静止校准的超时 / s")
     return parser.parse_args(argv)
+
+
+def require_local_fc_server(host, port):
+    """只读检查本机 IPv4 监听表，不建立会占用 FC_Server 的探测连接。"""
+    if host not in ("127.0.0.1", "localhost"):
+        return
+    try:
+        rows = Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]
+    except OSError as exc:
+        raise RuntimeError("无法读取本机 FC_Server 监听状态：{}".format(exc)) from exc
+    for row in rows:
+        fields = row.split()
+        if len(fields) < 4 or fields[3] != "0A":  # TCP_LISTEN
+            continue
+        address, port_hex = fields[1].split(":")
+        if address in ("00000000", "0100007F") and int(port_hex, 16) == port:
+            return
+    raise RuntimeError(
+        "FC_Server 未监听 {}:{}。请在另一终端先运行：python3 {}，"
+        "保持该终端运行，再点击本任务的运行按钮。".format(
+            host, port, Path(__file__).resolve().with_name("server_ros.py")
+        )
+    )
 
 
 class Mission:
@@ -128,14 +151,16 @@ def emergency_land(fc):
 def main(argv=None):
     global logger
     args = parse_args(argv)
-    if not args.confirm_flight:
-        print("此脚本会重启定位并执行真实飞行；确认现场条件后添加 --confirm-flight。")
-        return 2
     if sys.platform != "linux":
         print("请在机载 Linux 上运行，使用本机 FC_Server 和定位服务。")
         return 2
+    try:
+        require_local_fc_server(args.host, args.port)
+    except RuntimeError as exc:
+        print("[TEST] {}".format(exc))
+        return 1
 
-    # 延迟硬件/ROS 导入，帮助信息和未确认模式无需这些依赖。
+    # 延迟硬件/ROS 导入，帮助信息和平台检查无需这些依赖。
     from loguru import logger
     from FlightController import FC_Client
     from FlightController.Components.RosNode import RosNodeRunner

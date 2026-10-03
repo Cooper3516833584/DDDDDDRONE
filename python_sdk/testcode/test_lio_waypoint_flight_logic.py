@@ -67,6 +67,7 @@ class FlightLogicTests(unittest.TestCase):
                                     "loguru": loguru}),
             patch.object(task.sys, "platform", "linux"),
             patch.object(task, "restart_localization_for_task", self.restart),
+            patch.object(task, "require_local_fc_server"),
             patch.object(task.time, "sleep", lambda seconds: None),
         ):
             context.start()
@@ -95,7 +96,7 @@ class FlightLogicTests(unittest.TestCase):
         return True
 
     def run_flight(self):
-        return task.main(["--confirm-flight"])
+        return task.main([])
 
     def test_successful_route_and_height(self):
         self.assertEqual(self.run_flight(), 0)
@@ -108,10 +109,19 @@ class FlightLogicTests(unittest.TestCase):
         self.navi.pointing_landing.assert_called_once_with((0.0, 0.0))
         self.fc.land.assert_not_called()
 
-    def test_no_confirmation_never_connects(self):
-        self.assertEqual(task.main([]), 2)
+    def test_help_never_connects(self):
+        with self.assertRaises(SystemExit) as result:
+            task.main(["--help"])
+        self.assertEqual(result.exception.code, 0)
         self.fc.connect.assert_not_called()
         self.restart.assert_not_called()
+
+    def test_missing_server_never_connects_or_restarts(self):
+        task.require_local_fc_server.side_effect = RuntimeError("FC_Server 未监听")
+        self.assertEqual(self.run_flight(), 1)
+        self.fc.connect.assert_not_called()
+        self.restart.assert_not_called()
+        self.navigation_factory.assert_not_called()
 
     def test_prearmed_aircraft_is_not_taken_over(self):
         self.fc.state.unlock.value = True
@@ -169,6 +179,24 @@ class FlightLogicTests(unittest.TestCase):
         self.assertEqual(self.run_flight(), 1)
         self.assertEqual(self.fc.land.call_count, 2)
         self.fc.lock.assert_not_called()
+
+
+class ListenerCheckTests(unittest.TestCase):
+    def test_expected_loopback_listener(self):
+        with patch.object(task.Path, "read_text", return_value="header\n0: 0100007F:1616 00000000:0000 0A"):
+            task.require_local_fc_server("127.0.0.1", 5654)
+
+    def test_wildcard_listener(self):
+        with patch.object(task.Path, "read_text", return_value="header\n0: 00000000:1616 00000000:0000 0A"):
+            task.require_local_fc_server("localhost", 5654)
+
+    def test_other_port_address_or_connected_socket_is_not_server(self):
+        for row in ("0: 0100007F:1617 00000000:0000 0A",
+                    "0: 0200007F:1616 00000000:0000 0A",
+                    "0: 0100007F:1616 00000000:0000 01"):
+            with self.subTest(row=row), patch.object(task.Path, "read_text", return_value="header\n" + row):
+                with self.assertRaisesRegex(RuntimeError, "FC_Server 未监听"):
+                    task.require_local_fc_server("127.0.0.1", 5654)
 
 
 if __name__ == "__main__":
