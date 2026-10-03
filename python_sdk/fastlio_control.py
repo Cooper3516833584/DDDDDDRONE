@@ -159,21 +159,31 @@ def _run_recovery_command(command, timeout=15):
     return result.stdout
 
 
-def _assert_dds_released():
+def _assert_dds_released(*, timeout=0, ground_check=None):
     """Read-only, host-wide ownership audit before the official SHM cleaner.
 
     Other users' /proc maps require privilege. Do not kill unowned processes or
     blindly remove /dev/shm files. The task may retain loaded libraries after
     context shutdown, but must no longer map any DDS shared memory itself.
+    A bounded wait allows a stopped daemon to finish exiting. Every retry must
+    pass the same ownership audit; the optional ground guard runs before each.
     """
     audit = Path(__file__).with_name("localization_dds_audit.py")
     command = ["/usr/bin/python3", str(audit), "--released-task-pid", str(os.getpid())]
     if os.geteuid() != 0:
         command = ["sudo", "-n", *command]
-    report = json.loads(_run_recovery_command(command))
-    if report["owners"] or report["unreadable"]:
-        raise RuntimeError("DDS users remain; close them before retrying recovery: " +
-                           json.dumps(report, ensure_ascii=False))
+    deadline = time.monotonic() + timeout
+    while True:
+        if ground_check is not None:
+            ground_check()
+        report = json.loads(_run_recovery_command(command))
+        if not report["owners"] and not report["unreadable"]:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("DDS users remain; close them before retrying recovery: " +
+                               json.dumps(report, ensure_ascii=False))
+        time.sleep(min(0.1, remaining))
 
 
 def _localization_runner():
@@ -230,7 +240,8 @@ def restart_localization_for_task(fc, navigation, *, timeout=45):
                         raise RuntimeError("Localization service did not stop: " + service)
                 require_ground_restart(fc, navigation)
                 _run_recovery_command(["ros2", "daemon", "stop"])
-                _assert_dds_released()
+                _assert_dds_released(
+                    timeout=5, ground_check=lambda: require_ground_restart(fc, navigation))
                 require_ground_restart(fc, navigation)
                 # ROS Humble ships fastdds as a shell wrapper without a
                 # shebang on this image; invoke the wrapper through bash.

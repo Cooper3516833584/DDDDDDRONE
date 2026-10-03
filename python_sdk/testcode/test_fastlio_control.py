@@ -1,5 +1,7 @@
 """Service restart tests with stub FC/navigation/systemctl; no hardware."""
 import importlib.util
+import json
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -80,3 +82,139 @@ def test_timeout_revokes_any_partial_calibration(monkeypatch):
     with pytest.raises(RuntimeError, match="timed out"):
         control.restart_and_calibrate_fastlio(fc, nav, timeout=0.1)
     assert events[-1] == "invalidate"
+
+
+def setup_dds_audit(monkeypatch, report):
+    clock = NS(now=0.0)
+    commands = []
+    monkeypatch.setattr(control.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(control.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(control.time, "sleep", lambda seconds: setattr(clock, "now", clock.now + seconds))
+
+    def run(command):
+        commands.append(command)
+        return json.dumps(report())
+
+    monkeypatch.setattr(control, "_run_recovery_command", run)
+    return clock, commands
+
+
+def test_dds_wait_allows_exiting_owner_but_requires_empty_audit(monkeypatch):
+    reports = iter([
+        {"owners": [{"pid": 1395, "name": "python3"}], "unreadable": []},
+        {"owners": [{"pid": 1395, "name": "python3"}], "unreadable": []},
+        {"owners": [], "unreadable": []},
+    ])
+    clock, commands = setup_dds_audit(monkeypatch, lambda: next(reports))
+    guard_calls = []
+    control._assert_dds_released(timeout=5, ground_check=lambda: guard_calls.append(clock.now))
+    assert len(commands) == len(guard_calls) == 3
+    assert clock.now == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("report", [
+    {"owners": [{"pid": 1395, "name": "python3"}], "unreadable": []},
+    {"owners": [], "unreadable": [1395]},
+])
+def test_dds_wait_persistent_or_unreadable_owner_still_fails(monkeypatch, report):
+    clock, commands = setup_dds_audit(monkeypatch, lambda: report)
+    with pytest.raises(RuntimeError, match="DDS users remain.*1395"):
+        control._assert_dds_released(timeout=0.25)
+    assert clock.now == pytest.approx(0.25)
+    assert len(commands) == 4
+
+
+def test_default_dds_audit_remains_immediate(monkeypatch):
+    clock, commands = setup_dds_audit(
+        monkeypatch, lambda: {"owners": [{"pid": 1395}], "unreadable": []})
+    with pytest.raises(RuntimeError, match="DDS users remain"):
+        control._assert_dds_released()
+    assert clock.now == 0 and len(commands) == 1
+
+
+@pytest.mark.parametrize("failure", ["armed", "stale", "disconnected", "stopped"])
+def test_dds_wait_aborts_if_ground_guard_changes(monkeypatch, failure):
+    fc, nav, _ = setup_task(monkeypatch)
+    _, commands = setup_dds_audit(
+        monkeypatch, lambda: {"owners": [{"pid": 1395}], "unreadable": []})
+    checks = []
+
+    def guard():
+        if checks:
+            if failure == "armed": fc.state.unlock.value = True
+            if failure == "stale": fc.state.is_fresh = lambda age: False
+            if failure == "disconnected": fc.connected = False
+            if failure == "stopped": nav.stop_event = NS(is_set=lambda: True)
+        checks.append(True)
+        control.require_ground_restart(fc, nav)
+
+    with pytest.raises(RuntimeError):
+        control._assert_dds_released(timeout=5, ground_check=guard)
+    assert len(checks) == 2 and len(commands) == 1
+
+
+def test_dds_audit_command_failure_is_not_retried(monkeypatch):
+    _, commands = setup_dds_audit(monkeypatch, lambda: {})
+
+    def fail(command):
+        commands.append(command)
+        raise RuntimeError("audit permission denied")
+
+    monkeypatch.setattr(control, "_run_recovery_command", fail)
+    with pytest.raises(RuntimeError, match="audit permission denied"):
+        control._assert_dds_released(timeout=5)
+    assert len(commands) == 1
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_full_recovery_cannot_clean_or_start_before_dds_release(monkeypatch, persistent):
+    fc, nav, events = setup_task(monkeypatch)
+    count = NS(audits=0, stopped=False)
+
+    def report():
+        count.audits += 1
+        blocked = persistent or count.audits == 1
+        return {"owners": [{"pid": 1395}] if blocked else [], "unreadable": []}
+
+    _, commands = setup_dds_audit(monkeypatch, report)
+    audit_run = control._run_recovery_command
+
+    def recovery_command(command):
+        if "--released-task-pid" in command:
+            return audit_run(command)
+        events.append(tuple(command))
+        return ""
+
+    def systemctl(*args, **kwargs):
+        events.append(args)
+        if args[0] == "stop": count.stopped = True
+
+    def identity(service):
+        started = ("start", service) in events
+        active = not count.stopped or started
+        return dict(ActiveState="active" if active else "inactive",
+                    MainPID="2" if started else "1" if active else "0",
+                    InvocationID="new" if started else "old")
+
+    runner = NS(validate_localization_recovery=lambda listener: None,
+                release_localization_context=lambda listener: events.append("release"),
+                restore_localization_context=lambda *callbacks: events.append("restore") or object())
+    nav.lio_pose.on_odometry = nav.lio_pose.on_health = nav.lio_pose.on_imu = lambda msg: None
+    monkeypatch.setattr(control, "_dds_recovery_lock", nullcontext)
+    monkeypatch.setattr(control, "_localization_runner", lambda: runner)
+    monkeypatch.setattr(control, "_service_identity", identity)
+    monkeypatch.setattr(control, "_systemctl", systemctl)
+    monkeypatch.setattr(control, "_run_recovery_command", recovery_command)
+    monkeypatch.setattr(control.shutil, "which", lambda tool: "/usr/bin/" + tool)
+    if persistent:
+        with pytest.raises(RuntimeError, match="DDS users remain"):
+            control.restart_localization_for_task(fc, nav)
+        assert not any(isinstance(e, tuple) and e[0] in ("start", "bash") for e in events)
+        assert "calibrate" not in events and events[-2:] == ["invalidate", "restore"]
+    else:
+        result = control.restart_localization_for_task(fc, nav)
+        assert not result["needs_calibration"] and result["dds_rebuilt"]
+        assert len(commands) == 3  # Two before SHM clean, one after.
+        cleaner = ("bash", "/usr/bin/fastdds", "shm", "clean")
+        assert events.index(cleaner) < events.index(("start", control.DRIVER_SERVICE))
+        assert events.index(("start", control.FASTLIO_SERVICE)) < events.index("calibrate")
