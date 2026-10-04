@@ -51,3 +51,31 @@ active，图中可发现五个必需话题，但新建被动订阅器在 6 秒�
 
 此结论针对本次“雷达 UDP 存在但新 ROS 订阅无数据”。它不能解释或排除
 此前飞行抖动、降落偏移、动力不足或糊味的其他原因；此次没有飞行验收。
+
+## 部署后的验证
+
+代码修复提交 `0b011ad` 已推送 GitHub，并在飞机通过 `git pull --ff-only`
+快进同步。开发机和机载 Python 均通过 98 项逻辑测试，开发机额外报告
+3 项子测试通过；Python 编译检查、安装器 `bash -n` 和 diff 检查通过。
+未修改 `python_sdk/FlightController/**`。
+
+12:13:41 安装 drop-in 后，logind PID 627 日志确认 `Config file reloaded.`。
+原配置不存在，备份目录为 `/var/backups/robocup-ipc-PP6mAGEl`，内有
+`previously-absent` 标记。FC bridge PID 967、驱动主 PID 945、FAST-LIO
+主 PID 960 的 PID 和 InvocationID 均保持不变；没有重启这些服务。
+
+12:13:42 最后 SSH 会话 25 退出；新的独立样本 PID 4001 从
+12:13:42.232995 到 12:14:09.260088，共 28 次采样全部 exists=true、nlink=1，
+覆盖原先约 10 秒后的清理时间。样本退出时自行删除文件，随后确认无样本
+残留，也没有加载中的诊断临时单元。这验证了配置已在当前运行的 logind
+中生效，无需重启 logind 或飞机。
+
+新代码的 6 秒被动 ROS 检查仍报告五个话题零消息、ready=false：修复前
+已经 unlinked 的两个雷达节点映射仍然存在，配置无法把这些旧映射恢复。
+启动恢复的完整实机路径尚未运行；需要在安全地面条件下另行受控重启
+server/定位服务完成验证。没有执行真实飞行或任何 FC 控制命令。
+
+设备配置回退：因原 drop-in 不存在，只需移除
+`/etc/systemd/logind.conf.d/99-robocup-ipc.conf`，再按 README 的 SIGHUP
+命令重读。代码回退需在开发机 Git 中 revert 修复提交并推送，再让设备
+`git pull --ff-only`；不得在设备直接编辑代码或强制回退工作树。
