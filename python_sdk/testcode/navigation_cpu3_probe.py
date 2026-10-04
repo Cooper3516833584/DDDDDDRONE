@@ -116,6 +116,16 @@ def main():
             sink.state.unlock.value = True
             nav.set_navigation_state(True)
             nav.navi_x_pid.setpoint = 10
+            pid_start = time.monotonic()
+            while not (all(pid.auto_mode for pid in
+                           (nav.navi_x_pid, nav.navi_y_pid, nav.yaw_pid))
+                       and counters["nonzero_horizontal_frames"] > before_nonzero):
+                if time.monotonic() - pid_start > 0.2:
+                    raise RuntimeError("Navigation did not start producing simulated PID output")
+                sink.state.update_event.set()
+                time.sleep(0.001)
+            result["pid_startup_ms"] = (time.monotonic() - pid_start) * 1000
+            before_nonzero = counters["nonzero_horizontal_frames"]
             checks = Counter()
             callback_counts = Counter()
             last_received = {}
@@ -177,7 +187,7 @@ def main():
             and r["checks"]["affinity_cpu3"] == r["checks"]["samples"]
             and r["checks"]["scheduled_cpu3"] == r["checks"]["samples"]
             and r["checks"]["navigation_enabled"] == r["checks"]["samples"]
-            and r["checks"]["pids_enabled"] >= r["checks"]["samples"] - 1
+            and r["checks"]["pids_enabled"] == r["checks"]["samples"]
             and r["nonzero_horizontal_frames"] > r["seconds"] * 50
             and r["max_nonzero_control_gap_ms"] < 100
             and all(190 < hz < 210 for hz in r["callback_hz"].values())
