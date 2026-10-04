@@ -56,7 +56,24 @@ def main():
             result = {"tid": tid, "affinity": sorted(os.sched_getaffinity(tid))}
             if result["affinity"] != [3]:
                 raise RuntimeError("Navigation affinity is not CPU3")
-            nav.calibrate_basepoint(wait=True)
+            # Wait longer in this diagnostic, retaining the production IMU,
+            # mount, health and calibration gates unchanged.
+            calibration_deadline = time.monotonic() + 25
+            while True:
+                sink.state.update_event.set()
+                try:
+                    nav.calibrate_basepoint(wait=False)
+                    break
+                except RuntimeError as exc:
+                    if time.monotonic() >= calibration_deadline:
+                        result.update(calibration_error=str(exc),
+                                      stationary_ready=nav.lio_pose._stationary_ready,
+                                      lost_latched=nav.lio_pose._lost_latched)
+                        report["rounds"].append(result)
+                        report["passed"] = False
+                        print(json.dumps(report, indent=2))
+                        return 1
+                    time.sleep(0.05)
             # These fields belong exclusively to the simulated FC object.
             sink.state.unlock.value = True
             nav.set_navigation_state(True)
