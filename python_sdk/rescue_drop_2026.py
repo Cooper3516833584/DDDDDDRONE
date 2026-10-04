@@ -1,11 +1,11 @@
 """2026 空地协同救援物资投放赛无人机主入口。
 
 默认仅连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
-视觉与避障接口实现、投放数量、继电器端口和终端 ``start_mission`` 指令。
+避障接口实现、投放数量、继电器端口和终端 ``start_mission`` 指令。
 运行前确认 server_ros.py / FC_Server 未运行，避免抢占飞控串口。
 
 导航坐标单位为 cm，x 向前、y 向左；高度单位为 cm。
-本文件中的视觉、避障 TODO 未完成时会在连接硬件前拒绝飞行。
+本文件中的避障 TODO 未完成时会在连接硬件前拒绝飞行。
 """
 
 import argparse
@@ -52,6 +52,19 @@ TARGET_LOSS_WAIT = 2.0
 LOW_CALIBRATION_TIMEOUT = 6.0
 MISSION_TIMEOUT = 20.0 * 60.0
 
+# 投放目标相机与识别：下视相机 + FlightController/Solutions/models/robocup_target.pt。
+# 相机索引、分辨率和 fps 需要在机载实机上确认后再定稿。
+TARGET_CAMERA_INDEX = 1
+TARGET_CAMERA_WIDTH = 1920
+TARGET_CAMERA_HEIGHT = 1080
+TARGET_CAMERA_FPS = 30
+TARGET_DETECT_CONF = 0.35       # 与 robocup_target 权重配套的置信度阈值
+TARGET_DETECT_IMGSZ = 640
+TARGET_MAX_NEW_TRACKS = 8       # 单帧最多新建几个目标身份
+TARGET_TRACK_GATE_RATIO = 0.15  # 关联门限 = 该比例 × 画面短边
+TARGET_TRACK_TIMEOUT_S = 0.6    # 连续多久没再看到就丢弃该身份
+TARGET_CAMERA_READ_FAILURES = 10  # 连续读帧失败达到该次数即判定相机失效
+
 FREE_DROP_COUNT = 4
 MANDATORY_DROP_COUNT = 1
 TOTAL_DROP_COUNT = FREE_DROP_COUNT + MANDATORY_DROP_COUNT
@@ -93,20 +106,144 @@ class RouteProjection:
     distance_squared: float
 
 
-class VisionInterface:
-    """TODO：在此文件接入相机、颜色目标识别和目标身份跟踪。"""
+@dataclass
+class _TargetTrack:
+    """一次持续跟踪中的目标身份；仅本文件内部使用。"""
 
-    IMPLEMENTED = False
+    color: str
+    center: Tuple[float, float]
+    offset_x_px: float
+    offset_y_px: float
+    updated_at: float
+
+
+class VisionInterface:
+    """下视相机 + robocup_target 检测 + 目标身份跟踪。
+
+    poll() 抓一帧、识别四色同心目标，并把同一物理目标在连续帧之间关联到稳定的
+    target_id（形如 "red-3"），使 Mission._observation(target_id=...) 能持续锁定同一目标。
+    偏移定义与 TargetObservation 一致：+x 向前（画面正上）、+y 向左（画面正左）。
+
+    约束：open() 之前不打开相机；poll() 只抓帧和推理，不阻塞等待、不发飞控命令；
+    相机句柄与身份表只由视觉线程使用，close() 由任务停止流程调用。
+    """
+
+    IMPLEMENTED = True
+
+    def __init__(self) -> None:
+        self._camera = None
+        self._detector = None
+        self._frame_size: Tuple[int, int] = (0, 0)
+        self._tracks: Dict[str, _TargetTrack] = {}
+        self._next_track_id = 1
+        self._read_failures = 0
 
     def open(self) -> None:
-        raise NotImplementedError("TODO: open the target-detection camera")
+        if self._camera is not None:
+            return
+        # 惰性导入：Vision.py 会连带引入 scipy / pupil_apriltags，放在这里可以让本文件
+        # 在 import 阶段不依赖这些可选库；相机打不开时在起飞前就抛错。
+        import cv2
 
-    def poll(self) -> Sequence[TargetObservation]:
-        """快速返回最新观测；不得向飞控发送命令或长时间阻塞。"""
-        raise NotImplementedError("TODO: detect free and mandatory targets")
+        from FlightController.Solutions.Vision import change_cam_resolution, open_camera
+        from robocup_target_detector import RobocupTargetDetector
+
+        try:
+            camera, index = open_camera(TARGET_CAMERA_INDEX, TARGET_CAMERA_INDEX + 1)
+        except Exception as exc:
+            raise RuntimeError("无法打开投放目标相机 index={}".format(
+                TARGET_CAMERA_INDEX)) from exc
+        width, height, fps = change_cam_resolution(
+            camera, TARGET_CAMERA_WIDTH, TARGET_CAMERA_HEIGHT, TARGET_CAMERA_FPS)
+        try:
+            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 只留最新帧，降低视觉链路延迟
+        except Exception:
+            logger.debug("[RESCUE] Target camera buffer size is not adjustable")
+        self._camera = camera
+        self._frame_size = (int(width), int(height))
+        self._detector = RobocupTargetDetector(confThreshold=TARGET_DETECT_CONF,
+                                              imgsz=TARGET_DETECT_IMGSZ)
+        logger.info("[RESCUE] Target camera index={} ready: {:.0f}x{:.0f}@{:.0f}",
+                    index, width, height, fps)
 
     def close(self) -> None:
-        pass
+        camera, self._camera = self._camera, None
+        self._detector = None
+        self._tracks.clear()
+        if camera is not None:
+            try:
+                camera.release()
+            except Exception:
+                logger.exception("[RESCUE] Failed to release target camera")
+
+    def poll(self) -> Sequence[TargetObservation]:
+        """抓一帧、检测并更新身份；返回本帧真正看到的目标观测。
+
+        连续读帧失败达到阈值时抛错，交给 Mission 的停止/降落流程处理；
+        没有目标时返回空序列（不是 None）。
+        """
+        camera = self._camera
+        detector = self._detector
+        if camera is None or detector is None:
+            raise RuntimeError("target camera is not open")
+        ok, frame = camera.read()
+        if not ok or frame is None:
+            self._read_failures += 1
+            if self._read_failures >= TARGET_CAMERA_READ_FAILURES:
+                raise RuntimeError("target camera read failed {} times".format(
+                    self._read_failures))
+            return ()
+        self._read_failures = 0
+        return self._track(detector.detect(frame), time.monotonic())
+
+    def _track(self, detections, now: float) -> Sequence[TargetObservation]:
+        """把本帧检测关联到已有身份；关联不上就分配新身份，超时身份丢弃。"""
+        for target_id in [tid for tid, track in self._tracks.items()
+                          if now - track.updated_at > TARGET_TRACK_TIMEOUT_S]:
+            del self._tracks[target_id]
+
+        gate = TARGET_TRACK_GATE_RATIO * max(1, min(self._frame_size))
+        pending = list(range(len(detections)))
+        seen: Dict[str, _TargetTrack] = {}
+
+        # 同颜色里取最近的检测做关联；已配对的检测不再参与后面的匹配。
+        for target_id, track in self._tracks.items():
+            best_index, best_distance = None, None
+            for index in pending:
+                detection = detections[index]
+                if detection.color != track.color:
+                    continue
+                distance = math.hypot(detection.center[0] - track.center[0],
+                                      detection.center[1] - track.center[1])
+                if distance > gate:
+                    continue
+                if best_distance is None or distance < best_distance:
+                    best_index, best_distance = index, distance
+            if best_index is not None:
+                pending.remove(best_index)
+                seen[target_id] = self._make_track(detections[best_index], now)
+
+        # 没关联上的检测是新目标，分配新身份（单帧新建数量有上限）。
+        for index in pending[:TARGET_MAX_NEW_TRACKS]:
+            target_id = "{}-{}".format(detections[index].color, self._next_track_id)
+            self._next_track_id += 1
+            seen[target_id] = self._make_track(detections[index], now)
+
+        self._tracks.update(seen)
+        return tuple(TargetObservation(target_id=target_id,
+                                       color=track.color,
+                                       offset_x_px=track.offset_x_px,
+                                       offset_y_px=track.offset_y_px,
+                                       captured_at=track.updated_at)
+                     for target_id, track in seen.items())
+
+    @staticmethod
+    def _make_track(detection, now: float) -> _TargetTrack:
+        return _TargetTrack(color=detection.color,
+                            center=(float(detection.center[0]), float(detection.center[1])),
+                            offset_x_px=float(detection.offset_x_px),
+                            offset_y_px=float(detection.offset_y_px),
+                            updated_at=now)
 
 
 class ObstacleInterface:
