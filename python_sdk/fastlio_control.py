@@ -191,6 +191,44 @@ def _localization_runner():
     return RosNodeRunner()
 
 
+def _rebuild_localization_services(before, ground_check):
+    """Shared ground-guarded rebuild; caller holds the process recovery lock.
+
+    Caller must release its ROS context and serialize flight actions first.
+    No subscriptions, calibration, FC commands or automatic control resume.
+    """
+    ground_check()
+    for tool in ("ros2", "fastdds", "systemctl"):
+        if shutil.which(tool) is None:
+            raise RuntimeError("Missing recovery tool; source ROS environment: " + tool)
+    _systemctl("stop", FASTLIO_SERVICE, DRIVER_SERVICE, privileged=True, timeout=45)
+    for service in (DRIVER_SERVICE, FASTLIO_SERVICE):
+        stopped = _service_identity(service)
+        if (stopped.get("ActiveState") not in ("inactive", "failed") or
+                int(stopped.get("MainPID", "0")) != 0):
+            raise RuntimeError("Localization service did not stop: " + service)
+    ground_check()
+    _run_recovery_command(["ros2", "daemon", "stop"])
+    _assert_dds_released(
+        timeout=5, ground_check=ground_check)
+    ground_check()
+    # ROS Humble ships fastdds as a shell wrapper without a
+    # shebang on this image; invoke the wrapper through bash.
+    _run_recovery_command(["bash", shutil.which("fastdds"), "shm", "clean"])
+    _assert_dds_released()
+    for service in (DRIVER_SERVICE, FASTLIO_SERVICE):
+        ground_check()
+        _systemctl("start", service, privileged=True, timeout=30)
+    identities = {s: _service_identity(s) for s in before}
+    for service, identity in identities.items():
+        if (identity.get("ActiveState") != "active" or
+                int(identity.get("MainPID", "0")) <= 0 or
+                not identity.get("InvocationID") or
+                identity["InvocationID"] == before[service].get("InvocationID")):
+            raise RuntimeError("New service instance not confirmed: " + service)
+    return identities
+
+
 def restart_localization_for_task(fc, navigation, *, timeout=45):
     """Ground-only driver + FAST-LIO + DDS recovery, followed by calibration.
 
@@ -232,32 +270,9 @@ def restart_localization_for_task(fc, navigation, *, timeout=45):
                 released = True
                 navigation._lio_listener = None
                 require_ground_restart(fc, navigation)
-                _systemctl("stop", FASTLIO_SERVICE, DRIVER_SERVICE, privileged=True, timeout=45)
-                for service in (DRIVER_SERVICE, FASTLIO_SERVICE):
-                    stopped = _service_identity(service)
-                    if (stopped.get("ActiveState") not in ("inactive", "failed") or
-                            int(stopped.get("MainPID", "0")) != 0):
-                        raise RuntimeError("Localization service did not stop: " + service)
-                require_ground_restart(fc, navigation)
-                _run_recovery_command(["ros2", "daemon", "stop"])
-                _assert_dds_released(
-                    timeout=5, ground_check=lambda: require_ground_restart(fc, navigation))
-                require_ground_restart(fc, navigation)
-                # ROS Humble ships fastdds as a shell wrapper without a
-                # shebang on this image; invoke the wrapper through bash.
-                _run_recovery_command(["bash", shutil.which("fastdds"), "shm", "clean"])
-                _assert_dds_released()
-                for service in (DRIVER_SERVICE, FASTLIO_SERVICE):
-                    require_ground_restart(fc, navigation)
-                    _systemctl("start", service, privileged=True, timeout=30)
+                identities = _rebuild_localization_services(
+                    before, lambda: require_ground_restart(fc, navigation))
                 completed = time.time_ns()
-                identities = {s: _service_identity(s) for s in before}
-                for service, identity in identities.items():
-                    if (identity.get("ActiveState") != "active" or
-                            int(identity.get("MainPID", "0")) <= 0 or
-                            not identity.get("InvocationID") or
-                            identity["InvocationID"] == before[service].get("InvocationID")):
-                        raise RuntimeError("New service instance not confirmed: " + service)
                 restore_attempted = True
                 navigation._lio_listener = runner.restore_localization_context(
                     navigation.lio_pose.on_odometry, navigation.lio_pose.on_health,

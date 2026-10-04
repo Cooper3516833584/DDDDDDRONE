@@ -151,7 +151,7 @@ ros2 launch livox_ros_driver2 msg_MID360s_launch.py
 ros2 launch fast_lio mapping.launch.py config_file:=mid360s_drone.yaml rviz:=false
 ```
 
-`server_ros.py` checks systemd services and topics without launching another chain.
+`server_ros.py` checks systemd services and actual message flow without launching another chain.
 The aircraft
 Navigation subscribes to `/Odometry_highrate` through the existing rclpy
 executor. **Do not use a propeller-on closed loop until the assembled aircraft
@@ -167,6 +167,47 @@ They run the nodes directly via `ros2 run`, without tmux, launch or RViz.
 never launches a fallback. `ros_kill` is refused; `ros_log` reads the journal.
 Service/topic presence is diagnostic only. Navigation still checks reviewed
 mount, fresh exact-stamp data, health and disarmed ground calibration.
+
+Before serving FC clients or registering mission callbacks, `server_ros.py`
+performs one bounded passive subscription check in a child process. The child
+fully exits so the bridge does not retain a DDS context. With fresh disarmed FC
+telemetry and no mission session, proven deleted DDS shared memory may trigger
+one recovery through the existing systemd/ownership-audit/official-cleaner
+sequence. Other ROS users or unreadable ownership refuse recovery before any
+service is stopped. Unknown sensor/health failures are reported without blind
+restart. Startup failure keeps the serial bridge available for diagnosis;
+every flight task still needs its own new-map and calibration gates. There is
+no in-flight watchdog or automatic flight-control resume.
+
+### Preserve DDS memory after SSH logout
+
+The localization units run as ordinary UID 1000 outside login sessions. On
+Ubuntu systemd 249, the default `RemoveIPC=yes` can unlink their live POSIX
+shared memory after the last login ends. The process stays running, so an
+`active` service and visible topics do not prove data reaches a new task.
+See `docs/localization_ipc_logout.md` for the reproduced deletion evidence.
+
+After pulling the reviewed code, install the dedicated-computer policy:
+
+```bash
+sudo bash deploy/install_localization_ipc_policy.sh
+journalctl -b -u systemd-logind -n 10 --no-pager
+systemd-analyze cat-config systemd/logind.conf
+```
+
+The installer backs up a prior drop-in under `/var/backups/robocup-ipc-*`,
+installs `/etc/systemd/logind.conf.d/99-robocup-ipc.conf`, checks the merged
+configuration and requests a SIGHUP reload. No FC or localization service is
+started/restarted. `RemoveIPC=no` affects all ordinary users on this dedicated
+computer; IPC resources are thereafter cleaned by their owning programs or
+reboot. This prevents future logout deletion; already unlinked DDS mappings
+still require an authorized ground recovery. Do not delete live `/dev/shm`
+files manually.
+
+Rollback: restore the previous drop-in with `cp -a` from the printed backup,
+or remove this exact drop-in if the backup contains `previously-absent`;
+then run `sudo systemctl kill --kill-who=main --signal=HUP systemd-logind.service`.
+Do not restart logind or reboot the aircraft as a configuration check.
 
 ### Update, rebuild and install
 

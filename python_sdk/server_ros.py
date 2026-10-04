@@ -15,6 +15,7 @@ from FlightController.Components.LioPoseProvider import LioPoseProvider
 from FlightController.Components.UartScreen import UARTScreen
 from FlightController.Components.Utils import Tmux
 from loguru import logger
+from localization_startup import prepare_localization_at_startup
 
 fc = FC_Server()
 scr = UARTScreen(fc=fc)
@@ -216,7 +217,19 @@ def callback(cmd: str):
         logger.exception("UartScreen callback error")
 
 
-scr.register_report_callback(lambda x: threading.Thread(target=callback, args=(x,)).start())
-
 fc.start_listen_serial(print_state=True, block_until_connected=True)
+# One ground-only check before accepting flight clients or screen mission commands.
+# A failed check leaves the serial bridge available; tasks keep their own fresh
+# pose/calibration gates. Do not retry automatically while a task may be flying.
+try:
+    require_production_localization(require_mount=True)
+    telemetry_deadline = time.monotonic() + 2
+    while fc.connected and not fc.state.is_fresh(0.5) and time.monotonic() < telemetry_deadline:
+        time.sleep(0.05)
+    startup_report = prepare_localization_at_startup(fc, lambda: mis_tmux.session_running)
+    logger.info("[US] Localization startup check: {}", startup_report)
+except Exception:
+    logger.exception("[US] Localization startup check failed; ground repair required")
+
+scr.register_report_callback(lambda x: threading.Thread(target=callback, args=(x,)).start())
 fc.serve_forever(indicator=True)
