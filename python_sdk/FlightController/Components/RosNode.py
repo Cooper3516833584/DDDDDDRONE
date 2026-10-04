@@ -83,7 +83,8 @@ class T265ListenNode(Node):  # listen to the T265 data
 
 
 class LioListenNode(Node):
-    def __init__(self, callback: Callable[[Odometry], None], health_callback, imu_callback):
+    def __init__(self, callback: Callable[[Odometry], None], health_callback, imu_callback,
+                 pointcloud_callback=None):
         super().__init__("PyLioListenNode")
         from fast_lio.msg import LioHealth
         from sensor_msgs.msg import Imu
@@ -98,6 +99,11 @@ class LioListenNode(Node):
         self.imu_sub = self.create_subscription(
             Imu, "/livox/imu", imu_callback, qos_profile_sensor_data
         )
+        self.cloud_sub = None
+        if pointcloud_callback is not None:
+            self.cloud_sub = self.create_subscription(
+                pc2, "/cloud_registered_body", pointcloud_callback, qos_profile_sensor_data
+            )
         _nodes_to_run.append(self)
         logger.info("[ROS] LioListenNode ready to start")
 

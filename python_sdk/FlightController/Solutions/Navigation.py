@@ -139,6 +139,9 @@ class Navigation(object):
         self._last_pose_update = 0.0
         self._last_ros_calibration = 0.0
         self.lio_pose = kwargs.get("lio_pose_provider") or LioPoseProvider()
+        self.obstacle_planner = kwargs.get("obstacle_planner")
+        if self.obstacle_planner is not None:
+            self.obstacle_planner.bind_pose_getter(self.lio_pose.get_pose)
         self._lio_listener = None
         self._legacy_mode_warned = False
         self._thread_list: List[threading.Thread] = []
@@ -227,8 +230,12 @@ class Navigation(object):
         if self._lio_listener is None:
             from FlightController.Components.RosNode import LioListenNode, RosNodeRunner
 
+            pointcloud_callback = None
+            if self.obstacle_planner is not None:
+                pointcloud_callback = self.obstacle_planner.on_pointcloud
             self._lio_listener = LioListenNode(
-                self.lio_pose.on_odometry, self.lio_pose.on_health, self.lio_pose.on_imu
+                self.lio_pose.on_odometry, self.lio_pose.on_health, self.lio_pose.on_imu,
+                pointcloud_callback=pointcloud_callback,
             )
             RosNodeRunner().add_nodes().run()
         self.running = True

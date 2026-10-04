@@ -5,7 +5,7 @@
 运行前确认 server_ros.py / FC_Server 未运行，避免抢占飞控串口。
 
 导航坐标单位为 cm，x 向前、y 向左；高度单位为 cm。
-本文件中的避障 TODO 未完成时会在连接硬件前拒绝飞行。
+受保护航段使用二维雷达避障；点云缺失或过期时拒绝继续规划。
 """
 
 import argparse
@@ -21,6 +21,7 @@ from loguru import logger
 
 from FlightController import FC_Controller
 from FlightController.Components import LD_Radar
+from FlightController.Components.ObstaclePlanner2D import ObstaclePlanner2D
 from FlightController.Components.relay_lcus import LCUSRelay
 from FlightController.Solutions.Navigation import Navigation
 
@@ -249,17 +250,18 @@ class VisionInterface:
 
 
 class ObstacleInterface:
-    """TODO：仅在中心航迹和必投接近、返回阶段提供避障结果。"""
+    """比赛任务层到二维雷达避障 Component 的薄适配。"""
 
-    IMPLEMENTED = False
+    IMPLEMENTED = True
 
-    def safe_waypoint(self, current: Point, goal: Point) -> Point:
-        """返回通向 goal 的实时安全航点；无有效避障数据时必须报错。"""
-        raise NotImplementedError("TODO: center-route obstacle avoidance")
+    def __init__(self, planner: ObstaclePlanner2D) -> None:
+        self.planner = planner
+
+    def safe_waypoint(self, current: Point, goal: Point) -> Optional[Point]:
+        return self.planner.safe_waypoint(current, goal)
 
     def safe_velocity(self, current: Point, velocity: Point) -> Point:
-        """过滤必投视觉接近时的水平速度；无有效数据时必须报错。"""
-        raise NotImplementedError("TODO: mandatory-target obstacle avoidance")
+        return self.planner.safe_velocity(current, velocity)
 
 
 def validate_allocation(red: int, blue: int, green: int) -> Dict[str, int]:
@@ -852,13 +854,15 @@ def main() -> int:
     allocation = {color: 0 for color in FREE_COLORS}
     vision = None
     obstacle = None
+    obstacle_planner = None
 
     try:
         if args.confirm_flight:
             allocation = validate_allocation(
                 args.red_count, args.blue_count, args.green_count)
             vision = VisionInterface()
-            obstacle = ObstacleInterface()
+            obstacle_planner = ObstaclePlanner2D()
+            obstacle = ObstacleInterface(obstacle_planner)
             require_flight_interfaces(vision, obstacle)
 
         fc = FC_Controller()
@@ -870,7 +874,8 @@ def main() -> int:
         if fc.state.unlock.value:
             raise RuntimeError("flight controller already unlocked; refuse takeover")
 
-        navi = Navigation(fc=fc, stop_event=stop_event)
+        navi = Navigation(fc=fc, stop_event=stop_event,
+                          obstacle_planner=obstacle_planner)
         mission = Mission(fc, navi, None, vision, obstacle, allocation, stop_event)
         mission.prepare_navigation()
 
