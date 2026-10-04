@@ -25,6 +25,7 @@ FUSION_ROS_CALIBRATION_INTERVAL = 1.0
 FUSION_ROS_MAX_POSITION_CORRECTION_CM = 2.0
 FUSION_ROS_MAX_YAW_CORRECTION_DEG = 1.0
 NAVIGATION_CONTROL_STALE_TIMEOUT = 0.30
+NAVIGATION_LOOP_INTERVAL = 0.005
 LIO_CALIBRATION_WAIT_SECONDS = 3.0
 VELOCITY_OVERRIDE_ZERO_FLUSH_FRAMES = 3
 VELOCITY_OVERRIDE_ZERO_FLUSH_INTERVAL = 0.05
@@ -544,9 +545,14 @@ class Navigation(object):
         return x, y, yaw, avai and self.mapper.is_transform_fresh(POSE_STALE_TIMEOUT)  # type: ignore
 
     def _navigation_task(self):
-        paused = False
+        paused = True
         pose_available = True
         while self.running:
+            # Yield to the 200 Hz LIO callbacks instead of polling the same
+            # pose while holding the GIL and competing for the provider lock.
+            time.sleep(NAVIGATION_LOOP_INTERVAL)
+            if not self.running:
+                break
             try:
                 if self.stop_event is not None and self.stop_event.is_set():
                     self.update_realtime_control(
@@ -560,6 +566,7 @@ class Navigation(object):
                         vel_x=0, vel_y=0, yaw=0, _source="navigation"
                     )
                     self.navigation_flag = False
+                    paused = True
                     self.navi_x_pid.set_auto_mode(False)
                     self.navi_y_pid.set_auto_mode(False)
                     self.yaw_pid.set_auto_mode(False)

@@ -32,6 +32,7 @@ class Logger:
 
 namespace = {"np": np, "time": time, "logger": Logger(), "logger_dbg": Logger(),
              "NAVIGATION_CONTROL_STALE_TIMEOUT": 0.30,
+             "NAVIGATION_LOOP_INTERVAL": 0.005,
              "LIO_CALIBRATION_WAIT_SECONDS": 3.0}
 exec(compile(module, str(SOURCE), "exec"), namespace)
 Navigation = namespace["Navigation"]
@@ -55,12 +56,15 @@ class Provider:
 class PID:
     def __init__(self, output):
         self.output = output
+        self.auto_mode = False
+        self.mode_changes = []
 
     def __call__(self, value):
-        return self.output
+        return self.output if self.auto_mode else None
 
     def set_auto_mode(self, *args, **kwargs):
-        pass
+        self.auto_mode = args[0]
+        self.mode_changes.append(args[0])
 
 
 def navigation(provider):
@@ -134,7 +138,8 @@ def test_waited_calibration_allows_new_two_second_stationary_window(monkeypatch)
 def test_stale_pose_zeros_previous_horizontal_and_yaw_commands(monkeypatch):
     nav = navigation(Provider([(0, 0, 0, True), None]))
     nav.navigation_flag = True
-    monkeypatch.setattr(namespace["time"], "sleep", lambda seconds: setattr(nav, "running", False))
+    monkeypatch.setattr(namespace["time"], "sleep",
+                        lambda seconds: setattr(nav, "running", False) if seconds == 0.05 else None)
     nav._navigation_task()
     assert any(x != 0 or y != 0 or yaw != 0 for x, y, _, yaw in nav.fc.sent[:-1])
     assert nav.fc.sent[-1][0] == 0
@@ -143,6 +148,51 @@ def test_stale_pose_zeros_previous_horizontal_and_yaw_commands(monkeypatch):
     assert nav._realtime_control_data_in_xyzYaw[0] == 0
     assert nav._realtime_control_data_in_xyzYaw[1] == 0
     assert nav._realtime_control_data_in_xyzYaw[3] == 0
+
+
+def test_initial_valid_pose_enables_initially_disabled_pids(monkeypatch):
+    nav = navigation(Provider([(0, 0, 0, True)]))
+    nav.navigation_flag = True
+    monkeypatch.setattr(namespace["time"], "sleep", lambda seconds: None)
+    nav.fc.send_realtime_control_data = lambda *control: (
+        nav.fc.sent.append(control), setattr(nav, "running", False))
+    nav._navigation_task()
+    assert nav.navi_x_pid.auto_mode and nav.navi_y_pid.auto_mode and nav.yaw_pid.auto_mode
+    assert nav.fc.sent[-1] == (12, -7, 0, 4)
+
+
+def test_stale_recovery_reenables_pids_only_after_explicit_navigation_enable(monkeypatch):
+    nav = navigation(Provider([(0, 0, 0, True), None, (0, 0, 0, True)]))
+    nav.navigation_flag = True
+    def sleep(seconds):
+        if seconds == 0.05:
+            assert not nav.navigation_flag
+            assert not nav.navi_x_pid.auto_mode
+            nav.set_navigation_state(True)
+    monkeypatch.setattr(namespace["time"], "sleep", sleep)
+    def send(*control):
+        nav.fc.sent.append(control)
+        if len(nav.fc.sent) == 3:
+            nav.running = False
+    nav.fc.send_realtime_control_data = send
+    nav._navigation_task()
+    assert nav.navi_x_pid.mode_changes == [True, False, True]
+    assert nav.fc.sent[1] == (0, 0, 0, 0)
+    assert nav.fc.sent[-1] == (12, -7, 0, 4)
+
+
+def test_paused_navigation_yields_and_does_not_enable_pids(monkeypatch):
+    nav = navigation(Provider([(0, 0, 0, True)]))
+    sleeps = []
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            nav.running = False
+    monkeypatch.setattr(namespace["time"], "sleep", sleep)
+    nav._navigation_task()
+    assert sleeps == [0.005, 0.005, 0.005]
+    assert not nav.navi_x_pid.auto_mode
+    assert not nav.fc.sent
 
 
 def test_legacy_mode_cannot_switch_backend():
