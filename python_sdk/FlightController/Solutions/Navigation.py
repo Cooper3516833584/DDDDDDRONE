@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import time
 from typing import Any, List, Literal, Optional, Tuple, Union
@@ -238,15 +240,43 @@ class Navigation(object):
         self._realtime_control_data_in_xyzYaw = [0, 0, 0, 0]
         self.update_realtime_control(vel_x=0, vel_y=0, vel_z=0, yaw=0)
         logger.info("[NAVI] Realtime control started")
-        self._thread_list.append(threading.Thread(target=self._keep_height_task, daemon=True))
+        ready = threading.Event()
+        affinity_errors = []
+        self._thread_list.append(threading.Thread(
+            target=self._navigation_thread_entry,
+            args=(ready, affinity_errors),
+            name="navigation_cpu3",
+            daemon=True,
+        ))
         self._thread_list[-1].start()
-        self._thread_list.append(threading.Thread(target=self._navigation_task, daemon=True))
+        if not ready.wait(timeout=2.0):
+            self.stop()
+            raise RuntimeError("Navigation CPU3 affinity startup timed out")
+        if affinity_errors:
+            self.stop(join=True)
+            raise RuntimeError("Navigation could not bind to CPU3") from affinity_errors[0]
+        self._thread_list.append(threading.Thread(target=self._keep_height_task, daemon=True))
         self._thread_list[-1].start()
         self._thread_list.append(
             threading.Thread(target=self._velocity_override_watchdog_task, daemon=True)
         )
         self._thread_list[-1].start()
         logger.info("[NAVI] Navigation started")
+
+    def _navigation_thread_entry(self, ready, affinity_errors):
+        """Bind this Linux thread before entering the navigation control loop."""
+        try:
+            if sys.platform == "linux":
+                os.sched_setaffinity(0, {3})
+                if os.sched_getaffinity(0) != {3}:
+                    raise RuntimeError("Navigation affinity verification failed")
+                logger.info("[NAVI] Thread {} bound to CPU3", threading.get_native_id())
+        except Exception as exc:
+            affinity_errors.append(exc)
+        finally:
+            ready.set()
+        if not affinity_errors:
+            self._navigation_task()
 
     def update_realtime_control(
         self,
