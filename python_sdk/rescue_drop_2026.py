@@ -53,10 +53,12 @@ LOW_CALIBRATION_TIMEOUT = 6.0
 MISSION_TIMEOUT = 20.0 * 60.0
 
 # 投放目标相机与识别：下视相机 + FlightController/Solutions/models/robocup_target.pt。
-# 相机索引、分辨率和 fps 需要在机载实机上确认后再定稿。
-TARGET_CAMERA_INDEX = 1
-TARGET_CAMERA_WIDTH = 1920
-TARGET_CAMERA_HEIGHT = 1080
+# 2026-10-04 机上实测：Microdia USB 2.0 相机；采集节点是 index=0（index=1 是同一相机的
+# 参数节点，打不开）。640x480 在默认(YUYV)格式下实测 30 fps；1080p 的 YUYV 受 USB2 带宽
+# 限制只有 5 fps（需显式设 MJPG 才能到 30 fps）。此分辨率下端到端 poll 约 9 Hz。
+TARGET_CAMERA_INDEX = 0
+TARGET_CAMERA_WIDTH = 640
+TARGET_CAMERA_HEIGHT = 480
 TARGET_CAMERA_FPS = 30
 TARGET_DETECT_CONF = 0.35       # 与 robocup_target 权重配套的置信度阈值
 TARGET_DETECT_IMGSZ = 640
