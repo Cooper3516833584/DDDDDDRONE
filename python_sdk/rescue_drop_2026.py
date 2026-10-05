@@ -78,6 +78,22 @@ MANDATORY_COLOR = "yellow"
 Point = Tuple[float, float]
 
 
+def body_to_world_velocity(body_x: float, body_y: float, yaw_cw_deg: float) -> Point:
+    """Convert forward/left body velocity to startup-local using clockwise yaw."""
+    yaw = math.radians(float(yaw_cw_deg))
+    c, s = math.cos(yaw), math.sin(yaw)
+    return (c * float(body_x) + s * float(body_y),
+            -s * float(body_x) + c * float(body_y))
+
+
+def world_to_body_velocity(world_x: float, world_y: float, yaw_cw_deg: float) -> Point:
+    """Convert startup-local velocity back to forward/left body velocity."""
+    yaw = math.radians(float(yaw_cw_deg))
+    c, s = math.cos(yaw), math.sin(yaw)
+    return (c * float(world_x) - s * float(world_y),
+            s * float(world_x) + c * float(world_y))
+
+
 class MissionDeadline(RuntimeError):
     """任务计时到期，停止搜索和投掷。"""
 
@@ -588,21 +604,24 @@ class Mission:
 
     def _move_toward(self, observation: TargetObservation, protected: bool) -> None:
         angle = math.atan2(observation.offset_y_px, observation.offset_x_px)
-        velocity = (VISUAL_APPROACH_SPEED * math.cos(angle),
-                    VISUAL_APPROACH_SPEED * math.sin(angle))
+        body_velocity = (VISUAL_APPROACH_SPEED * math.cos(angle),
+                         VISUAL_APPROACH_SPEED * math.sin(angle))
         if protected:
             if self.obstacle is None:
                 raise RuntimeError("obstacle interface missing")
-            velocity = self.obstacle.safe_velocity(self._position(), velocity)
-            if velocity is None or not all(math.isfinite(v) for v in velocity):
+            yaw = float(self.navi.current_yaw)
+            world_velocity = body_to_world_velocity(*body_velocity, yaw)
+            safe_world_velocity = self.obstacle.safe_velocity(self._position(), world_velocity)
+            if safe_world_velocity is None or not all(math.isfinite(v) for v in safe_world_velocity):
                 raise RuntimeError("obstacle avoidance velocity invalid")
-        speed = math.hypot(*velocity)
+            body_velocity = world_to_body_velocity(*safe_world_velocity, yaw)
+        speed = math.hypot(*body_velocity)
         if speed < 1.0:
             self.navi.stop_move()
         else:
             self.navi.move_by_direction(
                 speed=speed,
-                direction_deg=math.degrees(math.atan2(velocity[1], velocity[0])),
+                direction_deg=math.degrees(math.atan2(body_velocity[1], body_velocity[0])),
             )
 
     def _approach_target(self, target: TargetObservation,

@@ -34,6 +34,11 @@ def pillar(cx=1.5, cy=0.0):
     return points
 
 
+def background_points():
+    """Five distinct endpoints behind the aircraft, clear of the test corridor."""
+    return [(-4.0, y, 0.0) for y in (-1.0, -0.5, 0.0, 0.5, 1.0)]
+
+
 def load_class(relative_path, class_name, names=None, namespace=None):
     source = SDK / relative_path
     tree = ast.parse(source.read_text(encoding="utf-8"))
@@ -52,7 +57,7 @@ class PlannerTests(unittest.TestCase):
         self.clock = patch.object(module.time, "monotonic", return_value=100.0).start()
         self.addCleanup(patch.stopall)
         self.planner = ObstaclePlanner2D()
-        self.planner.update_body_points([], POSE)
+        self.planner.update_body_points(background_points(), POSE)
 
     def seed(self, points_cm):
         p = self.planner
@@ -62,7 +67,7 @@ class PlannerTests(unittest.TestCase):
             p._scores[y, x] = p.SCORE_MAX
         p._revision += 1
 
-    def test_empty_map_exact_goal_and_velocity(self):
+    def test_clear_corridor_exact_goal_and_velocity(self):
         goal = (303.25, -4.75)
         self.assertEqual(self.planner.safe_waypoint((0, 0), goal), goal)
         self.assertEqual(self.planner.safe_velocity((0, 0), (15, -3)), (15, -3))
@@ -130,27 +135,27 @@ class PlannerTests(unittest.TestCase):
         ):
             with self.subTest(yaw=yaw, point=point):
                 p = ObstaclePlanner2D()
-                p.update_body_points([point], (30, 40, yaw, True))
+                p.update_body_points([point] + background_points(), (30, 40, yaw, True))
                 x, y = p._cm_to_cell(expected)
                 self.assertGreaterEqual(p._scores[y, x], p.OCCUPIED_THRESHOLD)
 
     def test_slice_range_and_nonfinite_points_filtered(self):
         count = self.planner.update_body_points(
             [(1, 0, 0), (1, 0, 1), (1, 0, -1), (0.1, 0, 0),
-             (7, 0, 0), (float("nan"), 0, 0), (1, 0, 0)], POSE)
-        self.assertEqual(count, 1)
+             (7, 0, 0), (float("nan"), 0, 0), (1, 0, 0)] + background_points(), POSE)
+        self.assertEqual(count, 6)
         state = self.planner.get_debug_state()
-        self.assertEqual(state["occupied_cells"], 1)
+        self.assertEqual(state["occupied_cells"], 6)
         self.assertGreater(state["inflated_cells"], state["occupied_cells"])
 
     def test_ray_free_scores_and_saturation(self):
         p = self.planner
         for _ in range(10):
-            p.update_body_points([(1, 0, 0)], POSE)
+            p.update_body_points([(1, 0, 0)] + background_points(), POSE)
         hit = p._cm_to_cell((100, 0))
         self.assertEqual(p._scores[hit[1], hit[0]], p.SCORE_MAX)
         for _ in range(12):
-            p.update_body_points([(2, 0, 0)], POSE)
+            p.update_body_points([(2, 0, 0)] + background_points(), POSE)
         self.assertEqual(p._scores[hit[1], hit[0]], p.SCORE_MIN)
 
     def test_stale_and_missing_fail_closed_for_all_velocities(self):
@@ -201,12 +206,15 @@ class PlannerTests(unittest.TestCase):
         self.assertFalse(p.ready())
         self.assertFalse(p._scores.any())
         self.assertIsNone(p._cached_subgoal)
+        state = p.get_debug_state()
+        self.assertEqual(state["last_endpoint_cells"], 0)
+        self.assertEqual(state["invalid_cloud_streak"], 0)
 
     def test_ros_decoding_throttle_and_failure_expiry(self):
         p = self.planner
         getter = Mock(return_value=POSE)
         p.bind_pose_getter(getter)
-        decoder = Mock(return_value=np.array([(1, 0, 0)]))
+        decoder = Mock(return_value=np.array(background_points()))
         ros = ModuleType("sensor_msgs_py")
         ros.point_cloud2 = SimpleNamespace(read_points_numpy=decoder)
         with patch.dict(sys.modules, {"sensor_msgs_py": ros}):
@@ -220,6 +228,150 @@ class PlannerTests(unittest.TestCase):
             self.clock.return_value = 101.0
             p.on_pointcloud(object())
             self.assertFalse(p.ready())
+
+    def test_empty_cloud_is_not_a_valid_map(self):
+        p = ObstaclePlanner2D()
+        self.assertEqual(p.update_body_points([], POSE), 0)
+        state = p.get_debug_state()
+        self.assertFalse(state["ready"])
+        self.assertEqual(state["last_endpoint_cells"], 0)
+        self.assertEqual(state["invalid_cloud_streak"], 1)
+        self.assertEqual(state["min_valid_endpoint_cells"], 5)
+        with self.assertRaises(RuntimeError):
+            p.safe_waypoint((0, 0), (100, 0))
+        with self.assertRaises(RuntimeError):
+            p.safe_velocity((0, 0), (15, 0))
+
+    def test_filtered_cloud_does_not_refresh_freshness(self):
+        for points in (
+            [(1, i * 0.2, 1) for i in range(6)],
+            [(7, i * 0.2, 0) for i in range(6)],
+            [(float("nan"), i * 0.2, 0) for i in range(6)],
+            background_points(),
+        ):
+            with self.subTest(points=points):
+                p = ObstaclePlanner2D()
+                pose = (2000, 2000, 0, True) if points == background_points() else POSE
+                self.assertEqual(p.update_body_points(points, pose), 0)
+                self.assertFalse(p.ready())
+                self.assertEqual(p._last_cloud_at, 0)
+                self.assertEqual(p.get_debug_state()["last_endpoint_cells"], 0)
+
+    def test_endpoint_threshold_uses_unique_cells(self):
+        p = ObstaclePlanner2D()
+        points = background_points()[:p.MIN_VALID_ENDPOINT_CELLS - 1]
+        self.assertEqual(p.update_body_points(points * 50, POSE), 4)
+        self.assertEqual(p._last_cloud_at, 0)
+        self.assertEqual(p.get_debug_state()["invalid_cloud_streak"], 1)
+        self.assertEqual(p._revision, 0)
+        self.assertFalse(p._scores.any())
+        self.assertEqual(p.update_body_points(background_points(), POSE), 5)
+        self.assertTrue(p.ready())
+        self.assertEqual(p.get_debug_state()["invalid_cloud_streak"], 0)
+
+    def test_invalid_frames_preserve_map_but_do_not_extend_ttl(self):
+        p = ObstaclePlanner2D()
+        p.update_body_points(pillar(), POSE)
+        scores, revision = p._scores.copy(), p._revision
+        for now in (100.20, 100.40):
+            self.clock.return_value = now
+            p.update_body_points([], POSE)
+            self.assertTrue(p.ready())
+            self.assertEqual(p._last_cloud_at, 100.0)
+            self.assertEqual(p._last_processed_at, now)
+            self.assertEqual(p._revision, revision)
+            np.testing.assert_array_equal(p._scores, scores)
+            self.assertIsNotNone(p.safe_waypoint((0, 0), (300, 0)))
+        self.assertEqual(p.get_debug_state()["invalid_cloud_streak"], 2)
+        self.clock.return_value = 100.61
+        self.assertFalse(p.ready())
+        with self.assertRaises(RuntimeError):
+            p.safe_waypoint((0, 0), (300, 0))
+        with self.assertRaises(RuntimeError):
+            p.safe_velocity((0, 0), (15, 0))
+
+    def test_invalid_cloud_attempts_are_still_throttled(self):
+        for decode_error in (False, True):
+            with self.subTest(decode_error=decode_error):
+                p = ObstaclePlanner2D(pose_getter=lambda: POSE)
+                decoder = Mock(return_value=np.empty((0, 3)),
+                               side_effect=ValueError("decode failure") if decode_error else None)
+                ros = ModuleType("sensor_msgs_py")
+                ros.point_cloud2 = SimpleNamespace(read_points_numpy=decoder)
+                with patch.dict(sys.modules, {"sensor_msgs_py": ros}):
+                    self.clock.return_value = 100.0
+                    p.on_pointcloud(object())
+                    self.assertEqual(p._last_processed_at, 100.0)
+                    self.clock.return_value = 100.1
+                    p.on_pointcloud(object())
+                    self.assertEqual(decoder.call_count, 1)
+                    self.clock.return_value = 100.21
+                    p.on_pointcloud(object())
+                    self.assertEqual(decoder.call_count, 2)
+                    self.assertFalse(p.ready())
+
+
+class MissionVelocityTests(unittest.TestCase):
+    def setUp(self):
+        source = SDK / "rescue_drop_2026.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and n.name in {"body_to_world_velocity", "world_to_body_velocity"}]
+        future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+        tree = ast.fix_missing_locations(ast.Module(body=[future] + helpers, type_ignores=[]))
+        self.namespace = {"math": math, "VISUAL_APPROACH_SPEED": 15.0}
+        exec(compile(tree, str(source), "exec"), self.namespace)
+        cls = load_class("rescue_drop_2026.py", "Mission",
+                         names={"_move_toward", "_position"}, namespace=self.namespace)
+        self.mission = cls()
+        self.mission.navi = Mock(current_x=30.0, current_y=40.0, current_yaw=90.0)
+        self.mission.obstacle = Mock()
+        self.observation = SimpleNamespace(offset_x_px=100.0, offset_y_px=0.0)
+
+    def test_yaw_directions_and_round_trip(self):
+        to_world = self.namespace["body_to_world_velocity"]
+        to_body = self.namespace["world_to_body_velocity"]
+        for yaw, expected in ((0, (15, 0)), (90, (0, -15)), (-90, (0, 15))):
+            np.testing.assert_allclose(to_world(15, 0, yaw), expected, atol=1e-12)
+        for yaw in (0, 37, 90, -90, 179):
+            for vector in ((15, 0), (0, 15), (10, -7)):
+                with self.subTest(yaw=yaw, vector=vector):
+                    np.testing.assert_allclose(to_body(*to_world(*vector, yaw), yaw), vector, atol=1e-12)
+
+    def test_protected_move_passes_world_to_planner_and_body_to_navigation(self):
+        mission = self.mission
+        mission.obstacle.safe_velocity.return_value = (15, 0)
+        mission._move_toward(self.observation, protected=True)
+        position, velocity = mission.obstacle.safe_velocity.call_args.args
+        self.assertEqual(position, (30, 40))
+        np.testing.assert_allclose(velocity, (0, -15), atol=1e-12)
+        output = mission.navi.move_by_direction.call_args.kwargs
+        self.assertAlmostEqual(output["speed"], 15)
+        self.assertAlmostEqual(output["direction_deg"], 90)
+        mission.navi.stop_move.assert_not_called()
+
+    def test_unprotected_move_keeps_body_direction(self):
+        self.mission._move_toward(self.observation, protected=False)
+        self.mission.obstacle.safe_velocity.assert_not_called()
+        self.mission.navi.move_by_direction.assert_called_once_with(speed=15.0, direction_deg=0.0)
+
+    def test_protected_zero_velocity_stops_and_invalid_results_raise(self):
+        self.mission.obstacle.safe_velocity.return_value = (0, 0)
+        self.mission._move_toward(self.observation, protected=True)
+        self.mission.navi.stop_move.assert_called_once()
+        self.mission.navi.move_by_direction.assert_not_called()
+        for result in (None, (float("nan"), 0), (0, float("inf"))):
+            with self.subTest(result=result):
+                self.mission.obstacle.safe_velocity.return_value = result
+                with self.assertRaisesRegex(RuntimeError, "velocity invalid"):
+                    self.mission._move_toward(self.observation, protected=True)
+        self.mission.navi.move_by_direction.assert_not_called()
+
+    def test_planner_failure_propagates_without_movement(self):
+        self.mission.obstacle.safe_velocity.side_effect = RuntimeError("stale")
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            self.mission._move_toward(self.observation, protected=True)
+        self.mission.navi.move_by_direction.assert_not_called()
 
 
 class WiringTests(unittest.TestCase):

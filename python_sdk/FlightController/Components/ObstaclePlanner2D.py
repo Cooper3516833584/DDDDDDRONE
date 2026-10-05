@@ -68,6 +68,7 @@ class ObstaclePlanner2D:
     PROCESS_PERIOD_S = 0.20
     CLOUD_STALE_S = 0.60
     MAX_ENDPOINT_CELLS_PER_UPDATE = 1200
+    MIN_VALID_ENDPOINT_CELLS = 5
 
     # Stable subgoal behaviour is important because rescue_drop_2026.py stops
     # and restarts its navigation worker whenever safe_waypoint() changes.
@@ -94,6 +95,8 @@ class ObstaclePlanner2D:
         self._inflated_cache: Optional[np.ndarray] = None
         self._last_cloud_at = 0.0
         self._last_processed_at = 0.0
+        self._invalid_cloud_streak = 0
+        self._last_endpoint_cells = 0
 
         self._cached_goal: Optional[Point] = None
         self._cached_subgoal: Optional[Point] = None
@@ -118,6 +121,8 @@ class ObstaclePlanner2D:
             self._inflated_cache = None
             self._last_cloud_at = 0.0
             self._last_processed_at = 0.0
+            self._invalid_cloud_streak = 0
+            self._last_endpoint_cells = 0
             self._cached_goal = None
             self._cached_subgoal = None
             self._cached_revision = -1
@@ -138,6 +143,8 @@ class ObstaclePlanner2D:
         with self._lock:
             if now - self._last_processed_at < self.PROCESS_PERIOD_S:
                 return
+            # Throttle attempts as well as valid updates, including decode failures.
+            self._last_processed_at = now
             pose_getter = self._pose_getter
         if pose_getter is None:
             return
@@ -188,7 +195,8 @@ class ObstaclePlanner2D:
             received_at: monotonic timestamp, mainly for offline tests.
 
         Returns:
-            Number of unique endpoint cells integrated.
+            Number of unique endpoint cells considered. Fewer than the minimum
+            do not update map evidence or the last valid cloud time.
         """
         now = time.monotonic() if received_at is None else float(received_at)
         if len(pose) < 3:
@@ -200,11 +208,6 @@ class ObstaclePlanner2D:
             raise ValueError("pose contains non-finite values")
 
         pts = np.asarray(points_xyz_m, dtype=float)
-        if pts.size == 0:
-            with self._lock:
-                self._last_cloud_at = now
-                self._last_processed_at = now
-            return 0
         pts = pts.reshape(-1, 3)
         finite = np.isfinite(pts).all(axis=1)
         horizontal_sq = pts[:, 0] * pts[:, 0] + pts[:, 1] * pts[:, 1]
@@ -249,6 +252,14 @@ class ObstaclePlanner2D:
         else:
             cells = np.empty((0, 2), dtype=np.int32)
 
+        endpoint_count = int(len(cells))
+        if endpoint_count < self.MIN_VALID_ENDPOINT_CELLS:
+            with self._lock:
+                self._last_processed_at = now
+                self._last_endpoint_cells = endpoint_count
+                self._invalid_cloud_streak += 1
+            return endpoint_count
+
         start = self._world_to_cell(x0_m, y0_m)
         with self._lock:
             if start is not None:
@@ -274,10 +285,12 @@ class ObstaclePlanner2D:
 
             self._last_cloud_at = now
             self._last_processed_at = now
+            self._last_endpoint_cells = endpoint_count
+            self._invalid_cloud_streak = 0
             self._revision += 1
             self._inflated_revision = -1
             self._inflated_cache = None
-        return int(len(cells))
+        return endpoint_count
 
     # ------------------------------------------------------------------
     # Public planning API used by rescue_drop_2026.ObstacleInterface
@@ -429,6 +442,8 @@ class ObstaclePlanner2D:
             age = float("inf") if self._last_cloud_at <= 0 else now - self._last_cloud_at
             revision = self._revision
             last_cloud_at = self._last_cloud_at
+            last_endpoint_cells = self._last_endpoint_cells
+            invalid_cloud_streak = self._invalid_cloud_streak
         inflated = self._inflate(occupied)
         return {
             "ready": bool(last_cloud_at > 0 and age <= self.CLOUD_STALE_S),
@@ -438,6 +453,9 @@ class ObstaclePlanner2D:
             "inflated_cells": int(np.count_nonzero(inflated)),
             "resolution_m": self.RESOLUTION_M,
             "map_size_m": self.MAP_SIZE_M,
+            "last_endpoint_cells": int(last_endpoint_cells),
+            "invalid_cloud_streak": int(invalid_cloud_streak),
+            "min_valid_endpoint_cells": int(self.MIN_VALID_ENDPOINT_CELLS),
         }
 
     # ------------------------------------------------------------------
