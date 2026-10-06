@@ -23,8 +23,9 @@
 
     python -m unittest testcode.test_relay_lcus -v     # 或在 python_sdk 下: python testcode/test_relay_lcus.py
 
-``--port`` 省略时使用环境变量 ``D_TASK_RELAY_PORT``; 端口尚未确定时必须显式给出,
-不要猜测易变的 ``/dev/ttyUSB*`` 编号。
+``--port`` 省略时依次取环境变量 ``D_TASK_RELAY_PORT`` 和驱动内置默认端口
+(机载上位机实测的 by-path); 换 USB 口或换主机后必须重新确认, 不要猜测易变的
+``/dev/ttyUSB*`` 编号。
 
 风险与边界 (使用前必读):
 
@@ -36,7 +37,8 @@
   线径和电源余量, 并注意继电器机械寿命。
 - ``--channel N --on/--off`` 带 FF 回读确认。实机 (4 路板) 观察: 控制帧后约 50ms 内回读仍是旧状态,
   所以经常先出现一次"校验失败, 重发第 2 次"再显示 ``[OK]``; 这是预期行为, 不是接线故障。
-- 端口必须显式指定: CH340 的 USB ID 与 HC-14 电台相同 (``1a86:7523``), 不能按 VID/PID 猜;
+- 端口: CH340 的 USB ID 与 HC-14 电台相同 (``1a86:7523``), 不能按 VID/PID 猜。
+  默认端口是机载上位机实测确认的 by-path, 只在同一个 USB 口上稳定;
   上电后 ``COMx``/``ttyUSBx`` 编号可能变化, 每次都用 ``--list`` 先确认。
 - 使用 4 路板时请加 ``--channels 4``, 否则 8 路默认配置会告警"缺少通道 [5, 6, 7, 8]"。
 - 本工具只走独立 USB 串口, 不导入飞控、不打开飞控串口、不发送任何飞控命令,
@@ -79,7 +81,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--port",
         default=None,
-        help=f"继电器串口, 例如 /dev/ttyUSB2; 省略时取环境变量 {RELAY_PORT_ENV}",
+        help=f"继电器串口, 例如 /dev/ttyUSB2 或 COM3; 省略时取环境变量 {RELAY_PORT_ENV} 或驱动默认端口",
     )
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUDRATE, help="波特率, 默认 9600")
     parser.add_argument("--channels", type=int, default=DEFAULT_CHANNEL_COUNT, help="继电器路数, 默认 8")

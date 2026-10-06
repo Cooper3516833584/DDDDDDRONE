@@ -19,7 +19,9 @@
   但它是完全独立的 USB 串口设备: 不经过飞控串口, 不接收也不调用任何飞控命令接口;
 - 串口打开时显式关闭 DTR/RTS, 与本仓库其他 CH340 设备的既有处理一致;
 - ``open()`` 不主动改变任何一路继电器状态, 需要全部断开时显式调用 ``all_off()``;
-- 实际接入的端口尚未确认, 必须显式传入 ``port`` 或设置环境变量 ``D_TASK_RELAY_PORT``。
+- 默认端口 ``DEFAULT_RELAY_PORT`` 已由机载上位机实测确认(见该常量上方注释);
+  优先级为: 显式 ``port`` > 环境变量 ``D_TASK_RELAY_PORT`` > ``DEFAULT_RELAY_PORT``。
+  Windows/PC 上没有这个 Linux 路径, 必须显式传入 ``COMx``。
 
 风险与边界 (实机使用前必读):
 
@@ -34,7 +36,11 @@
   同路同状态重发是幂等的、方向安全, 但每次带校验的操作可能多发一帧;
   若首帧真的丢失, 重发是必需的, 因此不要为了少发一帧而关掉重发/校验。
 - 端口不得猜测: CH340 的 USB ID 与 HC-14 电台相同 (``1a86:7523``), 不能只按 VID/PID
-  自动识别端口; 必须显式传入 ``port`` 或由 ``D_TASK_RELAY_PORT`` 指定。
+  自动识别端口。默认值 ``DEFAULT_RELAY_PORT`` 是实测确认过的物理 USB 口 (by-path);
+  一旦换 USB 口、换线或换主机, 该路径会失效或指向别的设备, 必须重新拔插确认后修改,
+  或显式传入 ``port`` / 设置 ``D_TASK_RELAY_PORT`` 覆盖。
+- 协议解析边界再确认: 机载 8 路板对 FF 的返回尚未确认与 4 路板一致(实测只回 8 个 0x00 字节),
+  在该板确认应答 ASCII 状态前, 不要把它当作"已可正常使用"。
 - DTR/RTS: 打开串口时显式拉低 DTR/RTS, 个别继电器板可能把这两根线接到其他电路,
   实机副作用尚未验证。
 - 无硬件互锁: 本驱动走独立 USB 串口, 不经过飞控, 因此不受飞控 ACK/重试/心跳/超时保护,
@@ -53,7 +59,8 @@
 
     from FlightController.Components.relay_lcus import LCUSRelay
 
-    with LCUSRelay(port="/dev/ttyUSB2") as relay:   # PC(Windows) 上换成 "COM5" 这样的串口名
+    # 机载默认端口来自 DEFAULT_RELAY_PORT; PC(Windows) 上必须显式传 "COM5" 这类串口名
+    with LCUSRelay() as relay:
         relay.set_channel(1, True, verify=True)   # 开第 1 路并用 FF 回读确认
         relay.get_channel_state(1)                # 查询第 1 路状态
         relay.all_off()                           # 全部断开(退出前必须显式调用)
@@ -70,6 +77,15 @@ from typing import Dict, List, Optional, Tuple, Union
 from loguru import logger
 
 RELAY_PORT_ENV = "D_TASK_RELAY_PORT"
+
+# 机载上位机 (fc@192.168.31.176) 上 8 路继电器实测确认的默认端口。
+# 识别依据 (2026-10-06 拔插枚举): 拔掉 8 路板时这个 CH340 消失、/dev/ttyUSB0 随之消失;
+# USB ID 1a86:7523, 物理位置总线 1 端口 3 (sysfs "1-3"), 无序列号、无厂商字符串。
+# 因此不能用 by-id: "usb-1a86_USB_Serial-if00-port0" 与机载 HC-14 电台同名, 两者同时
+# 插入时会互相覆盖, 存在把继电器帧发进无线链路的风险; 只能绑定物理 USB 口。
+# by-path 只在"同一个 USB 口"上稳定: 换 USB 口、换线或换主机时必须重新确认并修改此值,
+# 或显式传入 port / 设置 D_TASK_RELAY_PORT 覆盖。
+DEFAULT_RELAY_PORT = "/dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0-port0"
 
 DEFAULT_BAUDRATE = 9600
 DEFAULT_CHANNEL_COUNT = 8
@@ -92,19 +108,20 @@ __all__ = [
     "list_serial_ports",
     "format_port_list",
     "RELAY_PORT_ENV",
+    "DEFAULT_RELAY_PORT",
     "DEFAULT_BAUDRATE",
     "DEFAULT_CHANNEL_COUNT",
 ]
 
 
 def resolve_relay_settings(port: Optional[str] = None, baudrate: Optional[int] = None) -> Tuple[str, int]:
-    """解析串口参数: 端口优先取显式参数, 其次取环境变量 ``D_TASK_RELAY_PORT``。"""
-    resolved_port = port or os.environ.get(RELAY_PORT_ENV)
-    if not resolved_port:
+    """解析串口参数, 优先级: 显式 ``port`` > 环境变量 ``D_TASK_RELAY_PORT`` > ``DEFAULT_RELAY_PORT``。"""
+    resolved_port = port or os.environ.get(RELAY_PORT_ENV) or DEFAULT_RELAY_PORT
+    if not isinstance(resolved_port, str) or not resolved_port.strip():
         raise ValueError(
-            "未指定 LCUS 继电器串口: 请传入 port 参数或设置环境变量 "
-            f"{RELAY_PORT_ENV}; 当前可用串口: {format_port_list()}"
+            f"LCUS 继电器串口无效: {resolved_port!r}; 当前可用串口: {format_port_list()}"
         )
+    resolved_port = resolved_port.strip()
     raw_baudrate = DEFAULT_BAUDRATE if baudrate is None else baudrate
     try:
         resolved_baudrate = int(raw_baudrate)
@@ -206,7 +223,8 @@ class LCUSRelay(object):
         query_timeout: float = 1.0,
     ) -> None:
         """
-        port: 串口设备, 例如 ``/dev/ttyUSB2``; 为空时取环境变量 ``D_TASK_RELAY_PORT``
+        port: 串口设备; 为空时依次取环境变量 ``D_TASK_RELAY_PORT`` 和默认端口
+            ``DEFAULT_RELAY_PORT`` (机载上位机继电器实测端口), PC 上请显式传 ``COMx``
         baudrate: 波特率, 默认 9600
         channel_count: 继电器路数, 默认 8
         timeout: 单次串口读超时(秒)

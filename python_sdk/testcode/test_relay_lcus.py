@@ -30,6 +30,7 @@ if SDK_DIR not in sys.path:
 
 from FlightController.Components.relay_lcus import (  # noqa: E402
     DEFAULT_BAUDRATE,
+    DEFAULT_RELAY_PORT,
     LCUSRelay,
     RELAY_PORT_ENV,
     build_channel_command,
@@ -359,11 +360,22 @@ class DriverTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {RELAY_PORT_ENV: "/dev/env-relay"}):
             self.assertEqual(LCUSRelay(port="/dev/arg-relay").port, "/dev/arg-relay")
 
-    def test_missing_port_raises_value_error(self):
+    def test_default_port_used_when_nothing_specified(self):
+        """显式 port 与环境变量都缺省时, 回落到机载实测默认端口。"""
         self.install_fake_serial()
         with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(ValueError):
-                LCUSRelay()
+            relay = LCUSRelay()
+            self.assertEqual(relay.port, DEFAULT_RELAY_PORT)
+
+    def test_empty_environment_port_falls_back_to_default(self):
+        self.install_fake_serial()
+        with mock.patch.dict(os.environ, {RELAY_PORT_ENV: ""}):
+            self.assertEqual(LCUSRelay().port, DEFAULT_RELAY_PORT)
+
+    def test_non_string_port_rejected(self):
+        self.install_fake_serial()
+        with self.assertRaises(ValueError):
+            LCUSRelay(port=123)
 
     def test_invalid_channel_count_rejected(self):
         self.install_fake_serial()
