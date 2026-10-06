@@ -1,14 +1,15 @@
 # FleetBus task-layer integration
 
-`AirFleetNode` owns the airborne CH340/HC-14 serial device while FleetBus mode is
-active. The radio is connected directly to the airborne Linux computer; FleetBus
-traffic does not pass through the flight controller, its ACK path, or UART2.
+The airborne HC-14 is connected to the flight controller's UART2. `AirFleetNode`
+uses the existing FC wireless bridge while FleetBus mode is active; it does not
+open a CH340 device on the airborne Linux computer.
 
-`attach_air_fleet_node()` creates and starts the shared `HC14FleetTransport`.
-It uses `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0` at 115200 baud by
-default. `D_TASK_HC14_PORT` and `D_TASK_HC14_BAUDRATE` may override those values
-without changing mission code. The direct transport keeps the same `BB 33 |
-length | FleetBus frame` envelope used by the car and ground station.
+`attach_air_fleet_node()` creates and starts `FCWirelessTransport` by default.
+The flight-controller firmware adds and removes the `BB 33 | length` envelope;
+FleetBus receives and sends only the inner frame. Test rigs with a separate
+USB-connected HC-14 may explicitly pass `hc14_port` or `hc14_baudrate` to use
+`HC14FleetTransport` instead. Its serial port can also be overridden with
+`D_TASK_HC14_PORT` and `D_TASK_HC14_BAUDRATE`.
 Mission code consumes `node.command_queue.receive()` in its existing task thread and
 decides whether and how an accepted command may call existing navigation logic.
 The FleetBus worker itself does not perform flight actions.

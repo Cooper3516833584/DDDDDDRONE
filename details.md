@@ -21,18 +21,17 @@
 - SSH 别名：`fc`
 - 主机名：`fc-ubuntu`
 - 飞控串口：`/dev/ttyACM0`
-- HC-14 已从飞控 `UT2/USART2` 移到 CH340 测试架，通过 USB 直接连接机载 Linux
-- HC-14：`/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 -> /dev/ttyUSB1`
-- HC-14 USB 标识：CH340，USB ID `1a86:7523`
-- 雷达 CP2102：`/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0 -> /dev/ttyUSB0`
+- HC-14 当前接在飞控 `UT2/USART2`，不直接连接机载 Linux（2026-10-06 用户现场确认）
+- 机载 Linux 的 `usb-1a86_USB_Serial-if00-port0` 当前指向继电器板，禁止作为 HC-14 打开
+- 雷达 CP2102 的历史 `by-id` 路径为 `/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0`；当前 USB 编号须重新枚举确认
 
-生产 FleetBus 由机载上位机直接打开 CH340/HC-14，与小车使用相同物理链路和 `BB 33` 封装。它不再调用飞控命令 `0x0D`、无线回调或 `UT2/USART2`。优先使用稳定的 `/dev/serial/by-id/` 路径；若实际 CH340 标识不同，通过 `D_TASK_HC14_PORT` 覆盖，不要猜测易变的 `/dev/ttyUSB*` 编号。地面站仍不得打开 `/dev/ttyACM0`。
+当前机载 FleetBus 通过 `FC_Client`/`FC_Server` 使用飞控 `0x0D` 发送和 `0x07` 无线回调接收；飞控固件负责 `BB 33` 封装。仅当 HC-14 确实另接到 USB 测试架时，才显式指定直连串口。地面站仍不得打开 `/dev/ttyACM0`。
 
 本文不保存 SSH 密码、HMAC 密钥或其他凭据。凭据以 `AGENTS.md`、环境变量或用户当前明确提供的信息为准。
 
 ## 2. HC-14 当前参数
 
-2026-07-14 初次通过只读 AT 查询确认地面站 CH340/HC-14 为 `9600 8N1`；随后按当前方案发送 `AT+B115200`，并在 115200 下重新查询确认当前配置为：
+2026-07-14 初次通过只读 AT 查询确认地面站 CH340/HC-14 为 `9600 8N1`；随后发送 `AT+B115200`，并在 115200 下回读确认当时配置为：
 
 ```text
 UART：115200 8N1
@@ -58,7 +57,7 @@ ser.setDTR(False)
 
 连续收到 `ORDER ERROR\r\n` 时，优先检查 DTR、RTS、KEY 引脚、串口占用和两端 UART 参数。未经明确授权，不发送修改信道、波特率、空中速率、功率或恢复出厂设置的 AT 指令。
 
-两端 CH340/HC-14 均使用 `115200 8N1`。飞控 USB 继续独立使用 `500000`，不得混用；飞控 `UT2/USART2` 已不在生产 FleetBus 路径中。
+地面站 CH340 与飞控 `UT2/USART2` 的预期 UART 参数均为 `115200 8N1`；两块 HC-14 的当前参数尚未重新回读。飞控 USB 继续独立使用 `500000`，不得混用。
 
 ## 3. 当前 FleetBus 协议
 
@@ -82,12 +81,12 @@ BB 33 | bridge_len:u8 | FleetBus帧
 该外层只负责在透明串口字节流中划分完整 FleetBus 帧，各层设备和波特率仍然独立：
 
 ```text
-机载上位机 <-> 飞控：Base.py，本地飞控串口，默认 500000
-机载上位机 <-> CH340/HC-14：FleetBus，115200 8N1
-机载 HC-14 <-> 地面站 HC-14：透明无线链路，两端 CH340 均为 115200 8N1
+机载上位机 <-> 飞控：Base.py，本地飞控串口，默认 500000；无线命令 0x0D / 回调 0x07
+飞控 UT2 <-> 机载 HC-14：115200 8N1
+机载 HC-14 <-> 地面站 HC-14：透明无线链路，地面站 CH340 为 115200 8N1
 ```
 
-FleetBus 不转发飞控姿态或控制原始帧。飞控 USB 继续使用 `500000`，其 ACK 和 UART2 发送队列不再影响无人机轨迹回传。
+FleetBus 不转发飞控姿态或控制原始帧。飞控 USB 继续使用 `500000`；经飞控桥接时，无线发送依赖飞控 ACK 和 UART2 发送队列。
 
 ## 4. 当前代码位置
 
@@ -133,13 +132,15 @@ C:\Users\TZDEZACR\Desktop\ground_station\Ground_Station\components
 
 2026-08-01 用户已将机载 HC-14 移到 CH340 测试架并通过 USB 连接上位机。SSH 枚举已确认 CH340 稳定路径映射到 `/dev/ttyUSB1`，CP2102 雷达仍映射到 `/dev/ttyUSB0`。代码已切换为直连方案；直连 PING、15 点 TRACE 高吞吐、真实飞行距离、飞行中干扰和长期稳定性仍需验证。
 
+2026-10-06 用户确认机载 HC-14 已接回飞控 UT2，地面站与小车无线通信已打通。通过 `FC_Client` 发送无线测试帧得到飞控对 `0x0D` 的匹配 ACK，但地面站接收 0 字节，反向发送后飞控无线回调收到 0 帧；ACK 不证明 UT2 或空中链路已发送成功。地面站只读 `AT+RX` 与多波特率 `AT` 未得到有效参数回读；两块模块当前参数仍待在 KEY 命令模式下确认。
+
 ## 6. 推荐排障顺序
 
-1. 确认两台主机可达，并分别确认机载端、地面站 HC-14 映射到稳定 `by-id` 路径。
-2. 确认机载 CH340 为 USB ID `1a86:7523`；若稳定路径与默认值不同，设置 `D_TASK_HC14_PORT`。
-3. 确认两端 HC-14 均为 `115200 8N1`、`DTR=False`、`RTS=False`。
-4. 确认机载和地面站均正确处理 `BB 33 | length | FleetBus` 封装，且机载不再调用飞控 `0x0D/0x07`。
-5. 两块 HC-14 当前均应为 `B115200 / C28 / S8`；若再次更换模块，必须先在带 SET/KEY 控制的 USB 转串口上确认参数。
+1. 确认两台主机可达，地面站 HC-14 为 CH340，机载 HC-14 实际接在飞控 UT2。
+2. 禁止把机载继电器板的 CH340 `by-id` 路径当作 HC-14 打开。
+3. 确认飞控 UT2 和地面站 CH340 均为 `115200 8N1`；打开地面站串口时保持 `DTR=False`、`RTS=False`。
+4. 确认飞控通过 `0x0D/0x07` 收发，飞控固件与地面站均正确处理 `BB 33 | length | FleetBus` 封装。
+5. 两块 HC-14 的目标参数为 `B115200 / C28 / S8`；重新回读须在带 SET/KEY 控制的 USB 转串口上进行。
 6. 先做少量静态消息和 PING/ACK 联调，再测试遥测吞吐和重复命令过滤。
 7. 检查 CRC 失败计数、丢包、ACK 超时和重复包行为。
 8. 检查 TRACE 游标、积压和 `BUFFER_OVERRUN` 日志。

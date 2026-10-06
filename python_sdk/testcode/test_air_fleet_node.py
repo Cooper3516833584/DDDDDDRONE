@@ -109,6 +109,45 @@ class AirFleetNodeTests(unittest.TestCase):
     def test_default_turnaround_supports_dense_pose_polling(self):
         self.assertAlmostEqual(0.10, NodeTiming().turnaround_s)
 
+    def test_attach_defaults_to_fc_wireless_bridge(self):
+        class FC:
+            connected = True
+            state = None
+
+            def __init__(self):
+                self.callback = None
+                self.writes = []
+
+            def register_wireless_callback(self, callback):
+                self.callback = callback
+
+            def send_to_wireless(self, data):
+                self.writes.append(data)
+
+        fc = FC()
+        node = attach_air_fleet_node(
+            fc,
+            navigation=object(),
+            stop_event=threading.Event(),
+            state_provider=lambda: self.state,
+        )
+        try:
+            self.assertIsNotNone(fc.callback)
+            deadline = time.monotonic() + 1
+            while not node._transport.connected and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(node._transport.connected)
+            fc.callback(request(1, CommandPayload(CommandId.PING)))
+            deadline = time.monotonic() + 1
+            while not fc.writes and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(1, len(fc.writes))
+            self.assertTrue(fc.writes[0].startswith(b"\xd3\x91"))
+            ack = decode_ack(unpack_frame(fc.writes[0]).payload)
+            self.assertEqual(AckStatus.COMPLETED, ack.status)
+        finally:
+            node.close()
+
     def test_attach_uses_direct_hc14_transport_without_fc_wireless_callback(self):
         class FC:
             state = None

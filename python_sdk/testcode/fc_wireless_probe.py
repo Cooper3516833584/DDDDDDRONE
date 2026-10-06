@@ -1,6 +1,7 @@
 """Probe the flight-controller wireless forwarding channel.
 
-This opens the FC serial port and uses the existing 0x0D/0x07 wireless bridge.
+This uses the existing 0x0D/0x07 wireless bridge through FC_Server, or opens
+the FC serial port only when explicitly requested.
 It does not arm, take off, change flight modes, or send motion commands.
 """
 
@@ -16,7 +17,7 @@ SDK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if SDK_DIR not in sys.path:
     sys.path.insert(0, SDK_DIR)
 
-from FlightController import FC_Controller  # noqa: E402
+from FlightController import FC_Client, FC_Controller  # noqa: E402
 
 
 def format_bytes(data: bytes, hex_only: bool, encoding: str) -> str:
@@ -30,6 +31,9 @@ def format_bytes(data: bytes, hex_only: bool, encoding: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FC wireless bridge probe")
+    parser.add_argument("--via-server", action="store_true", help="use the running FC_Server")
+    parser.add_argument("--server-host", default="127.0.0.1", help="FC_Server host")
+    parser.add_argument("--server-port", type=int, default=5654, help="FC_Server port")
     parser.add_argument("--fc-port", help="FC serial port, for example COM5 or /dev/ttyACM0")
     parser.add_argument("--fc-baud", type=int, default=500000, help="FC serial baud rate")
     parser.add_argument("--encoding", default="utf-8", help="text encoding for send/display")
@@ -47,14 +51,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if not args.fc_port and not args.allow_auto_port:
-        print("Pass --fc-port explicitly, or add --allow-auto-port to use SDK auto-detection.")
+    if args.via_server and (args.fc_port or args.allow_auto_port):
+        print("--via-server cannot be combined with direct FC serial options.")
+        return 2
+    if not args.via_server and not args.fc_port and not args.allow_auto_port:
+        print("Pass --via-server, --fc-port, or --allow-auto-port explicitly.")
         return 2
 
-    fc = FC_Controller()
-    fc.settings.ack_max_retry = 1
-    fc.settings.raise_if_no_ack = False
-    fc.settings.raise_if_timeout = False
+    fc = FC_Client() if args.via_server else FC_Controller()
+    if not args.via_server:
+        fc.settings.ack_max_retry = 1
+        fc.settings.raise_if_no_ack = False
+        fc.settings.raise_if_timeout = False
 
     stop_event = threading.Event()
 
@@ -65,13 +73,24 @@ def main() -> int:
     fc.register_wireless_callback(on_wireless)
 
     try:
-        fc.start_listen_serial(
-            serial_dev=args.fc_port,
-            baudrate=args.fc_baud,
-            print_state=False,
-            block_until_connected=False,
-        )
-        print("FC serial listener started.")
+        if args.via_server:
+            fc.connect(
+                host=args.server_host,
+                port=args.server_port,
+                authkey=b"fc",
+                print_state=False,
+                block=True,
+                timeout=5,
+            )
+            print("Connected to FC_Server; FC serial remains owned by the server.")
+        else:
+            fc.start_listen_serial(
+                serial_dev=args.fc_port,
+                baudrate=args.fc_baud,
+                print_state=False,
+                block_until_connected=False,
+            )
+            print("FC serial listener started.")
         print("Sending wireless probe frames only; no flight-control commands are sent.")
 
         seq = 0
