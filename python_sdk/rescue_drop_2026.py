@@ -603,14 +603,15 @@ class Mission:
         return math.hypot(first[0] - second[0], first[1] - second[1]) <= 10.0
 
     def _start_leg_worker(self, waypoint: Point) -> Optional[threading.Thread]:
-        """由任务线程发起导航；只使用 Navigation 自带的轨迹执行线程。"""
+        """由任务线程发起导航；使用 Navigation 的水平直达航点线程。"""
         if self._at_waypoint(self._position(), waypoint):
             return None
         previous_count = len(self.navi._thread_list)
-        if not self.navi.navigation_to_waypoint(waypoint, wait=False):
+        if not self.navi.navigation_to_waypoint_direct(
+                waypoint, wait=False, pos_thres=10.0):
             raise RuntimeError("navigation leg could not start")
         if len(self.navi._thread_list) != previous_count + 1:
-            raise RuntimeError("navigation trajectory thread was not created")
+            raise RuntimeError("navigation direct waypoint thread was not created")
         return self.navi._thread_list[-1]
 
     def _stop_leg_worker(self, worker: threading.Thread) -> None:

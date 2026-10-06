@@ -73,6 +73,7 @@ def navigation(provider):
     nav.navigation_flag = False
     nav.keep_height_flag = False
     nav.running = True
+    nav.navi_speed = 40
     nav.stop_event = None
     nav._control_lock = threading.Lock()
     nav.traj_running_event = threading.Event()

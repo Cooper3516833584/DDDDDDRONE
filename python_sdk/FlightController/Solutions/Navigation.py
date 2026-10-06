@@ -634,6 +634,11 @@ class Navigation(object):
                 out_yaw = self.yaw_pid(-yaw_error)
                 if out_x_world is None or out_y_world is None or out_yaw is None:
                     continue
+                horizontal_speed = float(np.hypot(out_x_world, out_y_world))
+                if horizontal_speed > self.navi_speed and horizontal_speed > 1e-6:
+                    scale = self.navi_speed / horizontal_speed
+                    out_x_world *= scale
+                    out_y_world *= scale
                 out_x_body, out_y_body = _world_to_body_velocity(
                     out_x_world, out_y_world, self.current_yaw
                 )
@@ -648,7 +653,8 @@ class Navigation(object):
                 )
                 logger_dbg.info(
                     f"[NAVI] Pose PID output: world=({out_x_world}, {out_y_world}), "
-                    f"body=({out_x_body}, {out_y_body}), yaw={out_yaw}"
+                    f"body=({out_x_body}, {out_y_body}), "
+                    f"limit={self.navi_speed:.1f}, yaw={out_yaw}"
                 )
             except Exception as e:
                 logger.exception(f"[NAVI] Navigation task error")
@@ -767,6 +773,54 @@ class Navigation(object):
             traj_list.append(traj.calc_position_xyz(t))
         traj_list.append(waypoint)
         return self.navigation_follow_trajectory(traj_list, wait=wait)  # type: ignore
+
+    def navigation_to_waypoint_direct(
+        self,
+        waypoint,
+        wait=True,
+        pos_thres: float = 10.0,
+    ):
+        """Navigate directly to horizontal (x, y) in cm, without trajectory sampling."""
+        if len(waypoint) != 2:
+            raise ValueError("direct waypoint requires exactly (x, y)")
+        x, y = float(waypoint[0]), float(waypoint[1])
+        if not np.all(np.isfinite([x, y])):
+            raise ValueError("waypoint must contain finite coordinates")
+        if not self.running:
+            logger.error("[NAVI] Direct waypoint requires navigation to be running")
+            return False
+        if self.stop_event is not None and self.stop_event.is_set():
+            logger.error("[NAVI] Direct waypoint refused: external stop event is set")
+            return False
+        if not self.pose_is_fresh():
+            logger.error("[NAVI] Direct waypoint refused: navigation pose is stale")
+            return False
+
+        # Restore cruise tuning after the previous waypoint switched to hover.
+        self.navi_x_pid.tunings = self.pid_tunings["navi"]
+        self.navi_y_pid.tunings = self.pid_tunings["navi"]
+        self.navi_x_pid.output_limits = (-self.navi_speed, self.navi_speed)
+        self.navi_y_pid.output_limits = (-self.navi_speed, self.navi_speed)
+        self.navi_x_pid.setpoint = x
+        self.navi_y_pid.setpoint = y
+
+        distance = float(np.hypot(x - self.current_x, y - self.current_y))
+        # Completion timeout only; it does not control the cruise speed.
+        timeout = max(15.0, distance / max(float(self.navi_speed), 1.0) * 3.0 + 5.0)
+        if wait:
+            return self.wait_for_waypoint(
+                time_thres=0.1, pos_thres=pos_thres, timeout=timeout,
+            )
+
+        worker = threading.Thread(
+            target=self.wait_for_waypoint,
+            kwargs={"time_thres": 0.1, "pos_thres": pos_thres, "timeout": timeout},
+            name="navigation_direct_waypoint",
+            daemon=True,
+        )
+        worker.start()
+        self._thread_list.append(worker)
+        return True
 
     def create_smooth_traj_list(
         self,
@@ -1100,7 +1154,8 @@ class Navigation(object):
 
     def set_navigation_speed(self, speed):
         """
-        设置导航速度
+        设置水平导航最大速度，单位 cm/s。
+        导航位置 PID 输出最终还会执行二维向量模长限幅。
 
         speed: 速度 / cm/s
         """
