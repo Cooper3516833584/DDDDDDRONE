@@ -168,9 +168,10 @@ class FC_State_Struct:
         self._fmt_length = struct.calcsize(self._fmt_string)
         self.update_event = Event()
         self.last_update_monotonic = 0.0
-        # 4S LiPo: 3.7 V/cell warning floor.  The pack was changed from 3S to 4S,
-        # so a per-cell based threshold is used instead of a fixed pack voltage.
-        self._low_bat_warn_threshold = 3.7 * 4  # V
+        # Telemetry carries pack voltage only, so use the average cell voltage.
+        # Keep the original 3.5 V/cell warning floor when changing 3S to 4S.
+        self._battery_cells = 4
+        self._low_bat_warn_threshold = 3.5  # V/cell
         self._low_bat_warn_last_time = 0
 
     def update_from_bytes(self, bytes):
@@ -181,7 +182,7 @@ class FC_State_Struct:
             self.RECV_ORDER[i].update_value_with_mul(val)
         self.last_update_monotonic = time.monotonic()
         self.update_event.set()
-        if 1 < self.bat.value < self._low_bat_warn_threshold:
+        if 1 < self.bat.value and self.bat.value / self._battery_cells < self._low_bat_warn_threshold:
             if time.perf_counter() - self._low_bat_warn_last_time > 1:
                 self._low_bat_warn_last_time = time.perf_counter()
                 logger.warning(f"[FC] Low battery: {self.bat.value}V")
