@@ -903,6 +903,20 @@ def emergency_land(fc: FC_Controller) -> bool:
     return False
 
 
+def stop_navigation_ros(navi: Navigation) -> None:
+    """Stop the task's LIO executor before Python tears down its ROS context."""
+    listener = navi._lio_listener
+    if listener is None:
+        return
+    if navi.running:
+        raise RuntimeError("navigation still running; refuse ROS shutdown")
+    from FlightController.Components.RosNode import RosNodeRunner
+
+    RosNodeRunner().release_localization_context(listener, timeout=5.0)
+    navi._lio_listener = None
+    logger.info("[RESCUE] LIO ROS executor stopped")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="2026 救援物资投放无人机主入口")
     parser.add_argument("--confirm-flight", action="store_true",
@@ -913,7 +927,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--red-count", type=int)
     parser.add_argument("--blue-count", type=int)
     parser.add_argument("--green-count", type=int)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.confirm_flight:
+        if any(count is None for count in (
+                args.red_count, args.blue_count, args.green_count)):
+            parser.error("--confirm-flight requires --red-count, --blue-count "
+                         "and --green-count; their sum must be 4")
+        try:
+            validate_allocation(args.red_count, args.blue_count, args.green_count)
+        except ValueError as exc:
+            parser.error(str(exc))
+    return args
 
 
 def require_flight_interfaces(vision: VisionInterface,
@@ -1044,6 +1068,12 @@ def main() -> int:
                 logger.exception("[RESCUE] Failed to reset relay after lock check")
             finally:
                 relay.close()
+
+        if navi is not None:
+            try:
+                stop_navigation_ros(navi)
+            except Exception:
+                logger.exception("[RESCUE] Failed to stop LIO ROS executor")
 
         if fc is not None:
             try:
