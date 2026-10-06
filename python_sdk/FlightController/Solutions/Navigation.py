@@ -808,12 +808,14 @@ class Navigation(object):
         # Completion timeout only; it does not control the cruise speed.
         timeout = max(15.0, distance / max(float(self.navi_speed), 1.0) * 3.0 + 5.0)
         if wait:
-            return self.wait_for_waypoint(
+            return self._wait_for_waypoint_direct(
+                x, y,
                 time_thres=0.1, pos_thres=pos_thres, timeout=timeout,
             )
 
         worker = threading.Thread(
-            target=self.wait_for_waypoint,
+            target=self._wait_for_waypoint_direct,
+            args=(x, y),
             kwargs={"time_thres": 0.1, "pos_thres": pos_thres, "timeout": timeout},
             name="navigation_direct_waypoint",
             daemon=True,
@@ -821,6 +823,51 @@ class Navigation(object):
         worker.start()
         self._thread_list.append(worker)
         return True
+
+    def _wait_for_waypoint_direct(
+        self,
+        target_x: float,
+        target_y: float,
+        *,
+        time_thres: float = 0.1,
+        pos_thres: float = 10.0,
+        timeout: float = 15.0,
+    ):
+        """Wait within a radial threshold of a fixed target, or exit if cancelled."""
+        time_count = 0.0
+        time_start = time.perf_counter()
+        threshold_sq = float(pos_thres) ** 2
+        param_switched = False
+        while True:
+            time.sleep(0.05)
+            if self.stop_event is not None and self.stop_event.is_set():
+                logger.warning("[NAVI] Direct waypoint wait stopped by external stop event")
+                return False
+            if not (
+                abs(float(self.navi_x_pid.setpoint) - target_x) <= 1e-6
+                and abs(float(self.navi_y_pid.setpoint) - target_y) <= 1e-6
+            ):
+                logger.debug("[NAVI] Direct waypoint wait cancelled")
+                return False
+
+            if not self.running or not self.pose_is_fresh():
+                time_count = 0.0
+            else:
+                dx = float(self.current_x) - target_x
+                dy = float(self.current_y) - target_y
+                if dx * dx + dy * dy <= threshold_sq:
+                    time_count += 0.05
+                    if not param_switched:
+                        self._waypoint_param_switch()
+                        param_switched = True
+                else:
+                    time_count = 0.0
+            if time_count >= time_thres:
+                logger.info("[NAVI] Reached direct waypoint")
+                return True
+            if time.perf_counter() - time_start > timeout:
+                logger.warning("[NAVI] Direct waypoint overtime")
+                return False
 
     def create_smooth_traj_list(
         self,

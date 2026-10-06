@@ -45,6 +45,7 @@ def nav_context():
     }
     cls = load_methods(SDK / "FlightController/Solutions/Navigation.py", "Navigation", {
         "__init__", "navigation_to_waypoint_direct", "set_navigation_speed",
+        "_wait_for_waypoint_direct",
         "_navigation_task", "update_realtime_control", "pose_is_fresh",
         "wait_for_waypoint", "_reached_waypoint", "_waypoint_param_switch",
         "navigation_stop_here", "navigation_target",
@@ -112,7 +113,8 @@ def test_direct_sets_exact_horizontal_target_without_trajectory(nav_context, mon
     nav.height_pid.setpoint = 150
     nav.yaw_target = 42
     nav._waypoint_param_switch()
-    nav.wait_for_waypoint = Mock(return_value=result)
+    nav._wait_for_waypoint_direct = Mock(return_value=result)
+    nav.wait_for_waypoint = Mock(side_effect=AssertionError("legacy waiter called"))
     nav.navigation_follow_trajectory = Mock(side_effect=AssertionError("trajectory called"))
     generator = Mock(side_effect=AssertionError("trajectory generated"))
     monkeypatch.setitem(namespace, "TrajectoryGenerator", generator)
@@ -127,7 +129,9 @@ def test_direct_sets_exact_horizontal_target_without_trajectory(nav_context, mon
     assert nav.height_pid.setpoint == 150 and nav.yaw_target == 42
     assert nav.navi_x_pid.tunings == nav.navi_y_pid.tunings == nav.pid_tunings["navi"]
     assert nav.navi_x_pid.output_limits == nav.navi_y_pid.output_limits == (-30, 30)
-    nav.wait_for_waypoint.assert_called_once_with(time_thres=0.1, pos_thres=10.0, timeout=25.0)
+    nav._wait_for_waypoint_direct.assert_called_once_with(
+        200.0, 0.0, time_thres=0.1, pos_thres=10.0, timeout=25.0)
+    nav.wait_for_waypoint.assert_not_called()
     generator.assert_not_called()
     nav.navigation_follow_trajectory.assert_not_called()
 
@@ -136,7 +140,7 @@ def test_direct_sets_exact_horizontal_target_without_trajectory(nav_context, mon
 def test_direct_far_target_reaches_real_pid_speed_limit(nav_context, monkeypatch, speed):
     nav, namespace = nav_context
     nav.set_navigation_speed(speed)
-    nav.wait_for_waypoint = Mock(return_value=True)
+    nav._wait_for_waypoint_direct = Mock(return_value=True)
     assert nav.navigation_to_waypoint_direct((200, 0))
     vx, vy, _, _ = send_one_frame(nav, namespace, monkeypatch)
     assert (vx, vy) == (speed, 0)
@@ -146,7 +150,7 @@ def test_direct_pid_slows_near_target(nav_context, monkeypatch):
     nav, namespace = nav_context
     nav.current_x = 195
     nav.set_navigation_speed(30)
-    nav.wait_for_waypoint = Mock(return_value=True)
+    nav._wait_for_waypoint_direct = Mock(return_value=True)
     nav.navigation_to_waypoint_direct((200, 0))
     vx, vy, _, _ = send_one_frame(nav, namespace, monkeypatch)
     assert (vx, vy) == (7, 0)
@@ -185,6 +189,68 @@ def test_direct_completion_preserves_exact_target(nav_context):
     assert not nav.fc.sent
 
 
+@pytest.fixture
+def direct_clock(nav_context, monkeypatch):
+    nav, namespace = nav_context
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(namespace["time"], "perf_counter", lambda: clock.now)
+    monkeypatch.setattr(namespace["time"], "sleep",
+                        lambda seconds: setattr(clock, "now", clock.now + seconds))
+    return nav, namespace, clock
+
+
+@pytest.mark.parametrize("current,expected", [
+    ((0, 0), True), ((9, 0), True), ((0, 9), True), ((7, 7), True),
+    ((9, 9), False), ((10, 0), True), ((11, 0), False),
+])
+def test_direct_waypoint_uses_radial_distance_threshold(direct_clock, current, expected):
+    nav, _, clock = direct_clock
+    nav.current_x, nav.current_y = current
+    nav._waypoint_param_switch = Mock(wraps=nav._waypoint_param_switch)
+    assert load_mission()._at_waypoint(current, (0, 0)) is expected
+    assert nav._wait_for_waypoint_direct(0, 0, pos_thres=10, timeout=0.2) is expected
+    if expected:
+        assert clock.now == pytest.approx(0.1)
+        nav._waypoint_param_switch.assert_called_once_with()
+        assert nav.navi_x_pid.tunings == nav.navi_y_pid.tunings == nav.pid_tunings["hover"]
+    else:
+        assert clock.now > 0.2
+        nav._waypoint_param_switch.assert_not_called()
+    assert nav.navigation_target.tolist() == [0, 0]
+
+
+def test_direct_wait_resets_settle_time_outside_radial_threshold(direct_clock, monkeypatch):
+    nav, namespace, clock = direct_clock
+    positions = iter([(7, 7), (9, 9), (7, 7), (7, 7)])
+
+    def sleep(seconds):
+        clock.now += seconds
+        nav.current_x, nav.current_y = next(positions)
+
+    monkeypatch.setattr(namespace["time"], "sleep", sleep)
+    assert nav._wait_for_waypoint_direct(0, 0, timeout=0.3)
+    assert clock.now == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("failure", ["stopped", "stale"])
+def test_direct_wait_does_not_confirm_arrival_without_valid_pose(direct_clock, failure):
+    nav, _, clock = direct_clock
+    if failure == "stopped":
+        nav.running = False
+    else:
+        nav.pose_is_fresh.return_value = False
+    assert nav._wait_for_waypoint_direct(0, 0, timeout=0.2) is False
+    assert clock.now > 0.2
+
+
+def test_legacy_rectangular_waypoint_check_is_unchanged(nav_context):
+    nav, _ = nav_context
+    nav.current_x = nav.current_y = 9
+    assert nav._reached_waypoint(10)
+    nav.current_x, nav.current_y = 10, 0
+    assert not nav._reached_waypoint(10)
+
+
 def test_direct_timeout_keeps_target_and_reports_failure(nav_context, monkeypatch):
     nav, namespace = nav_context
     clock = SimpleNamespace(now=0.0)
@@ -211,13 +277,16 @@ def test_external_stop_exits_running_direct_worker(nav_context):
 def test_stop_here_allows_mission_join_within_two_seconds(nav_context):
     nav, _ = nav_context
     entered = threading.Event()
-    wait_for_waypoint = nav.wait_for_waypoint
+    wait_for_waypoint = nav._wait_for_waypoint_direct
+    results = []
 
-    def wait(**kwargs):
+    def wait(*args, **kwargs):
         entered.set()
-        return wait_for_waypoint(**kwargs)
+        result = wait_for_waypoint(*args, **kwargs)
+        results.append(result)
+        return result
 
-    nav.wait_for_waypoint = wait
+    nav._wait_for_waypoint_direct = wait
     assert nav.navigation_to_waypoint_direct((200, 0), wait=False)
     worker = nav._thread_list[-1]
     try:
@@ -230,11 +299,53 @@ def test_stop_here_allows_mission_join_within_two_seconds(nav_context):
         mission._stop_leg_worker(worker)
         assert time.monotonic() - started < 2.0
         assert not worker.is_alive()
+        assert results == [False]  # Cancellation must not report arrival at the original target.
         assert nav.navigation_target.tolist() == [0, 0]
     finally:
         nav.stop_event = threading.Event()
         nav.stop_event.set()
         worker.join(timeout=2.0)
+
+
+@pytest.mark.parametrize("stop_first", [True, False])
+def test_new_direct_target_replaces_old_worker(nav_context, stop_first):
+    nav, _ = nav_context
+    waiter = nav._wait_for_waypoint_direct
+    entered = {(200, 0): threading.Event(), (200, 200): threading.Event()}
+    results = {}
+
+    def wait(x, y, **kwargs):
+        entered[(x, y)].set()
+        result = waiter(x, y, **kwargs)
+        results[(x, y)] = result
+        return result
+
+    nav._wait_for_waypoint_direct = wait
+    try:
+        assert nav.navigation_to_waypoint_direct((200, 0), wait=False)
+        old_worker = nav._thread_list[-1]
+        assert entered[(200, 0)].wait(timeout=1.0)
+        assert old_worker.is_alive()
+        if stop_first:
+            nav.navigation_stop_here()
+            old_worker.join(timeout=2.0)
+            assert not old_worker.is_alive()
+            assert results[(200, 0)] is False
+
+        assert nav.navigation_to_waypoint_direct((200, 200), wait=False)
+        new_worker = nav._thread_list[-1]
+        assert entered[(200, 200)].wait(timeout=1.0)
+        old_worker.join(timeout=2.0)
+        assert not old_worker.is_alive()
+        assert results[(200, 0)] is False
+        assert new_worker is not old_worker and new_worker.is_alive()
+        assert nav.navigation_target.tolist() == [200, 200]
+        assert nav.navi_x_pid.tunings == nav.navi_y_pid.tunings == nav.pid_tunings["navi"]
+    finally:
+        nav.navigation_stop_here()
+        for worker in nav._thread_list:
+            worker.join(timeout=2.0)
+            assert not worker.is_alive()
 
 
 def load_mission():
