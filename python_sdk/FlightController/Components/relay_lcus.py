@@ -8,10 +8,14 @@
     - 状态 ``0x01`` = 开, ``0x00`` = 关;
     - 校验 = 前三字节按字节求和取低 8 位;
     - 例: 第 1 路开 ``A0 01 01 A2``, 第 1 路关 ``A0 01 00 A1``;
-- 状态查询: 发送单字节 ``FF``, 继电器返回每一路 10 字节 ASCII 文本行, 例如
-    ``"CH1: ON \\r\\nCH2: ON \\r\\nCH3: OFF\\r\\nCH4: OFF\\r\\n"``;
-    开与关的返回长度相同, 8 路共 80 字节。控制帧本身没有应答,
-    因此需要确认控制结果时用 ``set_channel(..., verify=True)`` 触发一次 FF 回读。
+- 状态查询: 发送单字节 ``FF``, 控制帧本身没有应答, 因此需要确认控制结果时用
+  ``set_channel(..., verify=True)`` 触发一次 FF 回读。实测存在两种返回格式, 由
+  ``parse_status_response()`` 自动识别:
+    - **ASCII 文本**(4 路板, 与说明书一致): 每路 10 字节文本行, 例如
+      ``"CH1: ON \\r\\nCH2: ON \\r\\nCH3: OFF\\r\\nCH4: OFF\\r\\n"``, 8 路共 80 字节;
+    - **二进制**(机载 8 路板实测): ``channel_count`` 个字节, 每字节一路,
+      ``0x01``=开 ``0x00``=关; 全关为 ``00 00 00 00 00 00 00 00``,
+      第 1 路打开后为 ``01 00 ...``。
 
 设计约束:
 
@@ -39,8 +43,11 @@
   自动识别端口。默认值 ``DEFAULT_RELAY_PORT`` 是实测确认过的物理 USB 口 (by-path);
   一旦换 USB 口、换线或换主机, 该路径会失效或指向别的设备, 必须重新拔插确认后修改,
   或显式传入 ``port`` / 设置 ``D_TASK_RELAY_PORT`` 覆盖。
-- 协议解析边界再确认: 机载 8 路板对 FF 的返回尚未确认与 4 路板一致(实测只回 8 个 0x00 字节),
-  在该板确认应答 ASCII 状态前, 不要把它当作"已可正常使用"。
+- 协议解析边界: 两块板实测返回格式不同(4 路板 ASCII / 8 路板二进制), ``parse_status_response()``
+  两种都支持; 若再换其他固件, 出现无法匹配的返回时会表现为"缺少通道"或空结果, 需要重新确认协议,
+  不要为了让它"通过"而放宽校验。
+- 已验证范围再补充: 机载 8 路板上已实测 ``A0 01 01 A2`` -> FF 回读第一字节由 ``00`` 变 ``01``、
+  ``A0 01 00 A1`` -> 恢复 ``00`` (仅第 1 路); 第 2~8 路的字节映射、多路同时动作仍待逐路确认。
 - DTR/RTS: 打开串口时显式拉低 DTR/RTS, 个别继电器板可能把这两根线接到其他电路,
   实机副作用尚未验证。
 - 无硬件互锁: 本驱动走独立 USB 串口, 不经过飞控, 因此不受飞控 ACK/重试/心跳/超时保护,
@@ -179,20 +186,31 @@ def build_channel_command(channel: int, on: bool, channel_count: int = DEFAULT_C
 
 
 def parse_status_response(data: Union[bytes, bytearray, str], channel_count: int = DEFAULT_CHANNEL_COUNT) -> Dict[int, bool]:
-    """解析 FF 查询返回的 ``CHn: ON/OFF`` 文本, 返回 ``{路号: True/False}``。
+    """解析 FF 查询返回, 返回 ``{路号: True/False}``。
 
-    容忍分片接收、前后噪声和行尾空白; 只保留 1~``channel_count`` 的结果。
+    支持两块板实测到的两种格式:
+
+    1. **ASCII 文本** (4 路板, 与说明书一致): 每路 10 字节, ``CH1: ON \\r\\n`` / ``CH1: OFF\\r\\n``;
+    2. **二进制** (8 路板实测): 连续 ``channel_count`` 个字节, 每字节一路, ``0x01``=开 ``0x00``=关。
+       实测 8 路板全关时返回 ``00 00 00 00 00 00 00 00``, 第 1 路打开后第一字节变为 ``01``。
+
+    二进制分支只在没有任何 ASCII 行匹配、且长度达到 ``channel_count``、且前 ``channel_count``
+    字节全是 ``0x00``/``0x01`` 时才采用: ASCII 字节都 >= 0x20, 因此不会互相误判;
+    长度不足(分片)时返回空, 避免把半个包或噪声当成状态。
     """
-    if isinstance(data, (bytes, bytearray)):
-        text = bytes(data).decode("ascii", errors="ignore")
-    else:
-        text = str(data)
+    raw = bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("ascii", "ignore")
     states: Dict[int, bool] = {}
-    for match in STATUS_PATTERN.finditer(text):
+    for match in STATUS_PATTERN.finditer(raw.decode("ascii", errors="ignore")):
         channel = int(match.group(1))
         if MIN_CHANNEL <= channel <= channel_count:
             states[channel] = match.group(2).upper() == "ON"
-    return states
+    if states:
+        return states
+    if len(raw) >= channel_count:
+        head = raw[:channel_count]
+        if all(byte in (STATE_OFF, STATE_ON) for byte in head):
+            return {index + 1: byte == STATE_ON for index, byte in enumerate(head)}
+    return {}
 
 
 def format_states(states: Dict[int, bool]) -> str:

@@ -196,6 +196,34 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parse_status_response(b""), {})
         self.assertEqual(parse_status_response(b"no status here"), {})
 
+    def test_parse_binary_status_all_off(self):
+        """机载 8 路板: 全关返回 8 个 0x00。"""
+        self.assertEqual(parse_status_response(bytes([0] * 8)), {c: False for c in range(1, 9)})
+
+    def test_parse_binary_status_first_channel_on(self):
+        """机载 8 路板: 打开第 1 路后第一字节为 0x01。"""
+        self.assertEqual(
+            parse_status_response(bytes([1, 0, 0, 0, 0, 0, 0, 0])),
+            {1: True, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False, 8: False},
+        )
+
+    def test_parse_binary_status_four_channel_board(self):
+        self.assertEqual(
+            parse_status_response(bytes([0, 1, 0, 1]), channel_count=4),
+            {1: False, 2: True, 3: False, 4: True},
+        )
+
+    def test_parse_binary_partial_reply_ignored(self):
+        """分片(不足 channel_count 字节)不能当成状态。"""
+        self.assertEqual(parse_status_response(bytes([1, 0, 0])), {})
+
+    def test_parse_binary_rejects_non_boolean_bytes(self):
+        self.assertEqual(parse_status_response(bytes([2, 0, 0, 0, 0, 0, 0, 0])), {})
+
+    def test_ascii_format_takes_precedence(self):
+        raw = b"CH1: ON \r\nCH2: OFF\r\nCH3: OFF\r\nCH4: OFF\r\n"
+        self.assertEqual(parse_status_response(raw), {1: True, 2: False, 3: False, 4: False})
+
     def test_format_states(self):
         self.assertEqual(format_states({2: False, 1: True}), "CH1=ON CH2=OFF")
         self.assertEqual(format_states({}), "(空)")
@@ -308,6 +336,29 @@ class DriverTests(unittest.TestCase):
         relay, serial_obj = self.make_relay()
         self.assertIsNone(relay.detect_channel_count())
         self.assertEqual(serial_obj.writes, [b"\xff"])
+
+    def test_binary_status_board_detect_and_verify(self):
+        """机载 8 路板(二进制状态): detect 返回 8, 单路 verify 能通过。"""
+        state = {channel: False for channel in range(1, 9)}
+
+        def responder(command):
+            if command == b"\xff":
+                return bytes(1 if state[channel] else 0 for channel in range(1, 9))
+            if len(command) == 4 and command[0] == 0xA0:
+                state[command[1]] = command[2] == 0x01
+            return b""
+
+        relay, serial_obj = self.make_relay(responder)
+        self.assertEqual(relay.detect_channel_count(), 8)
+        self.assertEqual(serial_obj.writes, [b"\xff"])  # 识别阶段只发查询帧
+
+        self.assertTrue(relay.set_channel(1, True, verify=True))
+        self.assertIn(bytes.fromhex("A00101A2"), serial_obj.writes)
+        self.assertTrue(relay.set_channel(1, False, verify=True))
+        self.assertIn(bytes.fromhex("A00100A1"), serial_obj.writes)
+
+        states = relay.query_status()
+        self.assertEqual(states, {channel: False for channel in range(1, 9)})
 
     def test_get_channel_state_reports_single_channel(self):
         def responder(command):
