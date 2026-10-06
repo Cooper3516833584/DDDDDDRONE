@@ -461,17 +461,20 @@ class WiringTests(unittest.TestCase):
         for flight in (False, True):
             with self.subTest(flight=flight):
                 fc, relay, mission = Mock(), Mock(), Mock()
+                fc.connected = True
+                fc.state.is_fresh.return_value = True
                 fc.state.unlock.value = False
                 relay.detect_channel_count.return_value = 8
                 relay.query_status.return_value = dict.fromkeys(range(1, 9), False)
                 planner = Mock()
                 namespace = {"parse_args": lambda: SimpleNamespace(confirm_flight=flight,
-                             red_count=2, blue_count=1, green_count=1, fc_port="fake", relay_port="fake"),
+                             red_count=2, blue_count=1, green_count=1,
+                             fc_host="127.0.0.1", fc_server_port=5654, relay_port="fake"),
                              "threading": module.threading, "FREE_COLORS": ("red", "blue", "green"),
                              "validate_allocation": Mock(return_value={"red": 2, "blue": 1, "green": 1}),
                              "VisionInterface": Mock(), "ObstaclePlanner2D": Mock(return_value=planner),
                              "ObstacleInterface": Mock(), "require_flight_interfaces": Mock(),
-                             "FC_Controller": Mock(return_value=fc), "Navigation": Mock(),
+                             "FC_Client": Mock(return_value=fc), "Navigation": Mock(),
                              "Mission": Mock(return_value=mission), "LCUSRelay": Mock(return_value=relay),
                              "RELAY_CHANNEL_COUNT": 8, "TOTAL_DROP_COUNT": 5, "MISSION_TIMEOUT": 1200,
                              "PAYLOAD_RELAY_CHANNELS": (8, 6, 4, 1, 5),
@@ -480,6 +483,10 @@ class WiringTests(unittest.TestCase):
                              "stop_navigation_ros": Mock()}
                 exec(compile(tree, str(source), "exec"), namespace)
                 self.assertEqual(namespace["main"](), 0)
+                fc.connect.assert_called_once_with(
+                    host="127.0.0.1", port=5654, authkey=b"fc",
+                    print_state=False, block=True, timeout=10)
+                fc.start_listen_serial.assert_not_called()
                 self.assertEqual(namespace["ObstaclePlanner2D"].call_count, int(flight))
                 self.assertIs(namespace["Navigation"].call_args.kwargs["obstacle_planner"],
                               planner if flight else None)

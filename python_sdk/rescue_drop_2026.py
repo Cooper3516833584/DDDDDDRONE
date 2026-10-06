@@ -1,8 +1,8 @@
 """2026 空地协同救援物资投放赛无人机主入口。
 
-默认仅连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
+默认通过 FC_Server 连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
 避障接口实现、投放数量、继电器端口和终端 ``start_mission`` 指令。
-运行前确认 server_ros.py / FC_Server 未运行，避免抢占飞控串口。
+机上自启动的 server_ros.py / FC_Server 独占飞控串口，本任务不直连串口。
 
 导航坐标单位为 cm，x 向前、y 向左；高度单位为 cm。
 受保护航段使用二维雷达避障；点云缺失或过期时拒绝继续规划。
@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
-from FlightController import FC_Controller
+from FlightController import FC_Client, FC_Like
 from FlightController.Components import LD_Radar
 from FlightController.Components.ObstaclePlanner2D import ObstaclePlanner2D
 from FlightController.Components.relay_lcus import LCUSRelay
@@ -33,7 +33,8 @@ LEFT_SPAN_Y_CM = 175.0          # y_l：航迹起点左侧范围
 RIGHT_SPAN_Y_CM = 175.0         # y_r：航迹起点右侧范围
 CENTER_INSET_X_CM = 80.0        # 航迹 3 折返到距航迹起点前方 80 cm
 
-FC_SERIAL_DEV = "/dev/ttyACM0"
+FC_SERVER_HOST = "127.0.0.1"
+FC_SERVER_PORT = 5654
 CRUISE_SPEED = 15.0
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 22.0
@@ -432,7 +433,7 @@ def wait_for_radar_pose(navi, radar, timeout=15.0, newer_than=0.0):
 
 
 class Mission:
-    def __init__(self, fc: FC_Controller, navi: Navigation,
+    def __init__(self, fc: FC_Like, navi: Navigation,
                  relay: Optional[LCUSRelay], vision: Optional[VisionInterface],
                  obstacle: Optional[ObstacleInterface], allocation: Dict[str, int],
                  stop_event: threading.Event):
@@ -539,6 +540,8 @@ class Mission:
             raise RuntimeError("mission stopped")
         if self._vision_error is not None:
             raise RuntimeError("vision observer failed") from self._vision_error
+        if not self.fc.connected:
+            raise RuntimeError("FC_Server connection lost")
         if not self.fc.state.is_fresh(0.5):
             raise RuntimeError("flight-controller telemetry is stale")
         if not self.navi.pose_is_fresh():
@@ -889,7 +892,7 @@ class Mission:
             self.navi.stop()
 
 
-def emergency_land(fc: FC_Controller) -> bool:
+def emergency_land(fc: FC_Like) -> bool:
     """请求降落；未确认落地前不强制锁桨，也不开断剩余物资。"""
     logger.warning("[RESCUE] Flight interrupted; requesting emergency landing")
     fc.set_flight_mode(fc.PROGRAM_MODE)
@@ -921,13 +924,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="2026 救援物资投放无人机主入口")
     parser.add_argument("--confirm-flight", action="store_true",
                         help="启用真实飞行；默认仅监视 LIO 位姿")
-    parser.add_argument("--fc-port", default=FC_SERIAL_DEV)
+    parser.add_argument("--fc-host", default=FC_SERVER_HOST,
+                        help="FC_Server 地址；机上自启动服务默认在本机")
+    parser.add_argument("--fc-server-port", type=int, default=FC_SERVER_PORT,
+                        help="FC_Server TCP 端口，默认 5654")
+    parser.add_argument("--fc-port", default=None,
+                        help="旧版直连串口参数；FC_Server 运行时不得使用")
     parser.add_argument("--relay-port", default=None,
                         help="LCUS 继电器串口；也可用 D_TASK_RELAY_PORT 环境变量")
     parser.add_argument("--red-count", type=int)
     parser.add_argument("--blue-count", type=int)
     parser.add_argument("--green-count", type=int)
     args = parser.parse_args()
+    if args.fc_port is not None:
+        parser.error("--fc-port cannot be used while FC_Server owns the serial port; "
+                     "use --fc-host and --fc-server-port")
+    if not 1 <= args.fc_server_port <= 65535:
+        parser.error("--fc-server-port must be between 1 and 65535")
     if args.confirm_flight:
         if any(count is None for count in (
                 args.red_count, args.blue_count, args.green_count)):
@@ -966,7 +979,7 @@ def wait_for_start_command() -> None:
 def main() -> int:
     args = parse_args()
     stop_event = threading.Event()
-    fc: Optional[FC_Controller] = None
+    fc: Optional[FC_Client] = None
     navi: Optional[Navigation] = None
     relay: Optional[LCUSRelay] = None
     mission: Optional[Mission] = None
@@ -992,12 +1005,16 @@ def main() -> int:
             obstacle = ObstacleInterface(obstacle_planner)
             require_flight_interfaces(vision, obstacle)
 
-        fc = FC_Controller()
-        fc.start_listen_serial(serial_dev=args.fc_port, print_state=False)
+        fc = FC_Client()
+        fc.connect(host=args.fc_host, port=args.fc_server_port, authkey=b"fc",
+                   print_state=False, block=True, timeout=10)
         if not fc.wait_for_connection(timeout_s=10):
-            raise RuntimeError("flight-controller connection timeout")
-        if not fc.state.is_fresh(0.5):
-            raise RuntimeError("flight-controller telemetry is stale")
+            raise RuntimeError("FC_Server connection timeout")
+        telemetry_deadline = time.monotonic() + 10.0
+        while not fc.state.is_fresh(0.5):
+            if not fc.connected or time.monotonic() >= telemetry_deadline:
+                raise RuntimeError("fresh flight-controller telemetry unavailable via FC_Server")
+            stop_event.wait(0.05)
         if fc.state.unlock.value:
             raise RuntimeError("flight controller already unlocked; refuse takeover")
 
