@@ -474,6 +474,8 @@ class WiringTests(unittest.TestCase):
                              "FC_Controller": Mock(return_value=fc), "Navigation": Mock(),
                              "Mission": Mock(return_value=mission), "LCUSRelay": Mock(return_value=relay),
                              "RELAY_CHANNEL_COUNT": 8, "TOTAL_DROP_COUNT": 5, "MISSION_TIMEOUT": 1200,
+                             "PAYLOAD_RELAY_CHANNELS": (8, 6, 4, 1, 5),
+                             "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0, 288.0),
                              "wait_for_start_command": Mock(), "time": module.time, "logger": Mock()}
                 exec(compile(tree, str(source), "exec"), namespace)
                 self.assertEqual(namespace["main"](), 0)

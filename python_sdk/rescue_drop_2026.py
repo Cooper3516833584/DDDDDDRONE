@@ -45,10 +45,12 @@ LIO_POSE_READY_TIMEOUT = 15.0
 MONITOR_INTERVAL = 1.0
 
 # 视觉初值沿用 former_code/2026_disaster_survey.py；超时和丢失等待由用户指定。
-VISUAL_CENTER_THRESHOLD_PX = 30.0
+VISUAL_CENTER_THRESHOLD_PX = 30.0  # 巡航接近结束、开始下降的像素距离
+LOW_CALIBRATION_THRESHOLD_PX = 10.0  # 下降后的悬挂点校准误差
 VISUAL_APPROACH_SPEED = 15.0
 VISUAL_PERIOD = 0.1
 VISUAL_MAX_AGE = 0.5
+VISION_WARMUP_S = 6.0
 TARGET_LOSS_WAIT = 2.0
 LOW_CALIBRATION_TIMEOUT = 6.0
 MISSION_TIMEOUT = 20.0 * 60.0
@@ -68,14 +70,35 @@ TARGET_TRACK_GATE_RATIO = 0.15  # 关联门限 = 该比例 × 画面短边
 TARGET_TRACK_TIMEOUT_S = 0.6    # 连续多久没再看到就丢弃该身份
 TARGET_CAMERA_READ_FAILURES = 10  # 连续读帧失败达到该次数即判定相机失效
 
-FREE_DROP_COUNT = 4
+FREE_DROP_COUNT = 4  # 任务牌配额仍合计 4；每色仅触发一次时允许未投完
 MANDATORY_DROP_COUNT = 1
 TOTAL_DROP_COUNT = FREE_DROP_COUNT + MANDATORY_DROP_COUNT
 RELAY_CHANNEL_COUNT = 8
+PAYLOAD_RELAY_CHANNELS = (8, 6, 4, 1, 5)  # 第 n 次投掷对应的继电器路号
+PAYLOAD_ANGLES_DEG = (0.0, 72.0, 144.0, 216.0, 288.0)  # 机头 0°，逆时针为正
+PAYLOAD_RADIUS_CM = 7.2
+CAMERA_VIEW_REFERENCE_HEIGHT_CM = 160.0  # 高度 160cm 时长边视野 300cm
+CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT = 300.0
 FREE_COLORS = ("red", "blue", "green")
 MANDATORY_COLOR = "yellow"
 
 Point = Tuple[float, float]
+
+
+def payload_target_offset_px(drop_number: int, height_cm: float,
+                             frame_size: Tuple[int, int]) -> Point:
+    """按长边视野与高度等比缩放，求第 n 件货物相对画面中心的位置。"""
+    if drop_number < 1 or drop_number > TOTAL_DROP_COUNT:
+        raise ValueError("drop number out of range")
+    if not math.isfinite(height_cm) or height_cm <= 0:
+        raise ValueError("invalid camera height")
+    long_edge_px = max(frame_size)
+    if long_edge_px <= 0:
+        raise ValueError("invalid camera frame size")
+    radius_px = (PAYLOAD_RADIUS_CM * long_edge_px * CAMERA_VIEW_REFERENCE_HEIGHT_CM
+                 / (CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT * height_cm))
+    angle = math.radians(PAYLOAD_ANGLES_DEG[drop_number - 1])
+    return radius_px * math.cos(angle), radius_px * math.sin(angle)
 
 
 def body_to_world_velocity(body_x: float, body_y: float, yaw_cw_deg: float) -> Point:
@@ -156,6 +179,10 @@ class VisionInterface:
         self._tracks: Dict[str, _TargetTrack] = {}
         self._next_track_id = 1
         self._read_failures = 0
+
+    @property
+    def frame_size(self) -> Tuple[int, int]:
+        return self._frame_size
 
     def open(self) -> None:
         if self._camera is not None:
@@ -341,12 +368,12 @@ def nearest_point_on_route(point: Point, route: Sequence[Point]) -> RouteProject
 
 
 class DropLedger:
-    """继电器顺位和任务牌配额；回读不确定也占用该次投掷。"""
+    """投掷顺位、继电器映射和任务牌配额；回读不确定也占用顺位。"""
 
     def __init__(self, allocation: Dict[str, int]):
         self.remaining = dict(allocation)
         self.mandatory_remaining = MANDATORY_DROP_COUNT
-        self.next_channel = 1
+        self.next_drop_number = 1
 
     def has_quota(self, color: str) -> bool:
         if color == MANDATORY_COLOR:
@@ -356,10 +383,11 @@ class DropLedger:
     def record_attempt(self, color: str) -> int:
         if not self.has_quota(color):
             raise RuntimeError("no remaining quota for {}".format(color))
-        channel = self.next_channel
-        if channel > TOTAL_DROP_COUNT:
+        drop_number = self.next_drop_number
+        if drop_number > TOTAL_DROP_COUNT:
             raise RuntimeError("planned relay channels exhausted")
-        self.next_channel += 1
+        channel = PAYLOAD_RELAY_CHANNELS[drop_number - 1]
+        self.next_drop_number += 1
         if color == MANDATORY_COLOR:
             self.mandatory_remaining -= 1
         else:
@@ -421,12 +449,14 @@ class Mission:
                             MissionState.ROUTE_2: 1}
         self.state = MissionState.ROUTE_1
         self.free_origin = MissionState.ROUTE_1
+        self._triggered_free_colors = set()
         self.target: Optional[TargetObservation] = None
         self.deadline: Optional[float] = None
         self.landed = False
         self._latest: Dict[str, TargetObservation] = {}
         self._vision_lock = threading.Lock()
         self._vision_stop = threading.Event()
+        self._vision_first_poll = threading.Event()
         self._vision_error: Optional[Exception] = None
         self._vision_thread: Optional[threading.Thread] = None
 
@@ -455,10 +485,26 @@ class Mission:
             target=self._vision_loop, name="rescue-target-observer", daemon=True)
         self._vision_thread.start()
 
+    def warmup_vision(self) -> None:
+        """起飞前持续运行视觉至少 6 秒，并确认采集识别循环已执行。"""
+        if self._vision_thread is None:
+            raise RuntimeError("vision observer was not started")
+        ready_at = time.monotonic() + VISION_WARMUP_S
+        while time.monotonic() < ready_at:
+            self._check()
+            if not self._vision_thread.is_alive():
+                raise RuntimeError("vision observer stopped during warmup")
+            self.stop_event.wait(min(VISUAL_PERIOD, ready_at - time.monotonic()))
+        self._check()
+        if not self._vision_thread.is_alive() or not self._vision_first_poll.is_set():
+            raise RuntimeError("vision observer did not complete a poll during warmup")
+        logger.info("[RESCUE] Vision warmup completed after at least {:.1f}s", VISION_WARMUP_S)
+
     def _vision_loop(self) -> None:
         try:
             while not self._vision_stop.is_set():
                 observations = self.vision.poll()
+                self._vision_first_poll.set()
                 now = time.monotonic()
                 with self._vision_lock:
                     for observation in observations:
@@ -484,6 +530,7 @@ class Mission:
                           and (target_id is None or obs.target_id == target_id)
                           and (color is not None or target_id is not None
                               or (obs.color in FREE_COLORS
+                              and obs.color not in self._triggered_free_colors
                               and self.ledger.has_quota(obs.color)))]
         return max(candidates, key=lambda obs: obs.captured_at) if candidates else None
 
@@ -591,6 +638,19 @@ class Mission:
             self.route_index[state] += 1
         return None
 
+    def _enter_free_drop(self, origin: MissionState,
+                         target: TargetObservation) -> None:
+        if (origin not in (MissionState.ROUTE_1, MissionState.ROUTE_2)
+                or target.color not in FREE_COLORS
+                or target.color in self._triggered_free_colors
+                or not self.ledger.has_quota(target.color)):
+            raise RuntimeError("free target cannot trigger another drop state")
+        # 进入状态即占用该颜色的唯一触发机会，接近时丢失目标也不重复触发。
+        self._triggered_free_colors.add(target.color)
+        self.free_origin = origin
+        self.target = target
+        self.state = MissionState.FREE_DROP
+
     def _resume_route(self, state: MissionState) -> None:
         route = {MissionState.ROUTE_1: self.route_1,
                  MissionState.CENTER: self.route_3,
@@ -602,8 +662,11 @@ class Mission:
         self._navigate_leg(projection.point, protected=state == MissionState.CENTER)
         self.route_index[state] = projection.segment_index + 1
 
-    def _move_toward(self, observation: TargetObservation, protected: bool) -> None:
-        angle = math.atan2(observation.offset_y_px, observation.offset_x_px)
+    def _move_toward(self, observation: TargetObservation, protected: bool,
+                     desired_offset: Point = (0.0, 0.0)) -> None:
+        error_x = observation.offset_x_px - desired_offset[0]
+        error_y = observation.offset_y_px - desired_offset[1]
+        angle = math.atan2(error_y, error_x)
         body_velocity = (VISUAL_APPROACH_SPEED * math.cos(angle),
                          VISUAL_APPROACH_SPEED * math.sin(angle))
         if protected:
@@ -660,8 +723,14 @@ class Mission:
         self._check(check_deadline)
 
     def _calibrate_low(self, target: TargetObservation,
-                       protected: bool) -> bool:
+                       protected: bool, drop_number: int) -> bool:
         """每件物资只使用本次校准开始后采集的新观测。"""
+        if self.vision is None:
+            raise RuntimeError("vision interface missing")
+        desired_offset = payload_target_offset_px(
+            drop_number, float(self.navi.current_height), self.vision.frame_size)
+        logger.info("[RESCUE] Drop {} target offset=({:.1f},{:.1f})px",
+                    drop_number, *desired_offset)
         started_at = time.monotonic()
         deadline = time.monotonic() + LOW_CALIBRATION_TIMEOUT
         hovering = False
@@ -674,13 +743,13 @@ class Mission:
                 if not hovering:
                     self.navi.stop_move()
                     hovering = True
-            elif math.hypot(observation.offset_x_px,
-                            observation.offset_y_px) <= VISUAL_CENTER_THRESHOLD_PX:
+            elif math.hypot(observation.offset_x_px - desired_offset[0],
+                            observation.offset_y_px - desired_offset[1]) <= LOW_CALIBRATION_THRESHOLD_PX:
                 self.navi.stop_move()
                 return True
             else:
                 hovering = False
-                self._move_toward(observation, protected)
+                self._move_toward(observation, protected, desired_offset)
             self.stop_event.wait(VISUAL_PERIOD)
         self.navi.stop_move()
         logger.warning("[RESCUE] Low-altitude calibration timed out for {}", target.target_id)
@@ -691,9 +760,10 @@ class Mission:
         if self.relay is None:
             raise RuntimeError("relay missing")
         # 先记顺位。即使回读失败，下一件也使用下一路，避免可能已释放时重投。
+        drop_number = self.ledger.next_drop_number
         channel = self.ledger.record_attempt(color)
-        logger.info("[DROP] Attempt {} target={} color={} calibrated={}",
-                    channel, target_id, color, calibrated)
+        logger.info("[DROP] Attempt {} relay={} target={} color={} calibrated={}",
+                    drop_number, channel, target_id, color, calibrated)
         confirmed = self.relay.turn_off(channel, verify=True, retries=1)
         if confirmed:
             logger.info("[DROP] Channel {} OFF confirmed; cargo release not sensor-verified",
@@ -710,9 +780,9 @@ class Mission:
             self._resume_route(self.free_origin)
             return
         self._set_height(FREE_DROP_HEIGHT)
-        while self.ledger.has_quota(target.color):
-            calibrated = self._calibrate_low(target, protected=False)
-            self._drop(target.color, target.target_id, calibrated)
+        calibrated = self._calibrate_low(
+            target, protected=False, drop_number=self.ledger.next_drop_number)
+        self._drop(target.color, target.target_id, calibrated)
         self._set_height(CRUISE_HEIGHT)
         self._resume_route(self.free_origin)
 
@@ -724,7 +794,8 @@ class Mission:
             self._resume_route(MissionState.CENTER)
             return False
         self._set_height(MANDATORY_DROP_HEIGHT)
-        calibrated = self._calibrate_low(target, protected=True)
+        calibrated = self._calibrate_low(
+            target, protected=True, drop_number=self.ledger.next_drop_number)
         self._drop(MANDATORY_COLOR, target.target_id, calibrated)
         self._set_height(CRUISE_HEIGHT)
         self._navigate_leg(self.route_3[-1], protected=True)
@@ -746,7 +817,7 @@ class Mission:
     def run(self) -> None:
         self._check()
         self.start_vision()
-        self._check()
+        self.warmup_vision()
         logger.warning("[RESCUE] Confirmed real-flight mission started")
         try:
             self.navi.pointing_takeoff(TAKEOFF_POINT, target_height=CRUISE_HEIGHT)
@@ -765,8 +836,7 @@ class Mission:
                     if self.target is None:
                         self.state = MissionState.CENTER
                     else:
-                        self.free_origin = self.state
-                        self.state = MissionState.FREE_DROP
+                        self._enter_free_drop(self.state, self.target)
                 elif self.state is MissionState.FREE_DROP:
                     self._free_drop()
                     self.state = self.free_origin
@@ -776,6 +846,8 @@ class Mission:
                         logger.warning("[RESCUE] Mandatory yellow target not found")
                         self.state = MissionState.ROUTE_2
                     else:
+                        if self.target.color != MANDATORY_COLOR:
+                            raise RuntimeError("mandatory drop requires a yellow target")
                         self.state = MissionState.MANDATORY_DROP
                 elif self.state is MissionState.MANDATORY_DROP:
                     self.state = (MissionState.ROUTE_2 if self._mandatory_drop()
@@ -785,13 +857,18 @@ class Mission:
                     if self.target is None:
                         self.state = MissionState.DONE
                     else:
-                        self.free_origin = self.state
-                        self.state = MissionState.FREE_DROP
+                        self._enter_free_drop(self.state, self.target)
 
+            if any(self.ledger.remaining.values()):
+                logger.warning("[RESCUE] Free cargo left unattempted: {}",
+                               self.ledger.remaining)
             self._return_and_land()
         except MissionDeadline:
             logger.warning("[RESCUE] Deadline reached; stop search and return")
             self.navi.navigation_stop_here()
+            if any(self.ledger.remaining.values()):
+                logger.warning("[RESCUE] Free cargo left unattempted: {}",
+                               self.ledger.remaining)
             if not self.navi.pose_is_fresh():
                 raise
             protected = self.state in (MissionState.CENTER,
@@ -853,7 +930,8 @@ def require_flight_interfaces(vision: VisionInterface,
 
 
 def wait_for_start_command() -> None:
-    logger.warning("[RESCUE] Payload channels 1-5 ON; enter start_mission to take off")
+    logger.warning("[RESCUE] Payload channels {} ON; enter start_mission to take off",
+                   PAYLOAD_RELAY_CHANNELS)
     while True:
         command = input("[RESCUE] start_mission> ")
         if command == "start_mission":
@@ -877,6 +955,12 @@ def main() -> int:
 
     try:
         if args.confirm_flight:
+            if (len(PAYLOAD_RELAY_CHANNELS) != TOTAL_DROP_COUNT
+                    or len(PAYLOAD_ANGLES_DEG) != TOTAL_DROP_COUNT
+                    or len(set(PAYLOAD_RELAY_CHANNELS)) != TOTAL_DROP_COUNT
+                    or any(channel < 1 or channel > RELAY_CHANNEL_COUNT
+                           for channel in PAYLOAD_RELAY_CHANNELS)):
+                raise RuntimeError("invalid payload relay/angle configuration")
             allocation = validate_allocation(
                 args.red_count, args.blue_count, args.green_count)
             vision = VisionInterface()
@@ -910,7 +994,7 @@ def main() -> int:
         if states is None or any(states.get(channel) is not False
                                  for channel in range(1, RELAY_CHANNEL_COUNT + 1)):
             raise RuntimeError("all eight relay channels must initially report OFF")
-        for channel in range(1, TOTAL_DROP_COUNT + 1):
+        for channel in PAYLOAD_RELAY_CHANNELS:
             relay_modified = True
             if not relay.turn_on(channel, verify=True, retries=1):
                 raise RuntimeError("failed to confirm payload channel {} ON".format(channel))
