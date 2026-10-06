@@ -31,6 +31,7 @@ if SDK_DIR not in sys.path:
 from FlightController.Components.relay_lcus import (  # noqa: E402
     DEFAULT_BAUDRATE,
     DEFAULT_RELAY_PORT,
+    DEFAULT_VERIFY_SETTLE,
     LCUSRelay,
     RELAY_PORT_ENV,
     build_channel_command,
@@ -253,6 +254,8 @@ class DriverTests(unittest.TestCase):
 
     def make_relay(self, responder=None, **kwargs):
         factory = self.install_fake_serial(responder)
+        # 默认关掉稳定等待, 让用例跑得快且不依赖真实时钟; 专门测 settle 的用例显式传值
+        kwargs.setdefault("verify_settle", 0)
         relay = LCUSRelay(port="/dev/fake-relay", query_timeout=0.05, **kwargs)
         relay.open()
         return relay, factory.created[0]
@@ -441,6 +444,45 @@ class DriverTests(unittest.TestCase):
             serial_obj.writes,
             [build_channel_command(channel, False, channel_count=4) for channel in range(1, 5)],
         )
+
+    # ---------------------------------------------------------------- 首帧回读滞后修复
+
+    def test_default_verify_settle_value(self):
+        self.install_fake_serial()
+        self.assertEqual(LCUSRelay(port="/dev/fake-relay").verify_settle, DEFAULT_VERIFY_SETTLE)
+        self.assertGreater(DEFAULT_VERIFY_SETTLE, 0)
+
+    def test_verify_settle_waits_before_readback(self):
+        """verify=True: 控制帧之后、FF 回读之前要等待 verify_settle。"""
+        def responder(command):
+            return status_reply(full_status([1])) if command == b"\xff" else b""
+
+        relay, _ = self.make_relay(responder, verify_settle=0.25)
+        with mock.patch("time.sleep") as sleeper:
+            self.assertTrue(relay.set_channel(1, True, verify=True))
+        self.assertIn(mock.call(0.25), sleeper.call_args_list)
+
+    def test_no_settle_wait_when_verify_disabled(self):
+        relay, _ = self.make_relay(verify_settle=0.25)
+        with mock.patch("time.sleep") as sleeper:
+            self.assertTrue(relay.set_channel(1, True))
+        self.assertNotIn(mock.call(0.25), sleeper.call_args_list)
+
+    def test_zero_verify_settle_restores_old_behaviour(self):
+        """verify_settle=0 时不等待(旧行为), 仍能靠回读确认。"""
+        def responder(command):
+            return status_reply(full_status([1])) if command == b"\xff" else b""
+
+        relay, _ = self.make_relay(responder, verify_settle=0)
+        with mock.patch("time.sleep") as sleeper:
+            self.assertTrue(relay.set_channel(1, True, verify=True))
+        self.assertEqual(sleeper.call_args_list, [])
+
+    def test_invalid_verify_settle_rejected(self):
+        self.install_fake_serial()
+        for bad in (-0.1, "0.1", None, float("nan")):
+            with self.assertRaises(ValueError):
+                LCUSRelay(port="/dev/fake-relay", verify_settle=bad)
 
 
 if __name__ == "__main__":

@@ -35,10 +35,12 @@
 - 已验证范围: 仅在一块 4 路 LCUS 板 (PC/COM3, CH340) 上验证过只读 FF 查询、
   ``detect_channel_count()`` 和单路开/关; 8 路板、第 5~8 路映射、多路同时吸合、
   长时间稳定性、运行中拔插 USB 均**未验证**。
-- 首次回读可能滞后: 实测控制帧后约 50ms 内 FF 回读仍返回旧状态, 因此 ``verify=True``
-  会稳定出现"第一次判定失败 -> 同状态重发 -> 第二次确认成功"。
-  同路同状态重发是幂等的、方向安全, 但每次带校验的操作可能多发一帧;
-  若首帧真的丢失, 重发是必需的, 因此不要为了少发一帧而关掉重发/校验。
+- 首次回读滞后与处理: 实测 4 路板与机载 8 路板在控制帧后约 15~50ms 内, FF 回读仍返回旧状态。
+  ``verify=True`` 现在会先等待 ``verify_settle``(默认 ``DEFAULT_VERIFY_SETTLE`` = 0.1s) 再回读,
+  正常情况下首次回读即一致, 不再出现"失败一次 -> 多发一帧";
+  重发机制保留作为兜底(板子更慢或首帧真的丢失时仍能确认), 不要为省帧而关掉重发/校验。
+  每次带校验的开关因此比原来多约 0.1s 耗时, 这是刻意的稳定性取舍;
+  需要旧行为可传 ``verify_settle=0``。
 - 端口不得猜测: CH340 的 USB ID 与 HC-14 电台相同 (``1a86:7523``), 不能只按 VID/PID
   自动识别端口。默认值 ``DEFAULT_RELAY_PORT`` 是实测确认过的物理 USB 口 (by-path);
   一旦换 USB 口、换线或换主机, 该路径会失效或指向别的设备, 必须重新拔插确认后修改,
@@ -75,6 +77,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
@@ -99,6 +102,12 @@ DEFAULT_CHANNEL_COUNT = 8
 MAX_CHANNEL_COUNT = 8
 MIN_CHANNEL = 1
 
+# ``verify=True`` 时, 控制帧发出后到首次 FF 回读之间的稳定等待(秒)。
+# 实测 (4 路板与机载 8 路板): 板子在收到控制帧后约 15~50ms 内, FF 回读仍返回旧状态,
+# 导致每次带校验的开关都要"失败一次 -> 重发 -> 确认", 多发一帧。等待 100ms 后
+# 首次回读即可拿到新状态, 重发只作为兜底保留 (板子更慢时可调大该值)。
+DEFAULT_VERIFY_SETTLE = 0.1
+
 CMD_PREFIX = 0xA0
 QUERY_BYTE = 0xFF
 STATE_ON = 0x01
@@ -118,6 +127,7 @@ __all__ = [
     "DEFAULT_RELAY_PORT",
     "DEFAULT_BAUDRATE",
     "DEFAULT_CHANNEL_COUNT",
+    "DEFAULT_VERIFY_SETTLE",
 ]
 
 
@@ -239,6 +249,7 @@ class LCUSRelay(object):
         channel_count: int = DEFAULT_CHANNEL_COUNT,
         timeout: float = 0.2,
         query_timeout: float = 1.0,
+        verify_settle: float = DEFAULT_VERIFY_SETTLE,
     ) -> None:
         """
         port: 串口设备; 为空时依次取环境变量 ``D_TASK_RELAY_PORT`` 和默认端口
@@ -247,11 +258,18 @@ class LCUSRelay(object):
         channel_count: 继电器路数, 默认 8
         timeout: 单次串口读超时(秒)
         query_timeout: 一次 FF 状态查询等待完整返回的总超时(秒)
+        verify_settle: ``verify=True`` 时, 控制帧发出后到首次 FF 回读之间的稳定等待(秒),
+            默认 ``DEFAULT_VERIFY_SETTLE``; 设为 0 表示不等待(退回旧行为, 靠重发兜底)
         """
         self._port, self._baudrate = resolve_relay_settings(port, baudrate)
         self.channel_count = _validate_channel_count(channel_count)
         self._timeout = float(timeout)
         self._query_timeout = float(query_timeout)
+        if not isinstance(verify_settle, (int, float)) or isinstance(verify_settle, bool):
+            raise ValueError(f"verify_settle 必须是数字, 实际 {verify_settle!r}")
+        if not math.isfinite(float(verify_settle)) or float(verify_settle) < 0:
+            raise ValueError(f"verify_settle 必须是非负有限值, 实际 {verify_settle!r}")
+        self._verify_settle = float(verify_settle)
         self._serial = None
         self._lock = threading.RLock()
 
@@ -264,6 +282,11 @@ class LCUSRelay(object):
     @property
     def baudrate(self) -> int:
         return self._baudrate
+
+    @property
+    def verify_settle(self) -> float:
+        """``verify=True`` 时控制帧到首次 FF 回读之间的稳定等待(秒)。"""
+        return self._verify_settle
 
     @property
     def connected(self) -> bool:
@@ -355,9 +378,10 @@ class LCUSRelay(object):
 
         风险与边界:
         - 本方法会真实吸合/断开触点, 调用前必须确认负载安全;
-        - 实测 4 路板在控制帧后约 50ms 内 FF 回读仍为旧状态, 所以 ``verify=True``
-          通常会出现一次"判定失败 -> 同状态重发 -> 确认成功"; 这是预期行为,
-          同路同状态重发幂等且方向安全, 不要为了少发一帧而把重发设为 0;
+        - 实测 4 路板与机载 8 路板在控制帧后约 15~50ms 内 FF 回读仍为旧状态; 因此
+          ``verify=True`` 时先等待 ``verify_settle``(默认 ``DEFAULT_VERIFY_SETTLE``=0.1s)
+          再回读, 正常情况下首次回读即一致; 若板子更慢仍会"失败 -> 同状态重发 -> 确认",
+          重发是兜底且幂等, 不要为了少发一帧而把重发设为 0;
         - ``verify=False`` 只表示"控制帧已发出", 不能证明继电器真的动作了,
           需要确认时必须用 ``verify=True`` 或事后调用 ``query_status()``。
         """
@@ -372,7 +396,9 @@ class LCUSRelay(object):
                 logger.info(f"[RELAY] 第{channel}路 -> {state_text} (发送 {_hex(command)})")
                 if not verify:
                     return True
-                # 立即回读: 板子状态刷新有延迟时这里会读到旧状态, 由下面的重发兜底
+                # 稳定等待: 板子状态快照更新需要几十毫秒, 立即回读会读到旧状态
+                if self._verify_settle > 0:
+                    time.sleep(self._verify_settle)
                 states = self._query_locked(serial_obj)
                 if states is not None and states.get(channel) == bool(on):
                     logger.info(f"[RELAY] 第{channel}路 {state_text} 已确认({format_states(states)})")
