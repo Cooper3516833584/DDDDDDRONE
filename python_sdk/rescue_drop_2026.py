@@ -53,7 +53,15 @@ VISUAL_PERIOD = 0.1
 VISUAL_MAX_AGE = 0.5
 VISION_WARMUP_S = 6.0
 TARGET_LOSS_WAIT = 2.0
-LOW_CALIBRATION_TIMEOUT = 6.0
+LOW_CALIBRATION_TIMEOUT = 9.0  # 原 6 秒的 1.5 倍
+LOW_CALIBRATION_MIN_SPEED = 5.0  # cm/s；沿用导航接口建议的精调速度下限
+LOW_CALIBRATION_MAX_SPEED = 12.0  # cm/s；低于巡航接近速度
+LOW_CALIBRATION_SPEED_PER_PX = 0.18  # 像素误差越小，水平速度越低
+LOW_CALIBRATION_LOOKAHEAD_S = 0.25  # 用像素运动趋势提前减速或悬停
+LOW_CALIBRATION_MAX_PIXEL_SPEED = 120.0  # 限制识别抖动对预测的影响
+LOW_CALIBRATION_MAX_FRAME_AGE_S = 0.25
+LOW_CALIBRATION_SETTLE_S = 0.3  # 连续新观测保持在阈值内才算校准完成
+LOW_CALIBRATION_LOG_PERIOD_S = 0.5
 MISSION_TIMEOUT = 20.0 * 60.0
 
 # 投放目标相机与识别：下视相机 + FlightController/Solutions/models/robocup_target.pt。
@@ -71,7 +79,7 @@ TARGET_TRACK_GATE_RATIO = 0.15  # 关联门限 = 该比例 × 画面短边
 TARGET_TRACK_TIMEOUT_S = 0.6    # 连续多久没再看到就丢弃该身份
 TARGET_CAMERA_READ_FAILURES = 10  # 连续读帧失败达到该次数即判定相机失效
 
-FREE_DROP_COUNT = 4  # 任务牌配额仍合计 4；每色仅触发一次时允许未投完
+FREE_DROP_COUNT = 4  # 任务牌配额仍合计 4；每次状态只投一件，剩余配额可再次触发
 MANDATORY_DROP_COUNT = 1
 TOTAL_DROP_COUNT = FREE_DROP_COUNT + MANDATORY_DROP_COUNT
 RELAY_CHANNEL_COUNT = 8
@@ -84,6 +92,23 @@ FREE_COLORS = ("red", "blue", "green")
 MANDATORY_COLOR = "yellow"
 
 Point = Tuple[float, float]
+
+
+def low_calibration_command(error: Point, pixel_velocity: Point) -> Tuple[float, Point]:
+    """按当前及短时预测误差计算低空速度；预测将入阈值时提前悬停。"""
+    predicted = (error[0] + pixel_velocity[0] * LOW_CALIBRATION_LOOKAHEAD_S,
+                 error[1] + pixel_velocity[1] * LOW_CALIBRATION_LOOKAHEAD_S)
+    distance = math.hypot(*error)
+    predicted_distance = math.hypot(*predicted)
+    if (distance <= LOW_CALIBRATION_THRESHOLD_PX
+            or predicted_distance <= LOW_CALIBRATION_THRESHOLD_PX
+            or error[0] * predicted[0] + error[1] * predicted[1] <= 0):
+        return 0.0, predicted
+    speed = min(LOW_CALIBRATION_MAX_SPEED,
+                max(LOW_CALIBRATION_MIN_SPEED,
+                    LOW_CALIBRATION_SPEED_PER_PX
+                    * (predicted_distance - LOW_CALIBRATION_THRESHOLD_PX)))
+    return speed, predicted
 
 
 def payload_target_offset_px(drop_number: int, height_cm: float,
@@ -467,7 +492,7 @@ class Mission:
                             MissionState.ROUTE_2: 1}
         self.state = MissionState.ROUTE_1
         self.free_origin = MissionState.ROUTE_1
-        self._triggered_free_colors = set()
+        self._completed_free_colors = set()
         self.target: Optional[TargetObservation] = None
         self.deadline: Optional[float] = None
         self.landed = False
@@ -548,7 +573,7 @@ class Mission:
                           and (target_id is None or obs.target_id == target_id)
                           and (color is not None or target_id is not None
                               or (obs.color in FREE_COLORS
-                              and obs.color not in self._triggered_free_colors
+                              and obs.color not in self._completed_free_colors
                               and self.ledger.has_quota(obs.color)))]
         return max(candidates, key=lambda obs: obs.captured_at) if candidates else None
 
@@ -662,11 +687,9 @@ class Mission:
                          target: TargetObservation) -> None:
         if (origin not in (MissionState.ROUTE_1, MissionState.ROUTE_2)
                 or target.color not in FREE_COLORS
-                or target.color in self._triggered_free_colors
+                or target.color in self._completed_free_colors
                 or not self.ledger.has_quota(target.color)):
             raise RuntimeError("free target cannot trigger another drop state")
-        # 进入状态即占用该颜色的唯一触发机会，接近时丢失目标也不重复触发。
-        self._triggered_free_colors.add(target.color)
         self.free_origin = origin
         self.target = target
         self.state = MissionState.FREE_DROP
@@ -683,12 +706,14 @@ class Mission:
         self.route_index[state] = projection.segment_index + 1
 
     def _move_toward(self, observation: TargetObservation, protected: bool,
-                     desired_offset: Point = (0.0, 0.0)) -> None:
-        error_x = observation.offset_x_px - desired_offset[0]
-        error_y = observation.offset_y_px - desired_offset[1]
+                     desired_offset: Point = (0.0, 0.0),
+                     speed: float = VISUAL_APPROACH_SPEED,
+                     control_error: Optional[Point] = None) -> None:
+        error_x, error_y = (control_error if control_error is not None else
+                            (observation.offset_x_px - desired_offset[0],
+                             observation.offset_y_px - desired_offset[1]))
         angle = math.atan2(error_y, error_x)
-        body_velocity = (VISUAL_APPROACH_SPEED * math.cos(angle),
-                         VISUAL_APPROACH_SPEED * math.sin(angle))
+        body_velocity = (speed * math.cos(angle), speed * math.sin(angle))
         if protected:
             if self.obstacle is None:
                 raise RuntimeError("obstacle interface missing")
@@ -752,27 +777,92 @@ class Mission:
         logger.info("[RESCUE] Drop {} target offset=({:.1f},{:.1f})px",
                     drop_number, *desired_offset)
         started_at = time.monotonic()
-        deadline = time.monotonic() + LOW_CALIBRATION_TIMEOUT
+        deadline = started_at + LOW_CALIBRATION_TIMEOUT
         hovering = False
+        previous_at = None
+        previous_error = None
+        pixel_velocity = (0.0, 0.0)
+        settled_at = None
+        last_log_at = started_at - LOW_CALIBRATION_LOG_PERIOD_S
+        last_error_distance = None
         while time.monotonic() < deadline:
             self._check()
+            now = time.monotonic()
             observation = self._observation(target_id=target.target_id)
-            if observation is not None and observation.captured_at <= started_at:
+            if (observation is not None
+                    and (observation.captured_at <= started_at
+                         or now - observation.captured_at > LOW_CALIBRATION_MAX_FRAME_AGE_S)):
                 observation = None
             if observation is None:
                 if not hovering:
                     self.navi.stop_move()
                     hovering = True
-            elif math.hypot(observation.offset_x_px - desired_offset[0],
-                            observation.offset_y_px - desired_offset[1]) <= LOW_CALIBRATION_THRESHOLD_PX:
-                self.navi.stop_move()
-                return True
-            else:
-                hovering = False
-                self._move_toward(observation, protected, desired_offset)
+                    if now - last_log_at >= LOW_CALIBRATION_LOG_PERIOD_S:
+                        logger.info("[ALIGN] target={} drop={} no fresh observation; hover",
+                                    target.target_id, drop_number)
+                        last_log_at = now
+                previous_at = None
+                previous_error = None
+                pixel_velocity = (0.0, 0.0)
+                settled_at = None
+            elif previous_at is None or observation.captured_at > previous_at:
+                error = (observation.offset_x_px - desired_offset[0],
+                         observation.offset_y_px - desired_offset[1])
+                if previous_at is not None and previous_error is not None:
+                    dt = observation.captured_at - previous_at
+                    if 0.04 <= dt <= VISUAL_MAX_AGE:
+                        measured = ((error[0] - previous_error[0]) / dt,
+                                    (error[1] - previous_error[1]) / dt)
+                        measured_speed = math.hypot(*measured)
+                        if measured_speed > LOW_CALIBRATION_MAX_PIXEL_SPEED:
+                            scale = LOW_CALIBRATION_MAX_PIXEL_SPEED / measured_speed
+                            measured = (measured[0] * scale, measured[1] * scale)
+                        pixel_velocity = ((pixel_velocity[0] + measured[0]) * 0.5,
+                                          (pixel_velocity[1] + measured[1]) * 0.5)
+                    else:
+                        pixel_velocity = (0.0, 0.0)
+                previous_at = observation.captured_at
+                previous_error = error
+                distance = math.hypot(*error)
+                last_error_distance = distance
+                speed, predicted_error = low_calibration_command(error, pixel_velocity)
+                if distance <= LOW_CALIBRATION_THRESHOLD_PX:
+                    if not hovering:
+                        self.navi.stop_move()
+                        hovering = True
+                    if settled_at is None:
+                        settled_at = observation.captured_at
+                    action = "settle"
+                elif speed == 0.0:
+                    if not hovering:
+                        self.navi.stop_move()
+                        hovering = True
+                    settled_at = None
+                    action = "brake"
+                else:
+                    settled_at = None
+                    hovering = False
+                    action = "move"
+                    self._move_toward(observation, protected, desired_offset,
+                                      speed=speed, control_error=predicted_error)
+                if now - last_log_at >= LOW_CALIBRATION_LOG_PERIOD_S:
+                    logger.info("[ALIGN] target={} drop={} offset=({:.1f},{:.1f})px "
+                                "error=({:.1f},{:.1f})px rate=({:.1f},{:.1f})px/s "
+                                "predicted=({:.1f},{:.1f})px speed={:.1f}cm/s action={}",
+                                target.target_id, drop_number,
+                                observation.offset_x_px, observation.offset_y_px,
+                                *error, *pixel_velocity, *predicted_error, speed, action)
+                    last_log_at = now
+                if (settled_at is not None
+                        and observation.captured_at - settled_at >= LOW_CALIBRATION_SETTLE_S):
+                    logger.info("[RESCUE] Low-altitude calibration settled for {} "
+                                "error={:.1f}px", target.target_id, distance)
+                    return True
             self.stop_event.wait(VISUAL_PERIOD)
         self.navi.stop_move()
-        logger.warning("[RESCUE] Low-altitude calibration timed out for {}", target.target_id)
+        logger.warning("[RESCUE] Low-altitude calibration timed out for {} "
+                       "after {:.1f}s; last_error_px={}", target.target_id,
+                       LOW_CALIBRATION_TIMEOUT, last_error_distance)
         return False
 
     def _drop(self, color: str, target_id: str, calibrated: bool) -> None:
@@ -791,6 +881,9 @@ class Mission:
         else:
             logger.error("[DROP] Channel {} OFF uncertain after one retry; continuing",
                          channel)
+        # 只在该颜色的指定投掷次数均已尝试后，禁止再次进入自由投掷。
+        if color in FREE_COLORS and not self.ledger.has_quota(color):
+            self._completed_free_colors.add(color)
 
     def _free_drop(self) -> None:
         target = self.target
