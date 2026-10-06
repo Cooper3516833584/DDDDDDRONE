@@ -168,7 +168,9 @@ class FC_State_Struct:
         self._fmt_length = struct.calcsize(self._fmt_string)
         self.update_event = Event()
         self.last_update_monotonic = 0.0
-        self._low_bat_warn_threshold = 3.5 * 3  # V
+        # 4S LiPo: 3.7 V/cell warning floor.  The pack was changed from 3S to 4S,
+        # so a per-cell based threshold is used instead of a fixed pack voltage.
+        self._low_bat_warn_threshold = 3.7 * 4  # V
         self._low_bat_warn_last_time = 0
 
     def update_from_bytes(self, bytes):
