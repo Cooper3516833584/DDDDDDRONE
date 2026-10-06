@@ -460,7 +460,9 @@ class WiringTests(unittest.TestCase):
         tree = ast.fix_missing_locations(ast.Module(body=[main], type_ignores=[]))
         for flight in (False, True):
             with self.subTest(flight=flight):
-                fc, relay, mission = Mock(), Mock(), Mock()
+                fc, relay, mission, vision = Mock(), Mock(), Mock(), Mock()
+                fc.connect.side_effect = lambda **kwargs: self.assertEqual(
+                    vision.prime.call_count, int(flight))
                 fc.connected = True
                 fc.state.is_fresh.return_value = True
                 fc.state.unlock.value = False
@@ -472,7 +474,8 @@ class WiringTests(unittest.TestCase):
                              fc_host="127.0.0.1", fc_server_port=5654, relay_port="fake"),
                              "threading": module.threading, "FREE_COLORS": ("red", "blue", "green"),
                              "validate_allocation": Mock(return_value={"red": 2, "blue": 1, "green": 1}),
-                             "VisionInterface": Mock(), "ObstaclePlanner2D": Mock(return_value=planner),
+                             "VisionInterface": Mock(return_value=vision),
+                             "ObstaclePlanner2D": Mock(return_value=planner),
                              "ObstacleInterface": Mock(), "require_flight_interfaces": Mock(),
                              "FC_Client": Mock(return_value=fc), "Navigation": Mock(),
                              "Mission": Mock(return_value=mission), "LCUSRelay": Mock(return_value=relay),
@@ -487,6 +490,7 @@ class WiringTests(unittest.TestCase):
                     host="127.0.0.1", port=5654, authkey=b"fc",
                     print_state=False, block=True, timeout=10)
                 fc.start_listen_serial.assert_not_called()
+                self.assertEqual(vision.prime.call_count, int(flight))
                 self.assertEqual(namespace["ObstaclePlanner2D"].call_count, int(flight))
                 self.assertIs(namespace["Navigation"].call_args.kwargs["obstacle_planner"],
                               planner if flight else None)

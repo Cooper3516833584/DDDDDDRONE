@@ -223,6 +223,23 @@ class VisionInterface:
             except Exception:
                 logger.exception("[RESCUE] Failed to release target camera")
 
+    def prime(self) -> None:
+        """起飞准备前打开相机并完成首次推理，避免模型惰性加载阻塞控制线程。"""
+        self.open()
+        deadline = time.monotonic() + LIO_POSE_READY_TIMEOUT
+        while True:
+            self.poll()
+            if self._detector.names:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("target model first inference timed out")
+                self._tracks.clear()
+                self._next_track_id = 1
+                logger.info("[RESCUE] Target camera/model first inference ready")
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("target camera/model first inference timed out")
+            time.sleep(VISUAL_PERIOD)
+
     def poll(self) -> Sequence[TargetObservation]:
         """抓一帧、检测并更新身份；返回本帧真正看到的目标观测。
 
@@ -1004,6 +1021,7 @@ def main() -> int:
             obstacle_planner = ObstaclePlanner2D()
             obstacle = ObstacleInterface(obstacle_planner)
             require_flight_interfaces(vision, obstacle)
+            vision.prime()
 
         fc = FC_Client()
         fc.connect(host=args.fc_host, port=args.fc_server_port, authkey=b"fc",
@@ -1063,6 +1081,11 @@ def main() -> int:
                 navi.stop()
             except Exception:
                 logger.exception("[RESCUE] Failed to stop navigation")
+        if mission is None and vision is not None:
+            try:
+                vision.close()
+            except Exception:
+                logger.exception("[RESCUE] Failed to close preflight vision")
 
         if (takeoff_attempted and fc is not None and fc.connected
                 and fc.state.unlock.value):
