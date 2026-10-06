@@ -174,3 +174,25 @@ C:\Users\TZDEZACR\Desktop\ground_station\Ground_Station\components
 
 两组外参的坐标方向、字段单位和台架测量步骤见
 `ros2_ws/README.md` 的 “Production measurements required” 一节。
+
+## 9. LCUS 8 路 USB 继电器（2026-10-06 确认）
+
+- 板子与端口：LCUS 型 8 路 USB 继电器，板载 CH340，USB ID `1a86:7523`，9600 8N1。
+  - 机载上位机 `fc`：物理 USB 口为**总线 1 / 端口 3**；唯一可用标识
+    `/dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0-port0`。该 CH340 **无序列号、无厂商字符串**，
+    其 `by-id` 名为 `usb-1a86_USB_Serial-if00-port0`，与机载 HC-14 电台同名，**禁止使用 by-id**
+    （两者同时插入会互相覆盖）。拔插枚举已确认：拔掉该板时此 CH340 与 `/dev/ttyUSB0` 同时消失。
+  - PC 端：`COM3`（编号会变，先用 `relay_lcus_terminal.py --list` 确认）。
+  - 驱动默认端口已写入 `python_sdk/FlightController/Components/relay_lcus.py` 的
+    `DEFAULT_RELAY_PORT`；优先级：显式传参 > `D_TASK_RELAY_PORT` > 默认值。
+- 协议：控制帧 `A0|路号|状态|校验` 与说明书一致；状态查询 `FF` 在**本 8 路板**上返回
+  **二进制 8 字节**（每字节一路，`0x01`=开 / `0x00`=关），不是说明书的 ASCII `CH1: ON` 文本行。
+  4 路板实测为 ASCII 格式；驱动两种都支持。
+- **已知硬件缺陷：第 7 路损坏**（2026-10-06 用户现场确认）。
+  - 用户判定：外接电路在第 7 路动作时不工作，该路已坏。
+  - 软件侧实测（PC/COM3 两轮，第 7 路开 30 s 后关）：开关帧与 FF 回读均正常，保持期间持续
+    回读 `CH7=ON`，结束时 `CH7=OFF`，0 次重发——即串口与板子的控制链路正常，软件无法观察触点侧，
+    故障位于触点/接线侧。
+  - 处置：使用该板时**避开第 7 路**；更换或修好之前，不要依赖该路完成任何动作。
+- 安全：继电器断电保持，`close()` 与进程退出都不会断开触点；程序结束前必须显式 `all_off()`
+  并回读确认。
