@@ -13,7 +13,7 @@ import pytest
 SOURCE = Path(__file__).resolve().parents[1] / "FlightController/Solutions/Navigation.py"
 tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
 source_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Navigation")
-methods = {"calibrate_basepoint", "set_navigation_state", "switch_navigation_mode",
+methods = {"calibrate_basepoint", "_get_lio_height", "set_navigation_state", "switch_navigation_mode",
            "update_realtime_control", "_navigation_task"}
 selected = ast.ClassDef(name="Navigation", bases=[], keywords=[],
                         body=[node for node in source_class.body
@@ -48,6 +48,9 @@ class Provider:
             return self.poses.pop(0)
         return self.poses[0]
 
+    def get_snapshot(self):
+        return {"position_m": (0.0, 0.0, 0.0)} if self.poses[-1] is not None else None
+
     def calibrate_basepoint(self, *, disarmed):
         assert disarmed
         self.calibrations += 1
@@ -70,6 +73,10 @@ class PID:
 def navigation(provider):
     nav = object.__new__(Navigation)
     nav.lio_pose = provider
+    nav.height_source = "fc_laser"
+    nav.current_height = 0.0
+    nav.current_height_lio = 0.0
+    nav._height_updated_at = 0.0
     nav.navigation_flag = False
     nav.keep_height_flag = False
     nav.running = True

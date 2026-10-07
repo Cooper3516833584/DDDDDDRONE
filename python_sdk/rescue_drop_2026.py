@@ -32,10 +32,14 @@ TRACK_LENGTH_X_CM = 150.0       # x_2：航迹前后方向长度
 LEFT_SPAN_Y_CM = 175.0          # y_l：航迹起点左侧范围
 RIGHT_SPAN_Y_CM = 175.0         # y_r：航迹起点右侧范围
 CENTER_INSET_X_CM = 80.0        # 航迹 3 折返到距航迹起点前方 80 cm
+# 目标地面高度相对起飞前 LIO 标定平面；更换场地时须重新测量这两项。
+FREE_TARGET_GROUND_HEIGHT_CM = 0.0
+MANDATORY_TARGET_GROUND_HEIGHT_CM = 30.0
 
 FC_SERVER_HOST = "127.0.0.1"
 FC_SERVER_PORT = 5654
 CRUISE_SPEED = 15.0
+# 以下三个高度均为 FAST-LIO startup-local Z 定高目标（cm），不是激光 AGL。
 CRUISE_HEIGHT = 150.0
 VERTICAL_SPEED = 22.0
 FREE_DROP_HEIGHT = 80.0
@@ -113,7 +117,7 @@ def low_calibration_command(error: Point, pixel_velocity: Point) -> Tuple[float,
 
 def payload_target_offset_px(drop_number: int, height_cm: float,
                              frame_size: Tuple[int, int]) -> Point:
-    """按长边视野与高度等比缩放，求第 n 件货物相对画面中心的位置。"""
+    """按相机到目标平面的估计距离缩放视野，求货物相对画面中心的位置。"""
     if drop_number < 1 or drop_number > TOTAL_DROP_COUNT:
         raise ValueError("drop number out of range")
     if not math.isfinite(height_cm) or height_cm <= 0:
@@ -508,7 +512,11 @@ class Mission:
         self.navi.set_vertical_speed(VERTICAL_SPEED)
         self.navi.start()
         wait_for_lio_basepoint(self.navi)
+        if not self.navi.height_is_fresh():
+            raise RuntimeError("LIO height is not ready after basepoint calibration")
         logger.info("[RESCUE] LIO basepoint calibrated: {}", self.navi.basepoint)
+        logger.info("[RESCUE] Height source={} local Z={:.1f}cm",
+                    self.navi.height_source, self.navi.current_height_lio)
 
     def monitor_pose(self) -> None:
         logger.warning("[RESCUE] Monitor-only mode; press Ctrl+C to exit")
@@ -588,6 +596,8 @@ class Mission:
             raise RuntimeError("flight-controller telemetry is stale")
         if not self.navi.pose_is_fresh():
             raise RuntimeError("LIO navigation pose is stale")
+        if not self.navi.height_is_fresh():
+            raise RuntimeError("LIO navigation height is stale")
         if check_deadline and self.deadline is not None and time.monotonic() >= self.deadline:
             raise MissionDeadline("20-minute mission deadline reached")
 
@@ -773,8 +783,13 @@ class Mission:
         """每件物资只使用本次校准开始后采集的新观测。"""
         if self.vision is None:
             raise RuntimeError("vision interface missing")
+        # 视觉尺度使用本场地的固定目标平面高度，不读取实时激光 AGL。
+        if target.color == MANDATORY_COLOR:
+            camera_height_cm = MANDATORY_DROP_HEIGHT - MANDATORY_TARGET_GROUND_HEIGHT_CM
+        else:
+            camera_height_cm = FREE_DROP_HEIGHT - FREE_TARGET_GROUND_HEIGHT_CM
         desired_offset = payload_target_offset_px(
-            drop_number, float(self.navi.current_height), self.vision.frame_size)
+            drop_number, camera_height_cm, self.vision.frame_size)
         logger.info("[RESCUE] Drop {} target offset=({:.1f},{:.1f})px",
                     drop_number, *desired_offset)
         started_at = time.monotonic()
@@ -1131,7 +1146,8 @@ def main() -> int:
             raise RuntimeError("flight controller already unlocked; refuse takeover")
 
         navi = Navigation(fc=fc, stop_event=stop_event,
-                          obstacle_planner=obstacle_planner)
+                          obstacle_planner=obstacle_planner,
+                          height_source="lio")
         mission = Mission(fc, navi, None, vision, obstacle, allocation, stop_event)
         mission.prepare_navigation()
 

@@ -86,6 +86,11 @@ class Navigation(object):
         """
         self.fc: FC_Like = kwargs["fc"]
         self.radar: Optional[LD_Radar] = kwargs.get("radar")
+        self.height_source: Literal["fc_laser", "lio"] = kwargs.get(
+            "height_source", "fc_laser"
+        )
+        if self.height_source not in ("fc_laser", "lio"):
+            raise ValueError("height_source must be 'fc_laser' or 'lio'")
         
         # 此处为没有t265的修改
         #self.rs: T265 = kwargs["rs"]
@@ -119,13 +124,16 @@ class Navigation(object):
         self.current_x = 0  # 当前位置X(相对于基地点) / cm
         self.current_y = 0  # 当前位置Y(相对于基地点) / cm
         self.current_yaw = 0  # 当前偏航角(顺时针为正) / deg
-        self.current_height = 0  # 当前高度(激光高度) / cm
+        self.current_height = 0.0  # 当前定高控制源的高度 / cm
+        self.current_height_lio = 0.0  # FAST-LIO startup-local Z / cm
+        self.current_height_agl = 0.0  # 飞控向下激光距地高度 / cm
+        self._height_updated_at = 0.0
         self.current_height_rs = 0.0  # 当前高度(realsense高度) / cm
         self.basepoint: Any = np.array([0.0, 0.0])  # 基地点(雷达坐标系)(Note:仅用于雷达扫网定位,建图则不需要) / cm
         #####################################
         self.keep_height_flag = False  # 定高状态
         self.navigation_flag = False  # 导航状态
-        self.keep_height_by_rs = False  # 历史兼容字段；运行时高度仅使用飞控遥测
+        self.keep_height_by_rs = False  # 历史兼容字段；运行时定高源由 height_source 决定
         self.stop_event = kwargs.get("stop_event")
         self.running = False
         self._control_lock = threading.Lock()
@@ -169,6 +177,12 @@ class Navigation(object):
         if pose is None:
             raise RuntimeError("LIO pose became stale during basepoint calibration")
         self.current_x, self.current_y, self.current_yaw, _ = pose
+        lio_height = self._get_lio_height()
+        if lio_height is None:
+            raise RuntimeError("LIO snapshot became stale during basepoint calibration")
+        if self.height_source == "lio":
+            self.current_height = lio_height
+            self._height_updated_at = time.monotonic()
         self._last_pose_update = time.monotonic()
         self.basepoint = np.array([0.0, 0.0])
         logger.info(f"[NAVI] Basepoint reset to {self.basepoint}")
@@ -330,7 +344,7 @@ class Navigation(object):
                     _source == "navigation" and not self.navigation_flag
                 )
                 allow_height = not (
-                    _source == "height" and not self.keep_height_flag
+                    _source == "height" and not self.keep_height_flag and vel_z != 0
                 )
                 if allow_navigation and vel_x is not None:
                     self._realtime_control_data_in_xyzYaw[0] = vel_x
@@ -446,17 +460,74 @@ class Navigation(object):
         self.navi_y_pid.tunings = tuning
         logger.debug(f"[NAVI] PID Tunings set to {pid}: {tuning}")
 
+    def _get_lio_height(self) -> Optional[float]:
+        snapshot = self.lio_pose.get_snapshot()
+        if snapshot is None:
+            return None
+        try:
+            height_cm = float(snapshot["position_m"][2]) * 100.0
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+        if not np.isfinite(height_cm):
+            return None
+        self.current_height_lio = height_cm
+        return height_cm
+
+    def get_agl_height(self, max_age: float = 0.5) -> Optional[float]:
+        """Return fresh FC downward-laser distance to the current ground, in cm."""
+        if not self._flight_state_is_fresh(max_age):
+            return None
+        try:
+            height_cm = float(self.fc.state.alt_add.value)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not np.isfinite(height_cm):
+            return None
+        self.current_height_agl = height_cm
+        return height_cm
+
+    def _get_control_height(self) -> Optional[float]:
+        if self.height_source == "lio":
+            return self._get_lio_height()
+        return self.get_agl_height()
+
+    def height_is_fresh(self, max_age: float = POSE_STALE_TIMEOUT) -> bool:
+        """Require a valid source and a recently consumed control-height sample."""
+        if self._height_updated_at <= 0 or (
+            time.monotonic() - self._height_updated_at > float(max_age)
+        ):
+            return False
+        if self.height_source == "lio":
+            return self._get_lio_height() is not None
+        return self.get_agl_height(max_age=max_age) is not None
+
     def _keep_height_task(self):
-        paused = False
+        paused = True
         while self.running:
             try:
-                if not self.fc.state.update_event.wait(1):
-                    logger.warning("[NAVI] FC state update timeout")
+                # A missing FC event must not leave an old LIO vertical command active.
+                wait_timeout = 0.1 if self.height_source == "lio" else 1.0
+                if not self.fc.state.update_event.wait(wait_timeout):
+                    if not paused:
+                        logger.warning("[NAVI] FC state update timeout; height paused")
+                    paused = True
+                    self._height_updated_at = 0.0
+                    self.height_pid.set_auto_mode(False)
                     self.update_realtime_control(vel_z=0, _source="height")
                     continue
                 self.fc.state.update_event.clear()
-                self.current_height = self.fc.state.alt_add.value
-                height = self.current_height
+                self.get_agl_height()
+                height = self._get_control_height()
+                if height is None:
+                    if not paused:
+                        logger.warning("[NAVI] Height source unavailable; height paused")
+                    paused = True
+                    self._height_updated_at = 0.0
+                    self.height_pid.set_auto_mode(False)
+                    self.update_realtime_control(vel_z=0, _source="height")
+                    continue
+                self.current_height = height
+                self._height_updated_at = time.monotonic()
                 logger_dbg.debug(f"[NAVI] Current height: {height}")
                 if not (
                     self.keep_height_flag
@@ -476,8 +547,11 @@ class Navigation(object):
                 out_hei = round(self.height_pid(height))  # type: ignore
                 self.update_realtime_control(vel_z=out_hei, _source="height")
                 logger_dbg.info(f"[NAVI] Height PID output: {out_hei}")
-            except Exception as e:
+            except Exception:
                 logger.exception("[NAVI] Keep height task error")
+                paused = True
+                self._height_updated_at = 0.0
+                self.height_pid.set_auto_mode(False)
                 self.update_realtime_control(vel_z=0, _source="height")
 
     def _get_t265_pose(self, wait=True) -> Optional[Tuple[float, float, float, bool]]:
@@ -569,6 +643,9 @@ class Navigation(object):
                     continue
                 pose = self.lio_pose.get_pose()
                 if pose is None:
+                    if self.height_source == "lio":
+                        self._height_updated_at = 0.0
+                        self.update_realtime_control(vel_z=0, _source="height")
                     self.update_realtime_control(
                         vel_x=0, vel_y=0, yaw=0, _source="navigation"
                     )
@@ -1164,7 +1241,8 @@ class Navigation(object):
         """
         设置飞行高度
 
-        height: 激光高度 / cm
+        height: 当前 height_source 坐标定义下的目标高度 / cm；
+            lio 为 startup-local Z，fc_laser 为向下激光 AGL。
         """
         self.height_pid.setpoint = height
         logger.debug(f"[NAVI] Keep height set to {height}")
@@ -1318,8 +1396,10 @@ class Navigation(object):
             logger.debug("[NAVI] Keep current horizontal position")
 
         # 4) 设置目标高度并等待到达
-        current_h = float(self.fc.state.alt_add.value) if hasattr(self.fc.state.alt_add, 'value') else self.current_height
-        logger.debug(f"[NAVI] Current height: {current_h:.1f}cm, Target: {target_height}cm")
+        logger.debug(
+            "[NAVI] Control height: {:.1f}cm, Target: {}cm, Source: {}",
+            self.current_height, target_height, self.height_source,
+        )
         
         self.set_height(float(target_height))
         self.wait_for_height(
@@ -1403,20 +1483,14 @@ class Navigation(object):
         self.fc.stablize()
         self.fc.land()
 
-        # 等待落地。只有新鲜高度足够低或飞控已自动上锁才允许补发 lock。
+        # 等待落地。只有新鲜 AGL 足够低或飞控已自动上锁才允许补发 lock。
         t0 = time.perf_counter()
         landed = False
         alt_thres = float(max(3, touchdown_alt_thres))
         while time.perf_counter() - t0 < max(1.0, float(touchdown_timeout)):
             time.sleep(0.1)
-            try:
-                alt_now = float(self.fc.state.alt_add.value)
-            except Exception:
-                alt_now = 999.0
-            state_fresh = bool(
-                getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
-            )
-            if (state_fresh and alt_now <= alt_thres) or (not self.fc.state.unlock.value):
+            agl_now = self.get_agl_height(max_age=0.5)
+            if (agl_now is not None and agl_now <= alt_thres) or (not self.fc.state.unlock.value):
                 landed = True
                 break
 
@@ -1430,11 +1504,8 @@ class Navigation(object):
         except TypeError:
             ok = self.fc.wait_for_lock(lock_timeout)
         if not ok:
-            state_fresh = bool(
-                getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
-            )
-            alt_now = float(self.fc.state.alt_add.value) if state_fresh else 999.0
-            if state_fresh and alt_now <= alt_thres:
+            agl_now = self.get_agl_height(max_age=0.5)
+            if agl_now is not None and agl_now <= alt_thres:
                 self.fc.lock()
             else:
                 logger.error("[NAVI] Lock not confirmed; refuse lock without fresh touchdown altitude")
@@ -1602,10 +1673,13 @@ class Navigation(object):
             return False
 
         target_height = (
-            float(self.fc.state.alt_add.value)
+            self._get_control_height()
             if hover_height is None
             else float(hover_height)
         )
+        if target_height is None or not np.isfinite(target_height):
+            logger.error("[NAVI] Cannot restore hover without valid control height")
+            return False
         self.direct_set_waypoint([self.current_x, self.current_y])
         self.set_height(target_height)
         self.switch_pid("hover")
@@ -1799,12 +1873,16 @@ class Navigation(object):
                 and self.pose_is_fresh()
                 and self.fc.state.mode.value == self.fc.HOLD_POS_MODE
             ):
-                self.direct_set_waypoint([self.current_x, self.current_y])
-                self.set_height(float(self.fc.state.alt_add.value))
-                self.switch_pid("hover")
-                self.navigation_flag = True
-                self.keep_height_flag = True
-                logger.warning("[NAVI] Moving landing timeout; holding current position")
+                target_height = self._get_control_height()
+                if target_height is not None:
+                    self.direct_set_waypoint([self.current_x, self.current_y])
+                    self.set_height(target_height)
+                    self.switch_pid("hover")
+                    self.navigation_flag = True
+                    self.keep_height_flag = True
+                    logger.warning("[NAVI] Moving landing timeout; holding current position")
+                else:
+                    logger.error("[NAVI] Moving landing cannot restore hover: height stale")
             return False
         if not landed:
             return False
@@ -1889,14 +1967,18 @@ class Navigation(object):
             if self.stop_event is not None and self.stop_event.is_set():
                 logger.warning("[NAVI] Height wait stopped by external stop event")
                 return False
-            if abs(self.current_height - self.height_pid.setpoint) < height_thres:
+            if (
+                self.running
+                and self._flight_state_is_fresh(0.5)
+                and self.height_is_fresh()
+                and abs(self.current_height - self.height_pid.setpoint) < height_thres
+                and abs(
+                    (self.current_height_lio if self.height_source == "lio"
+                     else self.current_height_agl) - self.height_pid.setpoint
+                ) < height_thres
+            ):
                 time_count += 0.05
             else:
-                time_count = 0
-            state_fresh = bool(
-                getattr(self.fc.state, "is_fresh", lambda _age: False)(0.5)
-            )
-            if not self.running or not state_fresh:
                 time_count = 0
             if time_count >= time_thres:
                 logger.info("[NAVI] Reached height")
@@ -2112,12 +2194,16 @@ class Navigation(object):
         self.fc.set_flight_mode(self.fc.HOLD_POS_MODE)
         self.set_height(70)
         self.keep_height_flag = True
-        self.wait_for_height()
+        first_height_ok = self.wait_for_height()
+        if self.height_source == "lio" and not first_height_ok:
+            raise RuntimeError("[NAVI] LIO initial takeoff height was not confirmed")
         self.navigation_flag = True
         self.navigation_to_waypoint(point, wait=True)  # 初始化路径点
         time.sleep(0.5)
         self.set_height(target_height)
-        self.wait_for_height()
+        target_height_ok = self.wait_for_height()
+        if self.height_source == "lio" and not target_height_ok:
+            raise RuntimeError("[NAVI] LIO target takeoff height was not confirmed")
         self.navigation_to_waypoint(point, wait=True)  # 初始化路径点
         self.switch_pid("hover")
         time.sleep(0.1)
