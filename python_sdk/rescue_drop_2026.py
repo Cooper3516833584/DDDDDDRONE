@@ -58,12 +58,12 @@ VISUAL_MAX_AGE = 0.5
 VISION_WARMUP_S = 6.0
 TARGET_LOSS_WAIT = 2.0
 LOW_CALIBRATION_TIMEOUT = 9.0  # 原 6 秒的 1.5 倍
-LOW_CALIBRATION_MIN_SPEED = 3.0  # cm/s；现场 5cm/s 在 10px 附近仍会越过目标
-LOW_CALIBRATION_MAX_SPEED = 12.0  # cm/s；低于巡航接近速度
-LOW_CALIBRATION_SPEED_PER_PX = 0.13  # 大误差仍可快飞，近目标进一步减速
-LOW_CALIBRATION_LOOKAHEAD_S = 0.30  # 用像素运动趋势提前减速或悬停
+LOW_CALIBRATION_MIN_SPEED = 2.0  # cm/s；小误差时降低单帧位移
+LOW_CALIBRATION_MAX_SPEED = 8.0  # cm/s；按现场约 0.4s 帧间隔限制位移
+LOW_CALIBRATION_SPEED_PER_PX = 0.10  # cm/s/px；减小近目标修正量
+LOW_CALIBRATION_LOOKAHEAD_S = 0.40  # 预测约一帧后的误差并提前制动
 LOW_CALIBRATION_MAX_PIXEL_SPEED = 120.0  # 限制识别抖动对预测的影响
-LOW_CALIBRATION_MAX_FRAME_AGE_S = 0.35
+LOW_CALIBRATION_MAX_FRAME_AGE_S = 0.45  # 覆盖现场常见 0.35-0.42s 帧间隔
 LOW_CALIBRATION_VELOCITY_MAX_GAP_S = 1.0  # 短暂漏帧不清空像素速度估计
 LOW_CALIBRATION_SETTLE_S = 0.3  # 连续新观测保持在阈值内才算校准完成
 LOW_CALIBRATION_SETTLE_MAX_GAP_S = 0.65  # 两帧间短暂空档可继续确认稳定
@@ -906,6 +906,7 @@ class Mission:
         goal = self.route_2[0]
         logger.info("[MANDATORY] Exit toward route-2 start: current={} goal={}",
                     self._position(), goal)
+        self.navi.stop_move()  # 完成全部必投后才恢复航迹导航 PID
         self._navigate_leg(goal, protected=True)
 
     def _enter_free_drop(self, origin: MissionState,
@@ -943,6 +944,16 @@ class Mission:
         logger.info("[CENTER] Resume from current position at route index {}",
                     self.route_index[MissionState.CENTER])
 
+    def _move_translation_only(self, speed: float, direction_deg: float) -> None:
+        """视觉手动平移时在同一控制帧中清零 yaw 角速度。"""
+        rad = math.radians(direction_deg)
+        self.navi.navigation_flag = False
+        self.navi.update_realtime_control(
+            vel_x=int(speed * math.cos(rad)),
+            vel_y=int(speed * math.sin(rad)),
+            yaw=0,
+        )
+
     def _move_toward(self, observation: TargetObservation, protected: bool,
                      desired_offset: Point = (0.0, 0.0),
                      speed: float = VISUAL_APPROACH_SPEED,
@@ -962,7 +973,10 @@ class Mission:
                 raise RuntimeError("obstacle avoidance velocity invalid")
             body_velocity = world_to_body_velocity(*safe_world_velocity, yaw)
         speed = math.hypot(*body_velocity)
-        if speed < 1.0:
+        if protected:
+            self._move_translation_only(
+                speed, math.degrees(math.atan2(body_velocity[1], body_velocity[0])))
+        elif speed < 1.0:
             self.navi.stop_move()
         else:
             self.navi.move_by_direction(
@@ -974,12 +988,17 @@ class Mission:
                          protected: bool) -> Optional[TargetObservation]:
         lost_at = None
         hovering = False
+        if protected:
+            self._move_translation_only(0.0, 0.0)
         while True:
             self._check()
             observation = self._observation(target_id=target.target_id)
             if observation is None:
                 if not hovering:
-                    self.navi.stop_move()
+                    if protected:
+                        self._move_translation_only(0.0, 0.0)
+                    else:
+                        self.navi.stop_move()
                     hovering = True
                 if lost_at is None:
                     lost_at = time.monotonic()
@@ -991,15 +1010,22 @@ class Mission:
                 hovering = False
                 if math.hypot(observation.offset_x_px,
                               observation.offset_y_px) <= VISUAL_CENTER_THRESHOLD_PX:
-                    self.navi.stop_move()
+                    if protected:
+                        self._move_translation_only(0.0, 0.0)
+                    else:
+                        self.navi.stop_move()
                     return observation
                 self._move_toward(observation, protected)
             self.stop_event.wait(VISUAL_PERIOD)
 
     def _set_height(self, height: float,
-                    check_deadline: bool = True) -> None:
+                    check_deadline: bool = True,
+                    translation_only: bool = False) -> None:
         self._check(check_deadline)
-        self.navi.stop_move()
+        if translation_only:
+            self._move_translation_only(0.0, 0.0)
+        else:
+            self.navi.stop_move()
         self.navi.set_height(height)
         if not self.navi.wait_for_height(timeout=10):
             raise RuntimeError("height {}cm was not confirmed".format(height))
@@ -1043,9 +1069,12 @@ class Mission:
                     missing_since = now
                 if not hovering:
                     # 短暂漏帧只发零速度，不反复启停导航位置 PID。
-                    self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                    if protected:
+                        self._move_translation_only(0.0, 0.0)
+                    else:
+                        self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
                     hovering = True
-                if (not position_hold
+                if (not protected and not position_hold
                         and now - missing_since >= LOW_CALIBRATION_HOLD_AFTER_LOSS_S):
                     self.navi.stop_move()
                     position_hold = True
@@ -1093,14 +1122,20 @@ class Mission:
                 speed, predicted_error = low_calibration_command(error, pixel_velocity)
                 if distance <= LOW_CALIBRATION_THRESHOLD_PX:
                     if not hovering:
-                        self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                        if protected:
+                            self._move_translation_only(0.0, 0.0)
+                        else:
+                            self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
                         hovering = True
                     if settled_at is None:
                         settled_at = observation.captured_at
                     action = "settle"
                 elif speed == 0.0:
                     if not hovering:
-                        self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                        if protected:
+                            self._move_translation_only(0.0, 0.0)
+                        else:
+                            self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
                         hovering = True
                     settled_at = None
                     action = "brake"
@@ -1127,7 +1162,10 @@ class Mission:
                                 "error={:.1f}px", target.target_id, distance)
                     return True
             self.stop_event.wait(VISUAL_PERIOD)
-        self.navi.stop_move()
+        if protected:
+            self._move_translation_only(0.0, 0.0)
+        else:
+            self.navi.stop_move()
         logger.warning("[RESCUE] Low-altitude calibration timed out for {} "
                        "after {:.1f}s; last_error_px={}", target.target_id,
                        LOW_CALIBRATION_TIMEOUT, last_error_distance)
@@ -1175,6 +1213,7 @@ class Mission:
             raise RuntimeError("mandatory target missing")
         approach_observation = self._approach_target(target, protected=True)
         if approach_observation is None:
+            self.navi.stop_move()
             self._resume_center_route()
             return False
         self._check()
@@ -1194,11 +1233,11 @@ class Mission:
         logger.info("[MANDATORY] 43cm drop-pose clearance accepted: "
                     "target={} drop={} target_world={} pose={}",
                     target.target_id, drop_number, target_world, desired_pose)
-        self._set_height(MANDATORY_DROP_HEIGHT)
+        self._set_height(MANDATORY_DROP_HEIGHT, translation_only=True)
         calibrated = self._calibrate_low(
             target, protected=True, drop_number=drop_number)
         self._drop(MANDATORY_COLOR, target.target_id, calibrated)
-        self._set_height(CRUISE_HEIGHT)
+        self._set_height(CRUISE_HEIGHT, translation_only=True)
         self._navigate_center_exit()
         return True
 

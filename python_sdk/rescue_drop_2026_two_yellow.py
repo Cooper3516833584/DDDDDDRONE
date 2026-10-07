@@ -27,6 +27,7 @@ class TwoYellowMission(rescue.Mission):
             raise RuntimeError("mandatory target missing")
         approach_observation = self._approach_target(target, protected=True)
         if approach_observation is None:
+            self.navi.stop_move()
             self._resume_center_route()
             return False
         self._check()
@@ -57,14 +58,14 @@ class TwoYellowMission(rescue.Mission):
                 "target={} drop={} target_world={} pose={}",
                 target.target_id, drop_number, target_world, desired_pose)
 
-        self._set_height(rescue.MANDATORY_DROP_HEIGHT)
+        self._set_height(rescue.MANDATORY_DROP_HEIGHT, translation_only=True)
         while self.ledger.has_quota(rescue.MANDATORY_COLOR):
             self._check()
             drop_number = self.ledger.next_drop_number
             calibrated = self._calibrate_low(
                 target, protected=True, drop_number=drop_number)
             self._drop(rescue.MANDATORY_COLOR, target.target_id, calibrated)
-        self._set_height(rescue.CRUISE_HEIGHT)
+        self._set_height(rescue.CRUISE_HEIGHT, translation_only=True)
         self._navigate_center_exit()
         return True
 

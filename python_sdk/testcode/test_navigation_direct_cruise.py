@@ -371,7 +371,7 @@ def mission():
                            _thread_list=[], traj_running_event=threading.Event(),
                            navigation_to_waypoint=Mock(side_effect=AssertionError("legacy API called")),
                            pointing_landing=Mock(return_value=True), move_by_direction=Mock(),
-                           stop_move=Mock())
+                           update_realtime_control=Mock(), stop_move=Mock())
 
     def direct(waypoint, **kwargs):
         navi.current_x, navi.current_y = waypoint
@@ -424,8 +424,13 @@ def test_visual_approach_speed_is_independent_from_cruise(mission, protected):
     namespace["CRUISE_SPEED"] = 30.0
     observation = SimpleNamespace(offset_x_px=100.0, offset_y_px=0.0)
     mission._move_toward(observation, protected=protected)
-    mission.navi.move_by_direction.assert_called_once_with(
-        speed=namespace["VISUAL_APPROACH_SPEED"], direction_deg=0.0)
+    if protected:
+        mission.navi.update_realtime_control.assert_called_once_with(
+            vel_x=15, vel_y=0, yaw=0)
+        mission.navi.move_by_direction.assert_not_called()
+    else:
+        mission.navi.move_by_direction.assert_called_once_with(
+            speed=namespace["VISUAL_APPROACH_SPEED"], direction_deg=0.0)
     assert namespace["VISUAL_APPROACH_SPEED"] == 15.0
     mission.navi.navigation_to_waypoint_direct.assert_not_called()
 

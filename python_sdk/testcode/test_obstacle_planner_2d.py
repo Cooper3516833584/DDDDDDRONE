@@ -371,7 +371,9 @@ class MissionVelocityTests(unittest.TestCase):
         self.namespace = {"math": math, "VISUAL_APPROACH_SPEED": 15.0}
         exec(compile(tree, str(source), "exec"), self.namespace)
         cls = load_class("rescue_drop_2026.py", "Mission",
-                         names={"_move_toward", "_position"}, namespace=self.namespace)
+                         names={"_move_translation_only", "_move_toward", "_position",
+                                "_calibrate_low", "_set_height", "_navigate_center_exit"},
+                         namespace=self.namespace)
         self.mission = cls()
         self.mission.navi = Mock(current_x=30.0, current_y=40.0, current_yaw=90.0)
         self.mission.obstacle = Mock()
@@ -394,9 +396,10 @@ class MissionVelocityTests(unittest.TestCase):
         position, velocity = mission.obstacle.safe_velocity.call_args.args
         self.assertEqual(position, (30, 40))
         np.testing.assert_allclose(velocity, (0, -15), atol=1e-12)
-        output = mission.navi.move_by_direction.call_args.kwargs
-        self.assertAlmostEqual(output["speed"], 15)
-        self.assertAlmostEqual(output["direction_deg"], 90)
+        mission.navi.update_realtime_control.assert_called_once_with(
+            vel_x=0, vel_y=15, yaw=0)
+        self.assertFalse(mission.navi.navigation_flag)
+        mission.navi.move_by_direction.assert_not_called()
         mission.navi.stop_move.assert_not_called()
 
     def test_unprotected_move_keeps_body_direction(self):
@@ -404,10 +407,12 @@ class MissionVelocityTests(unittest.TestCase):
         self.mission.obstacle.safe_velocity.assert_not_called()
         self.mission.navi.move_by_direction.assert_called_once_with(speed=15.0, direction_deg=0.0)
 
-    def test_protected_zero_velocity_stops_and_invalid_results_raise(self):
+    def test_protected_zero_velocity_clears_yaw_and_invalid_results_raise(self):
         self.mission.obstacle.safe_velocity.return_value = (0, 0)
         self.mission._move_toward(self.observation, protected=True)
-        self.mission.navi.stop_move.assert_called_once()
+        self.mission.navi.update_realtime_control.assert_called_once_with(
+            vel_x=0, vel_y=0, yaw=0)
+        self.mission.navi.stop_move.assert_not_called()
         self.mission.navi.move_by_direction.assert_not_called()
         for result in (None, (float("nan"), 0), (0, float("inf"))):
             with self.subTest(result=result):
@@ -421,6 +426,57 @@ class MissionVelocityTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "stale"):
             self.mission._move_toward(self.observation, protected=True)
         self.mission.navi.move_by_direction.assert_not_called()
+
+    def test_mandatory_height_keeps_yaw_zero_then_exit_restores_navigation(self):
+        mission = self.mission
+        mission._check = Mock()
+        mission.navi.wait_for_height.return_value = True
+        mission._set_height(100.0, translation_only=True)
+        mission.navi.update_realtime_control.assert_called_once_with(
+            vel_x=0, vel_y=0, yaw=0)
+        mission.navi.stop_move.assert_not_called()
+        mission.navi.set_height.assert_called_once_with(100.0)
+
+        self.namespace["logger"] = Mock()
+        mission.route_2 = [(200.0, 160.0)]
+        mission._navigate_leg = Mock()
+        mission._navigate_center_exit()
+        mission.navi.stop_move.assert_called_once()
+        mission._navigate_leg.assert_called_once_with((200.0, 160.0), protected=True)
+
+    def test_consecutive_mandatory_calibration_timeouts_never_restore_yaw_pid(self):
+        clock = SimpleNamespace(now=0.0)
+
+        def wait(period):
+            clock.now += period
+
+        self.namespace.update({
+            "time": SimpleNamespace(monotonic=lambda: clock.now),
+            "logger": Mock(), "MANDATORY_COLOR": "yellow",
+            "MANDATORY_DROP_HEIGHT": 100.0,
+            "MANDATORY_TARGET_GROUND_HEIGHT_CM": 30.0,
+            "payload_target_offset_px": Mock(return_value=(0.0, 0.0)),
+            "LOW_CALIBRATION_TIMEOUT": 0.3,
+            "LOW_CALIBRATION_MAX_FRAME_AGE_S": 0.45,
+            "LOW_CALIBRATION_HOLD_AFTER_LOSS_S": 0.1,
+            "LOW_CALIBRATION_VELOCITY_MAX_GAP_S": 1.0,
+            "LOW_CALIBRATION_SETTLE_MAX_GAP_S": 0.65,
+            "LOW_CALIBRATION_LOG_PERIOD_S": 0.5,
+            "VISUAL_PERIOD": 0.1,
+        })
+        mission = self.mission
+        mission.vision = SimpleNamespace(frame_size=(640, 480))
+        mission._check = Mock()
+        mission._observation = Mock(return_value=None)
+        mission.stop_event = SimpleNamespace(wait=wait)
+        target = SimpleNamespace(color="yellow", target_id="yellow-3")
+        self.assertFalse(mission._calibrate_low(target, protected=True, drop_number=2))
+        self.assertFalse(mission._calibrate_low(target, protected=True, drop_number=3))
+        self.assertFalse(mission.navi.navigation_flag)
+        mission.navi.stop_move.assert_not_called()
+        self.assertGreaterEqual(mission.navi.update_realtime_control.call_count, 4)
+        for call in mission.navi.update_realtime_control.call_args_list:
+            self.assertEqual(call.kwargs, {"vel_x": 0, "vel_y": 0, "yaw": 0})
 
 
 class CenterMissionOfflineTests(unittest.TestCase):
@@ -489,6 +545,8 @@ class CenterMissionOfflineTests(unittest.TestCase):
         self.assertTrue(mission._mandatory_drop())
         self.assertEqual([call.args[0] for call in mission._set_height.call_args_list],
                          [100.0, 150.0])
+        self.assertTrue(all(call.kwargs == {"translation_only": True}
+                            for call in mission._set_height.call_args_list))
         mission._calibrate_low.assert_called_once_with(
             mission.target, protected=True, drop_number=1)
         mission._drop.assert_called_once_with("yellow", "yellow-1", False)
