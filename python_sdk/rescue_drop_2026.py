@@ -86,7 +86,7 @@ TARGET_TRACK_GATE_RATIO = 0.15  # 关联门限 = 该比例 × 画面短边
 TARGET_TRACK_TIMEOUT_S = 0.6    # 连续多久没再看到就丢弃该身份
 TARGET_CAMERA_READ_FAILURES = 10  # 连续读帧失败达到该次数即判定相机失效
 
-FREE_DROP_COUNT = 4  # 任务牌配额仍合计 4；每次状态只投一件，剩余配额可再次触发
+FREE_DROP_COUNT = 4  # 任务牌配额仍合计 4；同一目标低空连续投完该颜色配额
 MANDATORY_DROP_COUNT = 1
 TOTAL_DROP_COUNT = FREE_DROP_COUNT + MANDATORY_DROP_COUNT
 RELAY_CHANNEL_COUNT = 8
@@ -1161,9 +1161,11 @@ class Mission:
             self._resume_route(self.free_origin)
             return
         self._set_height(FREE_DROP_HEIGHT)
-        calibrated = self._calibrate_low(
-            target, protected=False, drop_number=self.ledger.next_drop_number)
-        self._drop(target.color, target.target_id, calibrated)
+        while self.ledger.has_quota(target.color):
+            self._check()
+            calibrated = self._calibrate_low(
+                target, protected=False, drop_number=self.ledger.next_drop_number)
+            self._drop(target.color, target.target_id, calibrated)
         self._set_height(CRUISE_HEIGHT)
         self._resume_route(self.free_origin)
 
