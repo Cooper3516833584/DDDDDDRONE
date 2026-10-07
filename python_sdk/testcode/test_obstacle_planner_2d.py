@@ -198,6 +198,55 @@ class PlannerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             p.safe_waypoint((float("nan"), 0), (0, 0))
 
+    def test_center_window_keeps_three_exact_anchors_without_obstacles(self):
+        points = [(200, -105), (130, -105), (130, -35), (200, -35)]
+        plan = self.planner.plan_route_window((200, -175), points)
+        self.assertEqual(plan.anchors, tuple(enumerate(points[:3])))
+        self.assertEqual(plan.waypoints, tuple(points[:3]))
+        self.assertEqual(plan.skipped_offsets, ())
+        self.assertTrue(self.planner.path_is_free([(200, -175)] + list(plan.waypoints)))
+
+    def test_center_window_skips_blocked_corner_and_keeps_searching(self):
+        points = [(200, -105), (130, -105), (130, -35), (200, -35),
+                  (200, 35), (130, 35), (130, 105)]
+        self.seed([(160, -70), (170, -70)])
+        plan = self.planner.plan_route_window((200, -175), points)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.skipped_offsets, (0, 1, 2, 3))
+        self.assertEqual(plan.anchors[0], (4, points[4]))
+        self.assertTrue(self.planner.path_is_free([(200, -175)] + list(plan.waypoints)))
+
+    def test_path_checks_segments_and_only_remaining_part(self):
+        self.seed([(100, 0)])
+        self.assertFalse(self.planner.path_is_free([(0, 0), (200, 0)]))
+        self.assertTrue(self.planner.path_is_free([(0, 100), (200, 100)]))
+        self.assertTrue(self.planner.path_is_free([(200, 100), (300, 100)]))
+        self.seed([(50, 100)])
+        self.assertTrue(self.planner.path_is_free([(200, 100), (300, 100)]))
+
+    def test_real_spline_can_leave_a_clear_polyline(self):
+        source = SDK / "FlightController/Solutions/SmoothTrajectory.py"
+        spec = importlib.util.spec_from_file_location("smooth_trajectory_offline", source)
+        smooth = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {spec.name: smooth}):
+            spec.loader.exec_module(smooth)
+        polyline = [(0, 0), (100, 0), (100, 100)]
+        trajectory = smooth.SplineTrajectoryGenerator(
+            polyline, 150, smooth.SplineTrajectoryConfig(navi_speed=15)).generate_traj_list()
+        self.seed([(60, -60)])
+        self.assertTrue(self.planner.path_is_free(polyline))
+        self.assertFalse(self.planner.path_is_free([(point[0], point[1])
+                                                    for point in trajectory]))
+
+    def test_mandatory_43cm_admission_does_not_change_50cm_motion(self):
+        self.seed([(100, 0)])
+        self.assertFalse(self.planner.mandatory_drop_pose_is_clear((142, 0)))
+        self.assertTrue(self.planner.mandatory_drop_pose_is_clear((145, 0)))
+        self.assertIsNone(self.planner.safe_waypoint((0, 0), (145, 0)))
+        self.clock.return_value = 100.61
+        with self.assertRaisesRegex(RuntimeError, "missing or stale"):
+            self.planner.mandatory_drop_pose_is_clear((200, 0))
+
     def test_reset_clears_evidence_and_readiness(self):
         p = self.planner
         p.update_body_points(pillar(), POSE)
@@ -374,7 +423,182 @@ class MissionVelocityTests(unittest.TestCase):
         self.mission.navi.move_by_direction.assert_not_called()
 
 
+class CenterMissionOfflineTests(unittest.TestCase):
+    def setUp(self):
+        source = SDK / "rescue_drop_2026.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name in {"body_to_world_velocity", "pixel_offset_to_ground_cm",
+                                     "payload_offset_body_cm", "sample_polyline",
+                                     "segment_distance_to_point"}]
+        future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+        helper_tree = ast.fix_missing_locations(ast.Module(body=[future] + helpers, type_ignores=[]))
+        self.namespace = {
+            "math": math, "logger": Mock(), "MANDATORY_COLOR": "yellow",
+            "MANDATORY_DROP_HEIGHT": 100.0, "CRUISE_HEIGHT": 150.0,
+            "MANDATORY_TARGET_GROUND_HEIGHT_CM": 30.0,
+            "CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT": 300.0,
+            "CAMERA_VIEW_REFERENCE_HEIGHT_CM": 160.0,
+            "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0, 288.0),
+            "PAYLOAD_RADIUS_CM": 7.2, "TOTAL_DROP_COUNT": 5,
+            "VISUAL_PERIOD": 0.1,
+        }
+        exec(compile(helper_tree, str(source), "exec"), self.namespace)
+        mission_class = load_class("rescue_drop_2026.py", "Mission", names={
+            "_position", "_estimate_target_world_xy", "_desired_aircraft_drop_pose",
+            "_mandatory_drop", "_mark_mandatory_pose_rejected",
+            "_mandatory_observation_allowed", "_start_center_path_with_fallback",
+            "_at_waypoint", "_execute_center_route", "_update_center_route_progress",
+        }, namespace=self.namespace)
+        self.mission = mission_class()
+        self.mission.navi = Mock(current_x=200.0, current_y=0.0,
+                                 current_yaw=0.0, current_height=150.0)
+        self.mission.navi.height_pid.setpoint = 150.0
+        self.mission.vision = Mock(frame_size=(640, 480))
+        self.mission.obstacle = Mock()
+        self.mission.target = SimpleNamespace(color="yellow", target_id="yellow-1")
+        self.mission.ledger = SimpleNamespace(next_drop_number=1)
+        self.mission._check = Mock()
+        self.mission._approach_target = Mock(return_value=SimpleNamespace(
+            offset_x_px=0.0, offset_y_px=0.0))
+        self.mission._resume_center_route = Mock()
+        self.mission._set_height = Mock()
+        self.mission._calibrate_low = Mock(return_value=False)
+        self.mission._drop = Mock()
+        self.mission._navigate_center_exit = Mock()
+
+    def test_blocked_drop_pose_never_descends_or_drops(self):
+        mission = self.mission
+        mission.obstacle.mandatory_drop_pose_is_clear.return_value = False
+        self.assertFalse(mission._mandatory_drop())
+        self.assertEqual(mission.obstacle.mandatory_drop_pose_is_clear.call_args.args[0],
+                         (192.8, 0.0))
+        mission._set_height.assert_not_called()
+        mission._calibrate_low.assert_not_called()
+        mission._drop.assert_not_called()
+        mission._resume_center_route.assert_called_once()
+        self.assertFalse(mission._mandatory_observation_allowed(
+            SimpleNamespace(target_id="yellow-1")))
+        mission.navi.current_x = 281.0
+        self.assertTrue(mission._mandatory_observation_allowed(
+            SimpleNamespace(target_id="yellow-1")))
+
+    def test_clear_drop_pose_still_drops_after_failed_low_calibration(self):
+        mission = self.mission
+        mission.obstacle.mandatory_drop_pose_is_clear.return_value = True
+        self.assertTrue(mission._mandatory_drop())
+        self.assertEqual([call.args[0] for call in mission._set_height.call_args_list],
+                         [100.0, 150.0])
+        mission._calibrate_low.assert_called_once_with(
+            mission.target, protected=True, drop_number=1)
+        mission._drop.assert_called_once_with("yellow", "yellow-1", False)
+        mission._navigate_center_exit.assert_called_once()
+
+    def test_payload_sequence_and_yaw_change_desired_pose(self):
+        mission = self.mission
+        mission.navi.current_yaw = 90.0
+        for number, angle in enumerate(self.namespace["PAYLOAD_ANGLES_DEG"], 1):
+            with self.subTest(drop_number=number):
+                pose = mission._desired_aircraft_drop_pose((200.0, 0.0), number)
+                expected = self.namespace["body_to_world_velocity"](
+                    7.2 * math.cos(math.radians(angle)),
+                    7.2 * math.sin(math.radians(angle)), 90.0)
+                np.testing.assert_allclose(pose, (200.0 - expected[0], -expected[1]))
+
+    def test_spline_rejection_uses_checked_linear_fallback(self):
+        mission = self.mission
+        worker = Mock()
+        mission.navi._thread_list = []
+        mission.obstacle.path_is_free.side_effect = [False, True]
+
+        def reject_spline(*args, **kwargs):
+            self.assertFalse(kwargs["trajectory_validator"]([(200, 0, 150),
+                                                               (260, 0, 150)]))
+            return False
+
+        def start_linear(points, **kwargs):
+            self.assertEqual(points[-1][:2], (260.0, 0.0))
+            mission.navi._thread_list.append(worker)
+            return True
+
+        mission.navi.navigation_follow_waypoints.side_effect = reject_spline
+        mission.navi.navigation_follow_trajectory.side_effect = start_linear
+        self.assertIs(mission._start_center_path_with_fallback([(260, 0)]), worker)
+        self.assertEqual(mission.obstacle.path_is_free.call_count, 2)
+
+    def test_blocked_remaining_trajectory_stops_then_replans_from_current_pose(self):
+        mission = self.mission
+        center = object()
+        self.namespace["MissionState"] = SimpleNamespace(CENTER=center)
+        mission.route_3 = [(0, 0), (100, 0)]
+        mission.route_index = {center: 1}
+        mission.navi.current_x = 0.0
+        mission.navi.traj_running_event.is_set.return_value = False
+        mission.stop_event = Mock()
+        plan = SimpleNamespace(waypoints=((100, 0),), anchors=((0, (100, 0)),),
+                               revision=1, skipped_offsets=())
+        mission.obstacle.plan_route_window.return_value = plan
+        first, second = Mock(), Mock()
+        first.is_alive.return_value = True
+        second.is_alive.return_value = False
+
+        def start(*args):
+            if mission.obstacle.plan_route_window.call_count == 1:
+                return first
+            mission.navi.current_x = 100.0
+            return second
+
+        mission._start_center_path_with_fallback = Mock(side_effect=start)
+        mission._center_remaining_trajectory_safe = Mock(return_value=False)
+        mission._stop_center_worker = Mock(side_effect=lambda worker: setattr(
+            mission.navi, "current_x", 40.0))
+        self.assertIsNone(mission._execute_center_route(detect_mandatory=False))
+        self.assertEqual(mission.obstacle.plan_route_window.call_count, 2)
+        self.assertEqual(mission.obstacle.plan_route_window.call_args_list[1].args[0],
+                         (40.0, 0.0))
+        mission._stop_center_worker.assert_called_once_with(first)
+        self.assertEqual(mission.route_index[center], 2)
+
+
 class WiringTests(unittest.TestCase):
+    def test_navigation_validator_rejects_actual_generated_trajectory(self):
+        navigation = load_class("FlightController/Solutions/Navigation.py", "Navigation",
+                                names={"navigation_follow_waypoints"},
+                                namespace={"np": np, "logger": Mock()})
+        nav = navigation()
+        nav.current_x, nav.current_y, nav.current_height = 0.0, 0.0, 150.0
+        nav.create_smooth_traj_list = Mock(return_value=[(0.0, 0.0, 150.0),
+                                                        (50.0, 20.0, 150.0),
+                                                        (100.0, 0.0, 150.0)])
+        nav.navigation_follow_trajectory = Mock()
+        seen = []
+        result = nav.navigation_follow_waypoints(
+            [(100.0, 0.0)], wait=False,
+            trajectory_validator=lambda points: seen.extend(points) or False)
+        self.assertFalse(result)
+        self.assertEqual(seen, [(0.0, 0.0, 150.0), (50.0, 20.0, 150.0),
+                                (100.0, 0.0, 150.0)])
+        nav.navigation_follow_trajectory.assert_not_called()
+
+    def test_active_trajectory_clears_after_worker_error(self):
+        navigation = load_class("FlightController/Solutions/Navigation.py", "Navigation",
+                                names={"_trajectory_task", "active_trajectory_remaining"},
+                                namespace={})
+        nav = navigation()
+        nav._control_lock = module.threading.Lock()
+        nav._active_traj_list, nav._active_traj_index = (), 0
+
+        def fail_after_progress(*args, **kwargs):
+            nav._active_traj_index = 2
+            self.assertEqual(nav.active_trajectory_remaining(),
+                             [(1.0, 0.0, 150.0), (2.0, 0.0, 150.0)])
+            raise RuntimeError("simulated worker failure")
+
+        nav._trajectory_task_inner = fail_after_progress
+        with self.assertRaisesRegex(RuntimeError, "simulated worker failure"):
+            nav._trajectory_task([(0, 0, 150), (1, 0, 150), (2, 0, 150)])
+        self.assertEqual(nav.active_trajectory_remaining(), [])
+
     def test_optional_lio_subscription_uses_existing_node(self):
         class Node:
             def __init__(self, name):

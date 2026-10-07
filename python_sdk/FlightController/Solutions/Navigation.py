@@ -156,6 +156,8 @@ class Navigation(object):
         self.traj_running_event = threading.Event()
         self.traj_progress = 0.0
         self.traj_list_before_stop: Union[List[Tuple[float, ...]], np.ndarray] = []
+        self._active_traj_list: Tuple[Tuple[float, ...], ...] = ()
+        self._active_traj_index = 0
 
     def calibrate_basepoint(self, wait=True) -> np.ndarray:
         """
@@ -979,6 +981,7 @@ class Navigation(object):
         altitude: Optional[float] = None,
         pos_thres: float = 10.0,
         config: Optional[SplineTrajectoryConfig] = None,
+        trajectory_validator=None,
     ):
         """以当前位置为起点生成平滑多航点轨迹，并交给现有执行器。
 
@@ -1014,6 +1017,9 @@ class Navigation(object):
         )
         first_point = traj_list[0]
         traj_list[0] = (first_point[0], first_point[1], start_height)
+        if trajectory_validator is not None and not trajectory_validator(traj_list):
+            logger.warning("[NAVI] Smooth waypoint trajectory rejected by validator")
+            return False
         return self.navigation_follow_trajectory(
             traj_list,
             wait=wait,
@@ -1074,7 +1080,32 @@ class Navigation(object):
 
         self.navigation_follow_trajectory(traj_list, wait=wait, pos_thres=pos_thres)
  
+    def active_trajectory_remaining(self) -> List[Tuple[float, ...]]:
+        with self._control_lock:
+            if not self._active_traj_list:
+                return []
+            return list(self._active_traj_list[max(0, self._active_traj_index - 1):])
+
     def _trajectory_task(
+        self,
+        traj_list: Union[List[Tuple[float, ...]], np.ndarray],
+        pos_thres: float = 10.0,
+        timeout_per_point: float = 14.0,
+    ):
+        with self._control_lock:
+            self._active_traj_list = tuple(tuple(float(v) for v in point)
+                                           for point in traj_list)
+            self._active_traj_index = 0
+        try:
+            return self._trajectory_task_inner(
+                traj_list, pos_thres=pos_thres,
+                timeout_per_point=timeout_per_point)
+        finally:
+            with self._control_lock:
+                self._active_traj_list = ()
+                self._active_traj_index = 0
+
+    def _trajectory_task_inner(
         self,
         traj_list: Union[List[Tuple[float, ...]], np.ndarray],
         pos_thres: float = 10.0,
@@ -1097,6 +1128,8 @@ class Navigation(object):
         len_t = len(traj_list)
 
         for n, point in enumerate(traj_list):
+            with self._control_lock:
+                self._active_traj_index = n
             if self.stop_event is not None and self.stop_event.is_set():
                 logger.warning("[NAVI] Trajectory stopped by external stop event")
                 self.traj_running_event.clear()

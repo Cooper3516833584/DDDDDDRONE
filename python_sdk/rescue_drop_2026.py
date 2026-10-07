@@ -131,6 +131,24 @@ def payload_target_offset_px(drop_number: int, height_cm: float,
     return radius_px * math.cos(angle), radius_px * math.sin(angle)
 
 
+def pixel_offset_to_ground_cm(offset_px: Point, camera_height_cm: float,
+                              frame_size: Tuple[int, int]) -> Point:
+    long_edge_px = max(frame_size)
+    if (long_edge_px <= 0 or not math.isfinite(camera_height_cm)
+            or camera_height_cm <= 0):
+        raise ValueError("invalid camera geometry")
+    cm_per_px = (CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT * camera_height_cm
+                 / (long_edge_px * CAMERA_VIEW_REFERENCE_HEIGHT_CM))
+    return offset_px[0] * cm_per_px, offset_px[1] * cm_per_px
+
+
+def payload_offset_body_cm(drop_number: int) -> Point:
+    if drop_number < 1 or drop_number > TOTAL_DROP_COUNT:
+        raise ValueError("drop number out of range")
+    angle = math.radians(PAYLOAD_ANGLES_DEG[drop_number - 1])
+    return PAYLOAD_RADIUS_CM * math.cos(angle), PAYLOAD_RADIUS_CM * math.sin(angle)
+
+
 def body_to_world_velocity(body_x: float, body_y: float, yaw_cw_deg: float) -> Point:
     """Convert forward/left body velocity to startup-local using clockwise yaw."""
     yaw = math.radians(float(yaw_cw_deg))
@@ -353,6 +371,15 @@ class ObstacleInterface:
     def safe_velocity(self, current: Point, velocity: Point) -> Point:
         return self.planner.safe_velocity(current, velocity)
 
+    def plan_route_window(self, current: Point, candidates: Sequence[Point]):
+        return self.planner.plan_route_window(current, candidates)
+
+    def path_is_free(self, points: Sequence[Point]) -> bool:
+        return self.planner.path_is_free(points)
+
+    def mandatory_drop_pose_is_clear(self, pose: Point) -> bool:
+        return self.planner.mandatory_drop_pose_is_clear(pose)
+
 
 def validate_allocation(red: int, blue: int, green: int) -> Dict[str, int]:
     counts = {"red": red, "blue": blue, "green": green}
@@ -391,12 +418,16 @@ def build_routes() -> Tuple[List[Point], List[Point], List[Point]]:
     return route_1, route_3, route_2
 
 
-def nearest_point_on_route(point: Point, route: Sequence[Point]) -> RouteProjection:
+def nearest_point_on_route(point: Point, route: Sequence[Point],
+                           minimum_segment: int = 0) -> RouteProjection:
     """对航迹线段逐一投影；最多九段，计算量固定且很小。"""
     if len(route) < 2:
         raise ValueError("route must contain at least two points")
+    if not 0 <= minimum_segment < len(route) - 1:
+        raise ValueError("minimum segment out of range")
     best = None
-    for index, (start, end) in enumerate(zip(route, route[1:])):
+    for index in range(minimum_segment, len(route) - 1):
+        start, end = route[index], route[index + 1]
         dx, dy = end[0] - start[0], end[1] - start[1]
         length_squared = dx * dx + dy * dy
         if length_squared == 0:
@@ -412,6 +443,33 @@ def nearest_point_on_route(point: Point, route: Sequence[Point]) -> RouteProject
         if best is None or candidate.distance_squared < best.distance_squared:
             best = candidate
     return best
+
+
+def segment_distance_to_point(start: Point, end: Point, point: Point) -> float:
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    fraction = (0.0 if length_sq == 0 else max(0.0, min(1.0,
+                ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy)
+                / length_sq)))
+    return math.hypot(point[0] - start[0] - fraction * dx,
+                      point[1] - start[1] - fraction * dy)
+
+
+def sample_polyline(start: Point, waypoints: Sequence[Point], altitude: float,
+                    spacing_cm: float = 20.0) -> List[Tuple[float, float, float]]:
+    if spacing_cm <= 0:
+        raise ValueError("spacing must be positive")
+    samples = []
+    previous = start
+    for goal in waypoints:
+        steps = max(1, int(math.ceil(math.hypot(goal[0] - previous[0],
+                                               goal[1] - previous[1]) / spacing_cm)))
+        for index in range(1, steps + 1):
+            ratio = index / steps
+            samples.append((previous[0] + ratio * (goal[0] - previous[0]),
+                            previous[1] + ratio * (goal[1] - previous[1]), altitude))
+        previous = goal
+    return samples
 
 
 class DropLedger:
@@ -498,6 +556,8 @@ class Mission:
         self.free_origin = MissionState.ROUTE_1
         self._completed_free_colors = set()
         self.target: Optional[TargetObservation] = None
+        self._mandatory_rejected_target_id: Optional[str] = None
+        self._mandatory_rejected_at: Optional[Point] = None
         self.deadline: Optional[float] = None
         self.landed = False
         self._latest: Dict[str, TargetObservation] = {}
@@ -681,18 +741,167 @@ class Mission:
 
     def _follow_route(self, state: MissionState) -> Optional[TargetObservation]:
         route = {MissionState.ROUTE_1: self.route_1,
-                 MissionState.CENTER: self.route_3,
                  MissionState.ROUTE_2: self.route_2}[state]
-        protected = state == MissionState.CENTER
-        detection = "mandatory" if protected else "free"
         while self.route_index[state] < len(route):
             observation = self._navigate_leg(
-                route[self.route_index[state]], detection=detection,
-                protected=protected)
+                route[self.route_index[state]], detection="free")
             if observation is not None:
                 return observation
             self.route_index[state] += 1
         return None
+
+    def _start_center_path_with_fallback(self, waypoints: Sequence[Point]) -> threading.Thread:
+        if self.obstacle is None:
+            raise RuntimeError("obstacle interface missing")
+        before = len(self.navi._thread_list)
+
+        def validate(traj_list):
+            return self.obstacle.path_is_free(
+                [(float(point[0]), float(point[1])) for point in traj_list])
+
+        smooth = self.navi.navigation_follow_waypoints(
+            waypoints, wait=False, pos_thres=10.0, trajectory_validator=validate)
+        if smooth:
+            if len(self.navi._thread_list) != before + 1:
+                raise RuntimeError("center spline worker was not created")
+            logger.info("[CENTER] Starting clear spline with {} waypoints", len(waypoints))
+            return self.navi._thread_list[-1]
+
+        start = self._position()
+        linear = sample_polyline(start, waypoints,
+                                 altitude=float(self.navi.height_pid.setpoint))
+        if not self.obstacle.path_is_free([start] + [(p[0], p[1]) for p in linear]):
+            raise RuntimeError("A* fallback path became unsafe before execution")
+        before = len(self.navi._thread_list)
+        if not self.navi.navigation_follow_trajectory(
+                linear, wait=False, pos_thres=10.0):
+            raise RuntimeError("center fallback trajectory could not start")
+        if len(self.navi._thread_list) != before + 1:
+            raise RuntimeError("center fallback worker was not created")
+        logger.warning("[CENTER] Spline rejected; following clear A* polyline")
+        return self.navi._thread_list[-1]
+
+    def _stop_center_worker(self, worker: threading.Thread) -> None:
+        self.navi.navigation_stop_here()
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            raise RuntimeError("center trajectory did not stop within 2 seconds")
+
+    def _center_remaining_trajectory_safe(self) -> bool:
+        remaining = self.navi.active_trajectory_remaining()
+        if not remaining:
+            return not self.navi.traj_running_event.is_set()
+        points = [self._position()]
+        points.extend((float(point[0]), float(point[1])) for point in remaining)
+        return self.obstacle.path_is_free(points)
+
+    def _update_center_route_progress(self, plan, base_index: int,
+                                      previous_position: Point) -> None:
+        current = self._position()
+        new_index = self.route_index[MissionState.CENTER]
+        for offset, anchor in plan.anchors:
+            absolute_index = base_index + offset
+            if absolute_index < new_index:
+                continue
+            if segment_distance_to_point(previous_position, current, anchor) > 15.0:
+                break
+            new_index = absolute_index + 1
+        self.route_index[MissionState.CENTER] = max(
+            self.route_index[MissionState.CENTER], new_index)
+
+    def _mandatory_observation_allowed(self, observation: TargetObservation) -> bool:
+        if observation.target_id != self._mandatory_rejected_target_id:
+            return True
+        rejected_at = self._mandatory_rejected_at
+        if rejected_at is None or math.hypot(
+                self.navi.current_x - rejected_at[0],
+                self.navi.current_y - rejected_at[1]) >= 80.0:
+            self._mandatory_rejected_target_id = None
+            self._mandatory_rejected_at = None
+            return True
+        return False
+
+    def _mark_mandatory_pose_rejected(self, target_id: str) -> None:
+        self._mandatory_rejected_target_id = target_id
+        self._mandatory_rejected_at = self._position()
+
+    def _execute_center_route(self, detect_mandatory: bool) -> Optional[TargetObservation]:
+        if self.obstacle is None:
+            raise RuntimeError("obstacle interface missing")
+        while self.route_index[MissionState.CENTER] < len(self.route_3):
+            self._check()
+            base_index = self.route_index[MissionState.CENTER]
+            if self._at_waypoint(self._position(), self.route_3[base_index]):
+                if detect_mandatory:
+                    observation = self._observation(color=MANDATORY_COLOR)
+                    if (observation is not None
+                            and self._mandatory_observation_allowed(observation)):
+                        return observation
+                self.route_index[MissionState.CENTER] += 1
+                continue
+            try:
+                plan = self.obstacle.plan_route_window(
+                    self._position(), self.route_3[base_index:])
+            except Exception:
+                self.navi.navigation_stop_here()
+                raise
+            if plan is None or not plan.waypoints:
+                self.navi.navigation_stop_here()
+                raise RuntimeError("no safe route-3 window")
+            logger.info("[CENTER] Window revision={} anchors={} skipped={}",
+                        plan.revision, plan.anchors, plan.skipped_offsets)
+            try:
+                worker = self._start_center_path_with_fallback(plan.waypoints)
+            except Exception:
+                self.navi.navigation_stop_here()
+                raise
+            previous = self._position()
+            try:
+                while worker.is_alive():
+                    self._check()
+                    observation = (self._observation(color=MANDATORY_COLOR)
+                                   if detect_mandatory else None)
+                    if (observation is not None
+                            and self._mandatory_observation_allowed(observation)):
+                        self._update_center_route_progress(plan, base_index, previous)
+                        self._stop_center_worker(worker)
+                        return observation
+                    self._update_center_route_progress(plan, base_index, previous)
+                    previous = self._position()
+                    if not self._center_remaining_trajectory_safe():
+                        logger.warning("[CENTER] Remaining trajectory blocked; replanning")
+                        self._stop_center_worker(worker)
+                        break
+                    self.stop_event.wait(VISUAL_PERIOD)
+                else:
+                    worker.join(timeout=0)
+                    self._check()
+                    self._update_center_route_progress(plan, base_index, previous)
+                    last_offset, last_anchor = plan.anchors[-1]
+                    if (not self._at_waypoint(self._position(), last_anchor)
+                            or self.navi.traj_running_event.is_set()):
+                        self.navi.navigation_stop_here()
+                        raise RuntimeError("center trajectory ended before final anchor")
+                    self.route_index[MissionState.CENTER] = max(
+                        self.route_index[MissionState.CENTER],
+                        base_index + last_offset + 1)
+                    if detect_mandatory:
+                        observation = self._observation(color=MANDATORY_COLOR)
+                        if (observation is not None
+                                and self._mandatory_observation_allowed(observation)):
+                            return observation
+            except Exception:
+                if worker.is_alive():
+                    self._stop_center_worker(worker)
+                raise
+        return None
+
+    def _follow_center_route(self) -> Optional[TargetObservation]:
+        return self._execute_center_route(detect_mandatory=True)
+
+    def _navigate_center_exit(self) -> None:
+        self._resume_center_route()
+        self._execute_center_route(detect_mandatory=False)
 
     def _enter_free_drop(self, origin: MissionState,
                          target: TargetObservation) -> None:
@@ -706,15 +915,28 @@ class Mission:
         self.state = MissionState.FREE_DROP
 
     def _resume_route(self, state: MissionState) -> None:
+        if state is MissionState.CENTER:
+            self._resume_center_route()
+            return
         route = {MissionState.ROUTE_1: self.route_1,
-                 MissionState.CENTER: self.route_3,
                  MissionState.ROUTE_2: self.route_2}[state]
         self._check()
         projection = nearest_point_on_route(self._position(), route)
         logger.info("[RESCUE] Return to {} segment {} at {}",
                     state.value, projection.segment_index, projection.point)
-        self._navigate_leg(projection.point, protected=state == MissionState.CENTER)
+        self._navigate_leg(projection.point)
         self.route_index[state] = projection.segment_index + 1
+
+    def _resume_center_route(self) -> None:
+        self._check()
+        index = self.route_index[MissionState.CENTER]
+        if index >= len(self.route_3):
+            return
+        projection = nearest_point_on_route(
+            self._position(), self.route_3, minimum_segment=max(0, index - 1))
+        self.route_index[MissionState.CENTER] = max(index, projection.segment_index + 1)
+        logger.info("[CENTER] Resume from current position at route index {}",
+                    self.route_index[MissionState.CENTER])
 
     def _move_toward(self, observation: TargetObservation, protected: bool,
                      desired_offset: Point = (0.0, 0.0),
@@ -744,7 +966,7 @@ class Mission:
             )
 
     def _approach_target(self, target: TargetObservation,
-                         protected: bool) -> bool:
+                         protected: bool) -> Optional[TargetObservation]:
         lost_at = None
         hovering = False
         while True:
@@ -758,14 +980,14 @@ class Mission:
                     lost_at = time.monotonic()
                 if time.monotonic() - lost_at >= TARGET_LOSS_WAIT:
                     logger.warning("[RESCUE] Target {} lost for 2 seconds", target.target_id)
-                    return False
+                    return None
             else:
                 lost_at = None
                 hovering = False
                 if math.hypot(observation.offset_x_px,
                               observation.offset_y_px) <= VISUAL_CENTER_THRESHOLD_PX:
                     self.navi.stop_move()
-                    return True
+                    return observation
                 self._move_toward(observation, protected)
             self.stop_event.wait(VISUAL_PERIOD)
 
@@ -905,7 +1127,7 @@ class Mission:
         target = self.target
         if target is None or target.color not in FREE_COLORS:
             raise RuntimeError("free target missing")
-        if not self._approach_target(target, protected=False):
+        if self._approach_target(target, protected=False) is None:
             self._resume_route(self.free_origin)
             return
         self._set_height(FREE_DROP_HEIGHT)
@@ -919,16 +1141,54 @@ class Mission:
         target = self.target
         if target is None or target.color != MANDATORY_COLOR:
             raise RuntimeError("mandatory target missing")
-        if not self._approach_target(target, protected=True):
-            self._resume_route(MissionState.CENTER)
+        approach_observation = self._approach_target(target, protected=True)
+        if approach_observation is None:
+            self._resume_center_route()
             return False
+        self._check()
+        if self.obstacle is None:
+            raise RuntimeError("obstacle interface missing")
+        drop_number = self.ledger.next_drop_number
+        target_world = self._estimate_target_world_xy(approach_observation)
+        desired_pose = self._desired_aircraft_drop_pose(target_world, drop_number)
+        if not self.obstacle.mandatory_drop_pose_is_clear(desired_pose):
+            logger.warning("[MANDATORY] 43cm drop-pose clearance rejected: "
+                           "target={} drop={} target_world={} pose={}",
+                           target.target_id, drop_number, target_world, desired_pose)
+            self.navi.stop_move()
+            self._mark_mandatory_pose_rejected(target.target_id)
+            self._resume_center_route()
+            return False
+        logger.info("[MANDATORY] 43cm drop-pose clearance accepted: "
+                    "target={} drop={} target_world={} pose={}",
+                    target.target_id, drop_number, target_world, desired_pose)
         self._set_height(MANDATORY_DROP_HEIGHT)
         calibrated = self._calibrate_low(
-            target, protected=True, drop_number=self.ledger.next_drop_number)
+            target, protected=True, drop_number=drop_number)
         self._drop(MANDATORY_COLOR, target.target_id, calibrated)
         self._set_height(CRUISE_HEIGHT)
-        self._navigate_leg(self.route_3[-1], protected=True)
+        self._navigate_center_exit()
         return True
+
+    def _estimate_target_world_xy(self, observation: TargetObservation) -> Point:
+        if self.vision is None:
+            raise RuntimeError("vision interface missing")
+        camera_height = (float(self.navi.current_height)
+                         - MANDATORY_TARGET_GROUND_HEIGHT_CM)
+        body_dx, body_dy = pixel_offset_to_ground_cm(
+            (observation.offset_x_px, observation.offset_y_px),
+            camera_height, self.vision.frame_size)
+        world_dx, world_dy = body_to_world_velocity(
+            body_dx, body_dy, float(self.navi.current_yaw))
+        x, y = self._position()
+        return x + world_dx, y + world_dy
+
+    def _desired_aircraft_drop_pose(self, target_world: Point,
+                                    drop_number: int) -> Point:
+        payload_body = payload_offset_body_cm(drop_number)
+        payload_world = body_to_world_velocity(
+            payload_body[0], payload_body[1], float(self.navi.current_yaw))
+        return target_world[0] - payload_world[0], target_world[1] - payload_world[1]
 
     def _return_and_land(self, check_deadline: bool = True,
                          protected: bool = False) -> None:
@@ -970,7 +1230,7 @@ class Mission:
                     self._free_drop()
                     self.state = self.free_origin
                 elif self.state is MissionState.CENTER:
-                    self.target = self._follow_route(self.state)
+                    self.target = self._follow_center_route()
                     if self.target is None:
                         logger.warning("[RESCUE] Mandatory yellow target not found")
                         self.state = MissionState.ROUTE_2

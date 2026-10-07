@@ -24,12 +24,19 @@ import heapq
 import math
 import threading
 import time
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
 Point = Tuple[float, float]
 PoseGetter = Callable[[], Optional[Tuple[float, float, float, bool]]]
+
+
+class RouteWindowPlan(NamedTuple):
+    waypoints: Tuple[Point, ...]
+    anchors: Tuple[Tuple[int, Point], ...]
+    skipped_offsets: Tuple[int, ...]
+    revision: int
 
 
 class ObstaclePlanner2D:
@@ -52,9 +59,9 @@ class ObstaclePlanner2D:
     MIN_RANGE_M = 0.35
     MAX_RANGE_M = 6.0
 
-    # Physical safety envelope in the XY plane. 0.60 m is intentionally larger
-    # than the nominal aircraft radius to cover prop guards + localization error.
-    INFLATION_RADIUS_M = 0.60
+    # Physical safety envelope for all horizontal movement.
+    INFLATION_RADIUS_M = 0.50
+    MANDATORY_DROP_POSE_CLEARANCE_M = 0.43
     SELF_CLEAR_RADIUS_M = 0.25
 
     # ROG-like evidence update, simplified to a signed integer score.
@@ -434,6 +441,92 @@ class ObstaclePlanner2D:
         points[-1] = goal
         return points
 
+    def plan_route_window(
+        self, current_cm: Point, candidates_cm: Sequence[Point], max_anchors: int = 3,
+    ) -> Optional[RouteWindowPlan]:
+        """Plan up to ``max_anchors`` reachable route points on one map snapshot."""
+        if max_anchors < 1:
+            raise ValueError("max_anchors must be positive")
+        current = self._validate_point(current_cm, "current")
+        blocked, revision = self._fresh_inflated_snapshot()
+        start = self._cm_to_cell(current)
+        if start is None:
+            return None
+        blocked_goals = blocked.copy()
+        self._clear_start_in_snapshot(blocked, start)
+        cursor = start
+        cells = [start]
+        anchors = []
+        anchor_indices = []
+        skipped = []
+        for offset, raw_candidate in enumerate(candidates_cm):
+            candidate = self._validate_point(raw_candidate, "candidate")
+            goal = self._cm_to_cell(candidate)
+            if goal is None or blocked_goals[goal[1], goal[0]]:
+                skipped.append(offset)
+                continue
+            segment = self._plan_cells(blocked, cursor, goal, snap_goal=False)
+            if not segment:
+                skipped.append(offset)
+                continue
+            cells.extend(self._simplify_cells(blocked, segment)[1:])
+            anchors.append((offset, candidate))
+            anchor_indices.append(len(cells) - 1)
+            cursor = goal
+            if len(anchors) >= max_anchors:
+                break
+        if not anchors:
+            return None
+        points = [self._cell_to_cm(cell) for cell in cells]
+        points[0] = current
+        for index, (_, candidate) in zip(anchor_indices, anchors):
+            points[index] = candidate
+        # Exact route coordinates may differ from grid centres. Reject any
+        # segment that becomes unsafe after replacing the anchor coordinates.
+        for first, second in zip(points, points[1:]):
+            if not self._grid_line_free(blocked, self._cm_to_cell(first),
+                                        self._cm_to_cell(second)):
+                return None
+        return RouteWindowPlan(tuple(points[1:]), tuple(anchors),
+                               tuple(skipped), revision)
+
+    def path_is_free(self, points_cm: Sequence[Point]) -> bool:
+        """Check sampled positions and every connecting segment on a fresh map."""
+        if not points_cm:
+            return False
+        points = [self._validate_point(point, "path point") for point in points_cm]
+        blocked, _ = self._fresh_inflated_snapshot()
+        cells = [self._cm_to_cell(point) for point in points]
+        if any(cell is None for cell in cells):
+            return False
+        self._clear_start_in_snapshot(blocked, cells[0])
+        if blocked[cells[0][1], cells[0][0]]:
+            return False
+        for first, second in zip(cells, cells[1:]):
+            if blocked[second[1], second[0]] or not self._grid_line_free(blocked, first, second):
+                return False
+        return True
+
+    def mandatory_drop_pose_is_clear(self, pose_cm: Point) -> bool:
+        """43 cm admission check for the desired aircraft XY, never for motion."""
+        pose = self._validate_point(pose_cm, "mandatory drop pose")
+        occupied, _ = self._fresh_occupied_snapshot()
+        centre = self._cm_to_cell(pose)
+        if centre is None:
+            return False
+        radius_cm = self.MANDATORY_DROP_POSE_CLEARANCE_M * 100.0
+        radius_cells = int(math.ceil(self.MANDATORY_DROP_POSE_CLEARANCE_M / self.RESOLUTION_M))
+        cx, cy = centre
+        for iy in range(max(0, cy - radius_cells),
+                        min(self._cell_count, cy + radius_cells + 1)):
+            for ix in range(max(0, cx - radius_cells),
+                            min(self._cell_count, cx + radius_cells + 1)):
+                if occupied[iy, ix]:
+                    ox, oy = self._cell_to_cm((ix, iy))
+                    if math.hypot(ox - pose[0], oy - pose[1]) <= radius_cm:
+                        return False
+        return True
+
     def get_debug_state(self) -> dict:
         """Small diagnostic snapshot; safe to print from bench scripts."""
         now = time.monotonic()
@@ -472,6 +565,13 @@ class ObstaclePlanner2D:
                 self._inflated_cache = self._inflate(occupied)
                 self._inflated_revision = revision
             return self._inflated_cache.copy(), revision
+
+    def _fresh_occupied_snapshot(self) -> Tuple[np.ndarray, int]:
+        now = time.monotonic()
+        with self._lock:
+            if self._last_cloud_at <= 0.0 or now - self._last_cloud_at > self.CLOUD_STALE_S:
+                raise RuntimeError("2-D obstacle point cloud is missing or stale")
+            return (self._scores >= self.OCCUPIED_THRESHOLD).copy(), self._revision
 
     def _inflate(self, occupied: np.ndarray) -> np.ndarray:
         out = np.zeros_like(occupied, dtype=bool)
