@@ -51,7 +51,7 @@ MONITOR_INTERVAL = 1.0
 
 # 视觉初值沿用 former_code/2026_disaster_survey.py；超时和丢失等待由用户指定。
 VISUAL_CENTER_THRESHOLD_PX = 30.0  # 巡航接近结束、开始下降的像素距离
-LOW_CALIBRATION_THRESHOLD_PX = 10.0  # 下降后的悬挂点校准误差
+LOW_CALIBRATION_THRESHOLD_PX = 20.0  # 下降后的悬挂点校准误差
 VISUAL_APPROACH_SPEED = 15.0
 VISUAL_PERIOD = 0.1
 VISUAL_MAX_AGE = 0.5
