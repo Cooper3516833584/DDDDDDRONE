@@ -58,13 +58,16 @@ VISUAL_MAX_AGE = 0.5
 VISION_WARMUP_S = 6.0
 TARGET_LOSS_WAIT = 2.0
 LOW_CALIBRATION_TIMEOUT = 9.0  # 原 6 秒的 1.5 倍
-LOW_CALIBRATION_MIN_SPEED = 5.0  # cm/s；沿用导航接口建议的精调速度下限
+LOW_CALIBRATION_MIN_SPEED = 3.0  # cm/s；现场 5cm/s 在 10px 附近仍会越过目标
 LOW_CALIBRATION_MAX_SPEED = 12.0  # cm/s；低于巡航接近速度
-LOW_CALIBRATION_SPEED_PER_PX = 0.18  # 像素误差越小，水平速度越低
-LOW_CALIBRATION_LOOKAHEAD_S = 0.25  # 用像素运动趋势提前减速或悬停
+LOW_CALIBRATION_SPEED_PER_PX = 0.13  # 大误差仍可快飞，近目标进一步减速
+LOW_CALIBRATION_LOOKAHEAD_S = 0.30  # 用像素运动趋势提前减速或悬停
 LOW_CALIBRATION_MAX_PIXEL_SPEED = 120.0  # 限制识别抖动对预测的影响
-LOW_CALIBRATION_MAX_FRAME_AGE_S = 0.25
+LOW_CALIBRATION_MAX_FRAME_AGE_S = 0.35
+LOW_CALIBRATION_VELOCITY_MAX_GAP_S = 1.0  # 短暂漏帧不清空像素速度估计
 LOW_CALIBRATION_SETTLE_S = 0.3  # 连续新观测保持在阈值内才算校准完成
+LOW_CALIBRATION_SETTLE_MAX_GAP_S = 0.65  # 两帧间短暂空档可继续确认稳定
+LOW_CALIBRATION_HOLD_AFTER_LOSS_S = 1.0  # 长时间丢目标才切回位置保持
 LOW_CALIBRATION_LOG_PERIOD_S = 0.5
 MISSION_TIMEOUT = 20.0 * 60.0
 
@@ -900,8 +903,10 @@ class Mission:
         return self._execute_center_route(detect_mandatory=True)
 
     def _navigate_center_exit(self) -> None:
-        self._resume_center_route()
-        self._execute_center_route(detect_mandatory=False)
+        goal = self.route_2[0]
+        logger.info("[MANDATORY] Exit toward route-2 start: current={} goal={}",
+                    self._position(), goal)
+        self._navigate_leg(goal, protected=True)
 
     def _enter_free_drop(self, origin: MissionState,
                          target: TargetObservation) -> None:
@@ -1017,6 +1022,8 @@ class Mission:
         started_at = time.monotonic()
         deadline = started_at + LOW_CALIBRATION_TIMEOUT
         hovering = False
+        position_hold = False
+        missing_since = None
         previous_at = None
         previous_error = None
         pixel_velocity = (0.0, 0.0)
@@ -1032,25 +1039,45 @@ class Mission:
                          or now - observation.captured_at > LOW_CALIBRATION_MAX_FRAME_AGE_S)):
                 observation = None
             if observation is None:
+                if missing_since is None:
+                    missing_since = now
                 if not hovering:
-                    self.navi.stop_move()
+                    # 短暂漏帧只发零速度，不反复启停导航位置 PID。
+                    self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
                     hovering = True
-                    if now - last_log_at >= LOW_CALIBRATION_LOG_PERIOD_S:
+                if (not position_hold
+                        and now - missing_since >= LOW_CALIBRATION_HOLD_AFTER_LOSS_S):
+                    self.navi.stop_move()
+                    position_hold = True
+                if (previous_at is None
+                        or now - previous_at > LOW_CALIBRATION_VELOCITY_MAX_GAP_S):
+                    previous_at = None
+                    previous_error = None
+                    pixel_velocity = (0.0, 0.0)
+                if (previous_at is None
+                        or now - previous_at > LOW_CALIBRATION_SETTLE_MAX_GAP_S):
+                    settled_at = None
+                if now - last_log_at >= LOW_CALIBRATION_LOG_PERIOD_S:
+                    alternate = self._observation(color=target.color)
+                    if alternate is not None and alternate.target_id != target.target_id:
+                        logger.info("[ALIGN] locked target={} missing; same-color target={} "
+                                    "offset=({:.1f},{:.1f})px",
+                                    target.target_id, alternate.target_id,
+                                    alternate.offset_x_px, alternate.offset_y_px)
+                    else:
                         logger.info("[ALIGN] target={} drop={} no fresh observation; hover",
                                     target.target_id, drop_number)
-                        last_log_at = now
-                previous_at = None
-                previous_error = None
-                pixel_velocity = (0.0, 0.0)
-                settled_at = None
+                    last_log_at = now
             elif previous_at is None or observation.captured_at > previous_at:
+                missing_since = None
                 error = (observation.offset_x_px - desired_offset[0],
                          observation.offset_y_px - desired_offset[1])
+                frame_gap = (observation.captured_at - previous_at
+                             if previous_at is not None else None)
                 if previous_at is not None and previous_error is not None:
-                    dt = observation.captured_at - previous_at
-                    if 0.04 <= dt <= VISUAL_MAX_AGE:
-                        measured = ((error[0] - previous_error[0]) / dt,
-                                    (error[1] - previous_error[1]) / dt)
+                    if 0.04 <= frame_gap <= LOW_CALIBRATION_VELOCITY_MAX_GAP_S:
+                        measured = ((error[0] - previous_error[0]) / frame_gap,
+                                    (error[1] - previous_error[1]) / frame_gap)
                         measured_speed = math.hypot(*measured)
                         if measured_speed > LOW_CALIBRATION_MAX_PIXEL_SPEED:
                             scale = LOW_CALIBRATION_MAX_PIXEL_SPEED / measured_speed
@@ -1066,30 +1093,33 @@ class Mission:
                 speed, predicted_error = low_calibration_command(error, pixel_velocity)
                 if distance <= LOW_CALIBRATION_THRESHOLD_PX:
                     if not hovering:
-                        self.navi.stop_move()
+                        self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
                         hovering = True
                     if settled_at is None:
                         settled_at = observation.captured_at
                     action = "settle"
                 elif speed == 0.0:
                     if not hovering:
-                        self.navi.stop_move()
+                        self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
                         hovering = True
                     settled_at = None
                     action = "brake"
                 else:
                     settled_at = None
                     hovering = False
+                    position_hold = False
                     action = "move"
                     self._move_toward(observation, protected, desired_offset,
                                       speed=speed, control_error=predicted_error)
                 if now - last_log_at >= LOW_CALIBRATION_LOG_PERIOD_S:
                     logger.info("[ALIGN] target={} drop={} offset=({:.1f},{:.1f})px "
-                                "error=({:.1f},{:.1f})px rate=({:.1f},{:.1f})px/s "
+                                "error=({:.1f},{:.1f})px frame_gap={}s "
+                                "rate=({:.1f},{:.1f})px/s "
                                 "predicted=({:.1f},{:.1f})px speed={:.1f}cm/s action={}",
                                 target.target_id, drop_number,
                                 observation.offset_x_px, observation.offset_y_px,
-                                *error, *pixel_velocity, *predicted_error, speed, action)
+                                *error, None if frame_gap is None else round(frame_gap, 3),
+                                *pixel_velocity, *predicted_error, speed, action)
                     last_log_at = now
                 if (settled_at is not None
                         and observation.captured_at - settled_at >= LOW_CALIBRATION_SETTLE_S):
