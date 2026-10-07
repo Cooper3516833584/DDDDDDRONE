@@ -27,10 +27,10 @@ from FlightController.Solutions.Navigation import Navigation
 
 
 # 用户给定的航迹参数：x_1、x_2、y_l、y_r（cm）。
-TRACK_START_OFFSET_X_CM = 50.0  # x_1：起飞点前方的航迹起点
-TRACK_LENGTH_X_CM = 150.0       # x_2：航迹前后方向长度
-LEFT_SPAN_Y_CM = 175.0          # y_l：航迹起点左侧范围
-RIGHT_SPAN_Y_CM = 175.0         # y_r：航迹起点右侧范围
+TRACK_START_OFFSET_X_CM = 0.0  # x_1：起飞点前方的航迹起点
+TRACK_LENGTH_X_CM = 200.0       # x_2：航迹前后方向长度
+LEFT_SPAN_Y_CM = 157.0          # y_l：航迹起点左侧范围
+RIGHT_SPAN_Y_CM = 160.0         # y_r：航迹起点右侧范围
 CENTER_INSET_X_CM = 80.0        # 航迹 3 折返到距航迹起点前方 80 cm
 # 目标地面高度相对起飞前 LIO 标定平面；更换场地时须重新测量这两项。
 FREE_TARGET_GROUND_HEIGHT_CM = 0.0
@@ -38,9 +38,9 @@ MANDATORY_TARGET_GROUND_HEIGHT_CM = 30.0
 
 FC_SERVER_HOST = "127.0.0.1"
 FC_SERVER_PORT = 5654
-CRUISE_SPEED = 15.0
+CRUISE_SPEED = 30.0
 # 以下三个高度均为 FAST-LIO startup-local Z 定高目标（cm），不是激光 AGL。
-CRUISE_HEIGHT = 150.0
+CRUISE_HEIGHT = 130.0
 VERTICAL_SPEED = 22.0
 FREE_DROP_HEIGHT = 80.0
 MANDATORY_DROP_HEIGHT = 100.0
