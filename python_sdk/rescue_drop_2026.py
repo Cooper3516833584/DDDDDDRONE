@@ -52,7 +52,13 @@ MONITOR_INTERVAL = 1.0
 # 视觉初值沿用 former_code/2026_disaster_survey.py；超时和丢失等待由用户指定。
 VISUAL_CENTER_THRESHOLD_PX = 30.0  # 巡航接近结束、开始下降的像素距离
 LOW_CALIBRATION_THRESHOLD_PX = 20.0  # 下降后的悬挂点校准误差
-VISUAL_APPROACH_SPEED = 15.0
+VISUAL_APPROACH_SPEED = 15.0  # cm/s；仅作为远距离速度上限
+VISUAL_APPROACH_MIN_SPEED = 2.0  # cm/s；接近阈值时减速
+VISUAL_APPROACH_SPEED_PER_PX = 0.10  # cm/s/px；按预测像素误差调速
+VISUAL_APPROACH_LOOKAHEAD_S = 0.40  # 约一帧的预测提前量
+VISUAL_APPROACH_SETTLE_S = 0.8  # 至少三帧持续居中后才下降
+VISUAL_APPROACH_SETTLE_MAX_GAP_S = 0.65
+VISUAL_APPROACH_LOG_PERIOD_S = 1.0
 VISUAL_PERIOD = 0.1
 VISUAL_MAX_AGE = 0.5
 VISION_WARMUP_S = 6.0
@@ -83,7 +89,9 @@ TARGET_DETECT_CONF = 0.35       # 与 robocup_target 权重配套的置信度阈
 TARGET_DETECT_IMGSZ = 640
 TARGET_MAX_NEW_TRACKS = 8       # 单帧最多新建几个目标身份
 TARGET_TRACK_GATE_RATIO = 0.15  # 关联门限 = 该比例 × 画面短边
-TARGET_TRACK_TIMEOUT_S = 0.6    # 连续多久没再看到就丢弃该身份
+TARGET_TRACK_TIMEOUT_S = 1.2    # 约容忍两帧漏检，降低下降时的身份重建概率
+MANDATORY_REBIND_MAX_DISTANCE_CM = 30.0  # 只接续原目标附近的新黄色身份
+MANDATORY_REBIND_MIN_FRAMES = 2
 TARGET_CAMERA_READ_FAILURES = 10  # 连续读帧失败达到该次数即判定相机失效
 
 FREE_DROP_COUNT = 4  # 任务牌配额仍合计 4；同一目标低空连续投完该颜色配额
@@ -99,6 +107,23 @@ FREE_COLORS = ("red", "blue", "green")
 MANDATORY_COLOR = "yellow"
 
 Point = Tuple[float, float]
+
+
+def visual_approach_command(error: Point, pixel_velocity: Point) -> Tuple[float, Point]:
+    """巡航接近按像素误差减速；预测进入居中范围时提前发零速。"""
+    predicted = (error[0] + pixel_velocity[0] * VISUAL_APPROACH_LOOKAHEAD_S,
+                 error[1] + pixel_velocity[1] * VISUAL_APPROACH_LOOKAHEAD_S)
+    distance = math.hypot(*error)
+    predicted_distance = math.hypot(*predicted)
+    if (distance <= VISUAL_CENTER_THRESHOLD_PX
+            or predicted_distance <= VISUAL_CENTER_THRESHOLD_PX
+            or error[0] * predicted[0] + error[1] * predicted[1] <= 0):
+        return 0.0, predicted
+    speed = min(VISUAL_APPROACH_SPEED,
+                max(VISUAL_APPROACH_MIN_SPEED,
+                    VISUAL_APPROACH_SPEED_PER_PX
+                    * (predicted_distance - VISUAL_CENTER_THRESHOLD_PX)))
+    return speed, predicted
 
 
 def low_calibration_command(error: Point, pixel_velocity: Point) -> Tuple[float, Point]:
@@ -944,20 +969,19 @@ class Mission:
         logger.info("[CENTER] Resume from current position at route index {}",
                     self.route_index[MissionState.CENTER])
 
-    def _move_translation_only(self, speed: float, direction_deg: float) -> None:
+    def _move_translation_only(self, speed: float, direction_deg: float) -> Tuple[int, int]:
         """视觉手动平移时在同一控制帧中清零 yaw 角速度。"""
         rad = math.radians(direction_deg)
+        vel_x = int(speed * math.cos(rad))
+        vel_y = int(speed * math.sin(rad))
         self.navi.navigation_flag = False
-        self.navi.update_realtime_control(
-            vel_x=int(speed * math.cos(rad)),
-            vel_y=int(speed * math.sin(rad)),
-            yaw=0,
-        )
+        self.navi.update_realtime_control(vel_x=vel_x, vel_y=vel_y, yaw=0)
+        return vel_x, vel_y
 
     def _move_toward(self, observation: TargetObservation, protected: bool,
                      desired_offset: Point = (0.0, 0.0),
                      speed: float = VISUAL_APPROACH_SPEED,
-                     control_error: Optional[Point] = None) -> None:
+                     control_error: Optional[Point] = None) -> Tuple[int, int]:
         error_x, error_y = (control_error if control_error is not None else
                             (observation.offset_x_px - desired_offset[0],
                              observation.offset_y_px - desired_offset[1]))
@@ -973,25 +997,31 @@ class Mission:
                 raise RuntimeError("obstacle avoidance velocity invalid")
             body_velocity = world_to_body_velocity(*safe_world_velocity, yaw)
         speed = math.hypot(*body_velocity)
+        direction_deg = math.degrees(math.atan2(body_velocity[1], body_velocity[0]))
         if protected:
-            self._move_translation_only(
-                speed, math.degrees(math.atan2(body_velocity[1], body_velocity[0])))
-        elif speed < 1.0:
+            return self._move_translation_only(speed, direction_deg)
+        if speed < 1.0:
             self.navi.stop_move()
-        else:
-            self.navi.move_by_direction(
-                speed=speed,
-                direction_deg=math.degrees(math.atan2(body_velocity[1], body_velocity[0])),
-            )
+            return 0, 0
+        self.navi.move_by_direction(speed=speed, direction_deg=direction_deg)
+        return int(body_velocity[0]), int(body_velocity[1])
 
     def _approach_target(self, target: TargetObservation,
                          protected: bool) -> Optional[TargetObservation]:
         lost_at = None
         hovering = False
+        previous_at = None
+        previous_error = None
+        pixel_velocity = (0.0, 0.0)
+        settled_at = None
+        last_log_at = time.monotonic() - VISUAL_APPROACH_LOG_PERIOD_S
+        logger.info("[APPROACH] Start target={} protected={} pose={}",
+                    target.target_id, protected, self._position())
         if protected:
             self._move_translation_only(0.0, 0.0)
         while True:
             self._check()
+            now = time.monotonic()
             observation = self._observation(target_id=target.target_id)
             if observation is None:
                 if not hovering:
@@ -1001,21 +1031,83 @@ class Mission:
                         self.navi.stop_move()
                     hovering = True
                 if lost_at is None:
-                    lost_at = time.monotonic()
-                if time.monotonic() - lost_at >= TARGET_LOSS_WAIT:
+                    lost_at = now
+                if (previous_at is None
+                        or now - previous_at > VISUAL_APPROACH_SETTLE_MAX_GAP_S):
+                    settled_at = None
+                    pixel_velocity = (0.0, 0.0)
+                    previous_error = None
+                if now - last_log_at >= VISUAL_APPROACH_LOG_PERIOD_S:
+                    logger.info("[APPROACH] target={} no fresh observation; zero horizontal "
+                                "velocity; pose={}", target.target_id, self._position())
+                    last_log_at = now
+                if now - lost_at >= TARGET_LOSS_WAIT:
                     logger.warning("[RESCUE] Target {} lost for 2 seconds", target.target_id)
                     return None
             else:
                 lost_at = None
-                hovering = False
-                if math.hypot(observation.offset_x_px,
-                              observation.offset_y_px) <= VISUAL_CENTER_THRESHOLD_PX:
-                    if protected:
-                        self._move_translation_only(0.0, 0.0)
+                error = (observation.offset_x_px, observation.offset_y_px)
+                is_new = previous_at is None or observation.captured_at > previous_at
+                frame_gap = (observation.captured_at - previous_at
+                             if previous_at is not None else None)
+                if is_new:
+                    if previous_error is not None and frame_gap is not None and 0.04 <= frame_gap <= 1.0:
+                        measured = ((error[0] - previous_error[0]) / frame_gap,
+                                    (error[1] - previous_error[1]) / frame_gap)
+                        measured_speed = math.hypot(*measured)
+                        if measured_speed > LOW_CALIBRATION_MAX_PIXEL_SPEED:
+                            scale = LOW_CALIBRATION_MAX_PIXEL_SPEED / measured_speed
+                            measured = (measured[0] * scale, measured[1] * scale)
+                        pixel_velocity = ((pixel_velocity[0] + measured[0]) * 0.5,
+                                          (pixel_velocity[1] + measured[1]) * 0.5)
                     else:
-                        self.navi.stop_move()
+                        pixel_velocity = (0.0, 0.0)
+                    if (frame_gap is not None
+                            and frame_gap > VISUAL_APPROACH_SETTLE_MAX_GAP_S):
+                        settled_at = None
+                    previous_at = observation.captured_at
+                    previous_error = error
+                distance = math.hypot(*error)
+                speed, predicted = visual_approach_command(error, pixel_velocity)
+                command = (0, 0)
+                if distance <= VISUAL_CENTER_THRESHOLD_PX:
+                    if not hovering:
+                        if protected:
+                            self._move_translation_only(0.0, 0.0)
+                        else:
+                            self.navi.stop_move()
+                        hovering = True
+                    if settled_at is None and is_new:
+                        settled_at = observation.captured_at
+                    action = "settle"
+                elif speed == 0.0:
+                    if not hovering:
+                        if protected:
+                            self._move_translation_only(0.0, 0.0)
+                        else:
+                            self.navi.stop_move()
+                        hovering = True
+                    settled_at = None
+                    action = "brake"
+                else:
+                    settled_at = None
+                    hovering = False
+                    action = "move"
+                    command = self._move_toward(observation, protected,
+                                                speed=speed, control_error=predicted)
+                if now - last_log_at >= VISUAL_APPROACH_LOG_PERIOD_S:
+                    logger.info("[APPROACH] target={} offset=({:.1f},{:.1f})px "
+                                "predicted=({:.1f},{:.1f})px requested_speed={:.1f}cm/s "
+                                "command_body={}cm/s action={} pose={} yaw={:.1f}deg",
+                                target.target_id, *error, *predicted, speed,
+                                command, action, self._position(), self.navi.current_yaw)
+                    last_log_at = now
+                if (settled_at is not None and is_new
+                        and observation.captured_at - settled_at >= VISUAL_APPROACH_SETTLE_S):
+                    logger.info("[APPROACH] Target {} settled for {:.1f}s "
+                                "at error={:.1f}px; descend", target.target_id,
+                                VISUAL_APPROACH_SETTLE_S, distance)
                     return observation
-                self._move_toward(observation, protected)
             self.stop_event.wait(VISUAL_PERIOD)
 
     def _set_height(self, height: float,
@@ -1026,13 +1118,20 @@ class Mission:
             self._move_translation_only(0.0, 0.0)
         else:
             self.navi.stop_move()
+        if translation_only:
+            logger.info("[VISUAL] Height change to {:.1f}cm with zero horizontal/yaw "
+                        "command from pose={}", height, self._position())
         self.navi.set_height(height)
         if not self.navi.wait_for_height(timeout=10):
             raise RuntimeError("height {}cm was not confirmed".format(height))
         self._check(check_deadline)
+        if translation_only:
+            logger.info("[VISUAL] Height {:.1f}cm confirmed at pose={}",
+                        height, self._position())
 
     def _calibrate_low(self, target: TargetObservation,
-                       protected: bool, drop_number: int) -> bool:
+                       protected: bool, drop_number: int,
+                       target_world: Optional[Point] = None) -> bool:
         """每件物资只使用本次校准开始后采集的新观测。"""
         if self.vision is None:
             raise RuntimeError("vision interface missing")
@@ -1056,6 +1155,9 @@ class Mission:
         settled_at = None
         last_log_at = started_at - LOW_CALIBRATION_LOG_PERIOD_S
         last_error_distance = None
+        rebind_id = None
+        rebind_at = None
+        rebind_count = 0
         while time.monotonic() < deadline:
             self._check()
             now = time.monotonic()
@@ -1064,6 +1166,56 @@ class Mission:
                     and (observation.captured_at <= started_at
                          or now - observation.captured_at > LOW_CALIBRATION_MAX_FRAME_AGE_S)):
                 observation = None
+            if observation is not None:
+                rebind_id = None
+                rebind_at = None
+                rebind_count = 0
+            if (observation is None and protected and target_world is not None
+                    and target.color == MANDATORY_COLOR):
+                alternate = self._observation(color=MANDATORY_COLOR)
+                if (alternate is not None and alternate.target_id != target.target_id
+                        and alternate.captured_at > started_at
+                        and now - alternate.captured_at <= LOW_CALIBRATION_MAX_FRAME_AGE_S):
+                    alternate_world = self._estimate_target_world_xy(alternate)
+                    distance_cm = math.hypot(alternate_world[0] - target_world[0],
+                                             alternate_world[1] - target_world[1])
+                    if distance_cm <= MANDATORY_REBIND_MAX_DISTANCE_CM:
+                        if alternate.target_id != rebind_id:
+                            rebind_id = alternate.target_id
+                            rebind_at = alternate.captured_at
+                            rebind_count = 1
+                        elif alternate.captured_at > rebind_at:
+                            if alternate.captured_at - rebind_at > LOW_CALIBRATION_SETTLE_MAX_GAP_S:
+                                rebind_count = 1
+                            else:
+                                rebind_count += 1
+                            rebind_at = alternate.captured_at
+                        if rebind_count >= MANDATORY_REBIND_MIN_FRAMES:
+                            if self.obstacle is None:
+                                raise RuntimeError("obstacle interface missing")
+                            drop_pose = self._desired_aircraft_drop_pose(
+                                alternate_world, drop_number)
+                            if not self.obstacle.mandatory_drop_pose_is_clear(drop_pose):
+                                raise RuntimeError("rebound mandatory drop pose is blocked")
+                            logger.warning("[ALIGN] Rebound yellow target {} -> {} "
+                                           "after {} frames, world shift={:.1f}cm",
+                                           target.target_id, alternate.target_id,
+                                           rebind_count, distance_cm)
+                            target = alternate
+                            self.target = alternate
+                            observation = alternate
+                            previous_at = None
+                            previous_error = None
+                            pixel_velocity = (0.0, 0.0)
+                            settled_at = None
+                    else:
+                        rebind_id = None
+                        rebind_at = None
+                        rebind_count = 0
+                else:
+                    rebind_id = None
+                    rebind_at = None
+                    rebind_count = 0
             if observation is None:
                 if missing_since is None:
                     missing_since = now
@@ -1090,12 +1242,16 @@ class Mission:
                     alternate = self._observation(color=target.color)
                     if alternate is not None and alternate.target_id != target.target_id:
                         logger.info("[ALIGN] locked target={} missing; same-color target={} "
-                                    "offset=({:.1f},{:.1f})px",
+                                    "offset=({:.1f},{:.1f})px; command_body=(0,0)cm/s "
+                                    "pose={} yaw={:.1f}deg",
                                     target.target_id, alternate.target_id,
-                                    alternate.offset_x_px, alternate.offset_y_px)
+                                    alternate.offset_x_px, alternate.offset_y_px,
+                                    self._position(), self.navi.current_yaw)
                     else:
-                        logger.info("[ALIGN] target={} drop={} no fresh observation; hover",
-                                    target.target_id, drop_number)
+                        logger.info("[ALIGN] target={} drop={} no fresh observation; "
+                                    "command_body=(0,0)cm/s pose={} yaw={:.1f}deg",
+                                    target.target_id, drop_number,
+                                    self._position(), self.navi.current_yaw)
                     last_log_at = now
             elif previous_at is None or observation.captured_at > previous_at:
                 missing_since = None
@@ -1120,6 +1276,7 @@ class Mission:
                 distance = math.hypot(*error)
                 last_error_distance = distance
                 speed, predicted_error = low_calibration_command(error, pixel_velocity)
+                command = (0, 0)
                 if distance <= LOW_CALIBRATION_THRESHOLD_PX:
                     if not hovering:
                         if protected:
@@ -1144,17 +1301,20 @@ class Mission:
                     hovering = False
                     position_hold = False
                     action = "move"
-                    self._move_toward(observation, protected, desired_offset,
-                                      speed=speed, control_error=predicted_error)
+                    command = self._move_toward(
+                        observation, protected, desired_offset,
+                        speed=speed, control_error=predicted_error)
                 if now - last_log_at >= LOW_CALIBRATION_LOG_PERIOD_S:
                     logger.info("[ALIGN] target={} drop={} offset=({:.1f},{:.1f})px "
                                 "error=({:.1f},{:.1f})px frame_gap={}s "
                                 "rate=({:.1f},{:.1f})px/s "
-                                "predicted=({:.1f},{:.1f})px speed={:.1f}cm/s action={}",
+                                "predicted=({:.1f},{:.1f})px speed={:.1f}cm/s "
+                                "command_body={}cm/s action={} pose={} yaw={:.1f}deg",
                                 target.target_id, drop_number,
                                 observation.offset_x_px, observation.offset_y_px,
                                 *error, None if frame_gap is None else round(frame_gap, 3),
-                                *pixel_velocity, *predicted_error, speed, action)
+                                *pixel_velocity, *predicted_error, speed,
+                                command, action, self._position(), self.navi.current_yaw)
                     last_log_at = now
                 if (settled_at is not None
                         and observation.captured_at - settled_at >= LOW_CALIBRATION_SETTLE_S):
@@ -1235,8 +1395,9 @@ class Mission:
                     target.target_id, drop_number, target_world, desired_pose)
         self._set_height(MANDATORY_DROP_HEIGHT, translation_only=True)
         calibrated = self._calibrate_low(
-            target, protected=True, drop_number=drop_number)
-        self._drop(MANDATORY_COLOR, target.target_id, calibrated)
+            target, protected=True, drop_number=drop_number,
+            target_world=target_world)
+        self._drop(MANDATORY_COLOR, self.target.target_id, calibrated)
         self._set_height(CRUISE_HEIGHT, translation_only=True)
         self._navigate_center_exit()
         return True

@@ -63,7 +63,9 @@ class TwoYellowMission(rescue.Mission):
             self._check()
             drop_number = self.ledger.next_drop_number
             calibrated = self._calibrate_low(
-                target, protected=True, drop_number=drop_number)
+                target, protected=True, drop_number=drop_number,
+                target_world=target_world)
+            target = self.target
             self._drop(rescue.MANDATORY_COLOR, target.target_id, calibrated)
         self._set_height(rescue.CRUISE_HEIGHT, translation_only=True)
         self._navigate_center_exit()
