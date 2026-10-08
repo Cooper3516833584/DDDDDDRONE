@@ -68,6 +68,24 @@ def wait_for_start_command():
         rescue.logger.warning("[CENTER-TEST] Ignored command; enter exactly start_mission")
 
 
+def wait_for_obstacle_map(mission, planner):
+    """起飞前确认至少两次新鲜点云更新，避免无地图时先飞航迹 1。"""
+    deadline = time.monotonic() + rescue.LIO_POSE_READY_TIMEOUT
+    first_revision = None
+    while time.monotonic() < deadline:
+        mission._check()
+        status = planner.get_debug_state()
+        if status["ready"]:
+            if first_revision is not None and status["revision"] > first_revision:
+                rescue.logger.info("[CENTER-TEST] Obstacle map ready: {}", status)
+                return
+            first_revision = status["revision"]
+        else:
+            first_revision = None
+        mission.stop_event.wait(0.1)
+    raise RuntimeError("fresh, updating 2-D obstacle point cloud unavailable")
+
+
 def main():
     args = parse_args()
     route_1, route_3, _ = rescue.build_routes()
@@ -109,9 +127,11 @@ def main():
             fc, navi, None, None, obstacle,
             {color: 0 for color in rescue.FREE_COLORS}, stop_event)
         mission.prepare_navigation()
+        wait_for_obstacle_map(mission, obstacle_planner)
         wait_for_start_command()
         mission.deadline = time.monotonic() + rescue.MISSION_TIMEOUT
         mission._check()
+        wait_for_obstacle_map(mission, obstacle_planner)
         takeoff_attempted = True
         run_center_avoidance_test(mission)
         return 0
