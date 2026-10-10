@@ -58,7 +58,8 @@ class TwoYellowMission(rescue.Mission):
                 "target={} drop={} target_world={} pose={}",
                 target.target_id, drop_number, target_world, desired_pose)
 
-        self._set_height(rescue.MANDATORY_DROP_HEIGHT, translation_only=True)
+        self._set_height(rescue.MANDATORY_DROP_HEIGHT,
+                         preserve_horizontal_hold=True)
         while self.ledger.has_quota(rescue.MANDATORY_COLOR):
             self._check()
             drop_number = self.ledger.next_drop_number

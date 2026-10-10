@@ -40,10 +40,10 @@ FC_SERVER_HOST = "127.0.0.1"
 FC_SERVER_PORT = 5654
 CRUISE_SPEED = 30.0
 # 以下三个高度均为 FAST-LIO startup-local Z 定高目标（cm），不是激光 AGL。
-CRUISE_HEIGHT = 130.0
+CRUISE_HEIGHT = 100.0
 VERTICAL_SPEED = 22.0
-FREE_DROP_HEIGHT = 60.0
-MANDATORY_DROP_HEIGHT = 80.0
+FREE_DROP_HEIGHT = 40.0
+MANDATORY_DROP_HEIGHT = 60.0
 TAKEOFF_POINT = (0.0, 0.0)
 LANDING_HEIGHT_TIMEOUT = 8.0
 LIO_POSE_READY_TIMEOUT = 15.0
@@ -52,15 +52,18 @@ MONITOR_INTERVAL = 1.0
 # 视觉初值沿用 former_code/2026_disaster_survey.py；超时和丢失等待由用户指定。
 VISUAL_CENTER_THRESHOLD_PX = 30.0  # 巡航接近结束、开始下降的像素距离
 LOW_CALIBRATION_THRESHOLD_PX = 20.0  # 下降后的悬挂点校准误差
-VISUAL_APPROACH_SPEED = 15.0  # cm/s；仅作为远距离速度上限
+VISUAL_APPROACH_SPEED = 12.0  # cm/s；仅作为远距离速度上限
 VISUAL_APPROACH_MIN_SPEED = 2.0  # cm/s；接近阈值时减速
-VISUAL_APPROACH_SPEED_PER_PX = 0.10  # cm/s/px；按预测像素误差调速
+VISUAL_APPROACH_SPEED_PER_PX = 0.07  # cm/s/px；按预测像素误差调速
 VISUAL_APPROACH_LOOKAHEAD_S = 0.40  # 约一帧的预测提前量
-VISUAL_APPROACH_SETTLE_S = 0.8  # 至少三帧持续居中后才下降
+VISUAL_APPROACH_CENTER_FRAMES = 3  # 连续三帧实际偏差达标才下降
 VISUAL_APPROACH_SETTLE_MAX_GAP_S = 0.65
 VISUAL_APPROACH_LOG_PERIOD_S = 1.0
 VISUAL_PERIOD = 0.1
 VISUAL_MAX_AGE = 0.5
+VISUAL_NEAR_CENTER_RADIUS_PX = 100.0
+VISUAL_JUMP_THRESHOLD_PX = 45.0
+VISUAL_JUMP_CONFIRM_MAX_GAP_S = 0.65
 VISION_WARMUP_S = 6.0
 TARGET_LOSS_WAIT = 2.0
 LOW_CALIBRATION_TIMEOUT = 9.0  # 原 6 秒的 1.5 倍
@@ -71,7 +74,7 @@ LOW_CALIBRATION_LOOKAHEAD_S = 0.40  # 预测约一帧后的误差并提前制动
 LOW_CALIBRATION_MAX_PIXEL_SPEED = 120.0  # 限制识别抖动对预测的影响
 LOW_CALIBRATION_MAX_FRAME_AGE_S = 0.45  # 覆盖现场常见 0.35-0.42s 帧间隔
 LOW_CALIBRATION_VELOCITY_MAX_GAP_S = 1.0  # 短暂漏帧不清空像素速度估计
-LOW_CALIBRATION_SETTLE_S = 0.3  # 连续新观测保持在阈值内才算校准完成
+LOW_CALIBRATION_CENTER_FRAMES = 2  # 连续两帧实际误差达标才投放
 LOW_CALIBRATION_SETTLE_MAX_GAP_S = 0.65  # 两帧间短暂空档可继续确认稳定
 LOW_CALIBRATION_HOLD_AFTER_LOSS_S = 1.0  # 长时间丢目标才切回位置保持
 LOW_CALIBRATION_LOG_PERIOD_S = 0.5
@@ -208,13 +211,18 @@ class MissionState(Enum):
 
 @dataclass(frozen=True)
 class TargetObservation:
-    """视觉线程提供的观测；偏移 +x 向前、+y 向左，时间为 monotonic 秒。"""
+    """视觉线程观测；采集时间取 camera.read() 返回后，偏移 +x 前、+y 左。"""
 
     target_id: str
     color: str
     offset_x_px: float
     offset_y_px: float
     captured_at: float
+    frame_seq: int = 0
+    captured_wall_at: float = 0.0
+    inference_ms: float = 0.0
+    confidence: float = 0.0
+    box: Optional[Tuple[float, float, float, float]] = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +241,64 @@ class _TargetTrack:
     offset_x_px: float
     offset_y_px: float
     updated_at: float
+
+
+class _VisualJumpGuard:
+    """近中心单帧大位移先悬停，下一独立帧确认或否决。"""
+
+    def __init__(self) -> None:
+        self.last: Optional[TargetObservation] = None
+        self.pending: Optional[TargetObservation] = None
+
+    @staticmethod
+    def _distance(first: TargetObservation, second: TargetObservation) -> float:
+        return math.hypot(first.offset_x_px - second.offset_x_px,
+                          first.offset_y_px - second.offset_y_px)
+
+    def accept(self, observation: TargetObservation,
+               desired_offset: Point = (0.0, 0.0)) -> Tuple[bool, Optional[TargetObservation], str]:
+        previous = self.last
+        if previous is None:
+            self.last = observation
+            return True, None, "initial"
+        if self.pending is not None:
+            candidate = self.pending
+            if (observation.captured_at - candidate.captured_at
+                    <= VISUAL_JUMP_CONFIRM_MAX_GAP_S
+                    and self._distance(observation, candidate) <= VISUAL_JUMP_THRESHOLD_PX):
+                self.pending = None
+                self.last = observation
+                return True, candidate, "jump-confirmed"
+            self.pending = None
+            if self._distance(observation, previous) <= VISUAL_JUMP_THRESHOLD_PX:
+                self.last = observation
+                return True, candidate, "jump-reverted"
+        previous_error = (previous.offset_x_px - desired_offset[0],
+                          previous.offset_y_px - desired_offset[1])
+        current_error = (observation.offset_x_px - desired_offset[0],
+                         observation.offset_y_px - desired_offset[1])
+        near_center = (math.hypot(*previous_error) <= VISUAL_NEAR_CENTER_RADIUS_PX
+                       or math.hypot(*current_error) <= VISUAL_NEAR_CENTER_RADIUS_PX)
+        if near_center and self._distance(observation, previous) > VISUAL_JUMP_THRESHOLD_PX:
+            self.pending = observation
+            return False, previous, "jump-pending"
+        self.last = observation
+        return True, previous, "normal"
+
+
+def _is_new_visual_frame(observation: TargetObservation,
+                         previous_seq: int, previous_at: float) -> bool:
+    seq = getattr(observation, "frame_seq", 0)
+    return seq > previous_seq if seq else observation.captured_at > previous_at
+
+
+def _is_consecutive_visual_frame(observation: TargetObservation,
+                                 previous_seq: int, previous_at: float,
+                                 max_gap: float) -> bool:
+    if observation.captured_at - previous_at > max_gap:
+        return False
+    seq = getattr(observation, "frame_seq", 0)
+    return seq == previous_seq + 1 if seq and previous_seq else True
 
 
 class VisionInterface:
@@ -254,6 +320,7 @@ class VisionInterface:
         self._frame_size: Tuple[int, int] = (0, 0)
         self._tracks: Dict[str, _TargetTrack] = {}
         self._next_track_id = 1
+        self._frame_seq = 0
         self._read_failures = 0
 
     @property
@@ -292,6 +359,7 @@ class VisionInterface:
         camera, self._camera = self._camera, None
         self._detector = None
         self._tracks.clear()
+        self._frame_seq = 0
         if camera is not None:
             try:
                 camera.release()
@@ -333,9 +401,19 @@ class VisionInterface:
                     self._read_failures))
             return ()
         self._read_failures = 0
-        return self._track(detector.detect(frame), time.monotonic())
+        # 与历史采集线程一致：在读帧成功时记时间，而非推理完成后补记。
+        captured_at = time.monotonic()
+        captured_wall_at = time.time()
+        self._frame_seq += 1
+        frame_seq = self._frame_seq
+        detections = detector.detect(frame)
+        inference_ms = (time.monotonic() - captured_at) * 1000.0
+        return self._track(detections, captured_at, frame_seq,
+                           captured_wall_at, inference_ms)
 
-    def _track(self, detections, now: float) -> Sequence[TargetObservation]:
+    def _track(self, detections, now: float, frame_seq: int = 0,
+               captured_wall_at: float = 0.0,
+               inference_ms: float = 0.0) -> Sequence[TargetObservation]:
         """把本帧检测关联到已有身份；关联不上就分配新身份，超时身份丢弃。"""
         for target_id in [tid for tid, track in self._tracks.items()
                           if now - track.updated_at > TARGET_TRACK_TIMEOUT_S]:
@@ -344,6 +422,7 @@ class VisionInterface:
         gate = TARGET_TRACK_GATE_RATIO * max(1, min(self._frame_size))
         pending = list(range(len(detections)))
         seen: Dict[str, _TargetTrack] = {}
+        matched = {}
 
         # 同颜色里取最近的检测做关联；已配对的检测不再参与后面的匹配。
         for target_id, track in self._tracks.items():
@@ -361,19 +440,27 @@ class VisionInterface:
             if best_index is not None:
                 pending.remove(best_index)
                 seen[target_id] = self._make_track(detections[best_index], now)
+                matched[target_id] = detections[best_index]
 
         # 没关联上的检测是新目标，分配新身份（单帧新建数量有上限）。
         for index in pending[:TARGET_MAX_NEW_TRACKS]:
             target_id = "{}-{}".format(detections[index].color, self._next_track_id)
             self._next_track_id += 1
             seen[target_id] = self._make_track(detections[index], now)
+            matched[target_id] = detections[index]
 
         self._tracks.update(seen)
         return tuple(TargetObservation(target_id=target_id,
                                        color=track.color,
                                        offset_x_px=track.offset_x_px,
                                        offset_y_px=track.offset_y_px,
-                                       captured_at=track.updated_at)
+                                       captured_at=track.updated_at,
+                                       frame_seq=frame_seq,
+                                       captured_wall_at=captured_wall_at,
+                                       inference_ms=inference_ms,
+                                       confidence=float(getattr(matched[target_id],
+                                                                "confidence", 0.0)),
+                                       box=tuple(getattr(matched[target_id], "box", ())) or None)
                      for target_id, track in seen.items())
 
     @staticmethod
@@ -568,7 +655,7 @@ class Mission:
     def __init__(self, fc: FC_Like, navi: Navigation,
                  relay: Optional[LCUSRelay], vision: Optional[VisionInterface],
                  obstacle: Optional[ObstacleInterface], allocation: Dict[str, int],
-                 stop_event: threading.Event):
+                 stop_event: threading.Event, vision_diagnostics: bool = False):
         self.fc = fc
         self.navi = navi
         self.relay = relay
@@ -576,6 +663,8 @@ class Mission:
         self.obstacle = obstacle
         self.ledger = DropLedger(allocation)
         self.stop_event = stop_event
+        self.vision_diagnostics = vision_diagnostics
+        self._vision_diag_recent = []
         self.route_1, self.route_3, self.route_2 = build_routes()
         self.route_index = {MissionState.ROUTE_1: 1,
                             MissionState.CENTER: 1,
@@ -672,6 +761,38 @@ class Mission:
                               and obs.color not in self._completed_free_colors
                               and self.ledger.has_quota(obs.color)))]
         return max(candidates, key=lambda obs: obs.captured_at) if candidates else None
+
+    def _vision_diagnostic(self, stage: str, observation: TargetObservation,
+                           action: str, command: Tuple[int, int],
+                           previous: Optional[TargetObservation] = None) -> None:
+        """仅显式启用时记录新帧；跳变事件附带相邻帧位姿与指令。"""
+        if not self.vision_diagnostics:
+            return
+        def fields(obs: TargetObservation) -> tuple:
+            return (getattr(obs, "frame_seq", 0),
+                    round(obs.captured_at, 6),
+                    round(getattr(obs, "captured_wall_at", 0.0), 6),
+                    round(getattr(obs, "inference_ms", 0.0), 1),
+                    obs.target_id,
+                    getattr(obs, "box", None),
+                    round(getattr(obs, "confidence", 0.0), 3),
+                    (round(obs.offset_x_px, 1), round(obs.offset_y_px, 1)))
+        current = (fields(observation), self._position(),
+                   round(float(self.navi.current_yaw), 1), command, action)
+        prior = None
+        if previous is not None:
+            previous_key = (stage, previous.target_id,
+                            getattr(previous, "frame_seq", 0), previous.captured_at)
+            prior = next((snapshot for key, snapshot in reversed(self._vision_diag_recent)
+                          if key == previous_key), None)
+            if prior is None:
+                prior = (fields(previous), None, None, None, "not-recorded")
+        logger.debug("[VISION-DIAG] stage={} current={} previous={}",
+                     stage, current, prior)
+        key = (stage, observation.target_id,
+               getattr(observation, "frame_seq", 0), observation.captured_at)
+        self._vision_diag_recent.append((key, current))
+        del self._vision_diag_recent[:-4]
 
     def _check(self, check_deadline: bool = True) -> None:
         if self.stop_event.is_set():
@@ -1010,10 +1131,16 @@ class Mission:
                          protected: bool) -> Optional[TargetObservation]:
         lost_at = None
         hovering = False
-        previous_at = None
+        previous_at = -1.0
+        previous_seq = 0
+        seen_at = -1.0
+        seen_seq = 0
         previous_error = None
         pixel_velocity = (0.0, 0.0)
-        settled_at = None
+        centered_count = 0
+        centered_at = -1.0
+        centered_seq = 0
+        jump_guard = _VisualJumpGuard()
         last_log_at = time.monotonic() - VISUAL_APPROACH_LOG_PERIOD_S
         logger.info("[APPROACH] Start target={} protected={} pose={}",
                     target.target_id, protected, self._position())
@@ -1028,13 +1155,13 @@ class Mission:
                     if protected:
                         self._move_translation_only(0.0, 0.0)
                     else:
-                        self.navi.stop_move()
+                        self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
                     hovering = True
                 if lost_at is None:
                     lost_at = now
-                if (previous_at is None
+                if (previous_at < 0
                         or now - previous_at > VISUAL_APPROACH_SETTLE_MAX_GAP_S):
-                    settled_at = None
+                    centered_count = 0
                     pixel_velocity = (0.0, 0.0)
                     previous_error = None
                 if now - last_log_at >= VISUAL_APPROACH_LOG_PERIOD_S:
@@ -1046,86 +1173,124 @@ class Mission:
                     return None
             else:
                 lost_at = None
-                error = (observation.offset_x_px, observation.offset_y_px)
-                is_new = previous_at is None or observation.captured_at > previous_at
-                frame_gap = (observation.captured_at - previous_at
-                             if previous_at is not None else None)
-                if is_new:
-                    if previous_error is not None and frame_gap is not None and 0.04 <= frame_gap <= 1.0:
-                        measured = ((error[0] - previous_error[0]) / frame_gap,
-                                    (error[1] - previous_error[1]) / frame_gap)
-                        measured_speed = math.hypot(*measured)
-                        if measured_speed > LOW_CALIBRATION_MAX_PIXEL_SPEED:
-                            scale = LOW_CALIBRATION_MAX_PIXEL_SPEED / measured_speed
-                            measured = (measured[0] * scale, measured[1] * scale)
-                        pixel_velocity = ((pixel_velocity[0] + measured[0]) * 0.5,
-                                          (pixel_velocity[1] + measured[1]) * 0.5)
-                    else:
+                if _is_new_visual_frame(observation, seen_seq, seen_at):
+                    seen_at = observation.captured_at
+                    seen_seq = getattr(observation, "frame_seq", 0)
+                    accepted, jump_previous, jump_reason = jump_guard.accept(observation)
+                    if not accepted:
+                        if protected:
+                            self._move_translation_only(0.0, 0.0)
+                        else:
+                            self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                        hovering = True
+                        centered_count = 0
                         pixel_velocity = (0.0, 0.0)
-                    if (frame_gap is not None
-                            and frame_gap > VISUAL_APPROACH_SETTLE_MAX_GAP_S):
-                        settled_at = None
-                    previous_at = observation.captured_at
-                    previous_error = error
-                distance = math.hypot(*error)
-                speed, predicted = visual_approach_command(error, pixel_velocity)
-                command = (0, 0)
-                if distance <= VISUAL_CENTER_THRESHOLD_PX:
-                    if not hovering:
-                        if protected:
-                            self._move_translation_only(0.0, 0.0)
+                        previous_error = None
+                        if getattr(self, "vision_diagnostics", False):
+                            self._vision_diagnostic("approach", observation,
+                                                    jump_reason, (0, 0), jump_previous)
+                    else:
+                        error = (observation.offset_x_px, observation.offset_y_px)
+                        frame_gap = (observation.captured_at - previous_at
+                                     if previous_at >= 0 else None)
+                        if (previous_error is not None and frame_gap is not None
+                                and 0.04 <= frame_gap <= 1.0
+                                and jump_reason != "jump-confirmed"):
+                            measured = ((error[0] - previous_error[0]) / frame_gap,
+                                        (error[1] - previous_error[1]) / frame_gap)
+                            measured_speed = math.hypot(*measured)
+                            if measured_speed > LOW_CALIBRATION_MAX_PIXEL_SPEED:
+                                scale = LOW_CALIBRATION_MAX_PIXEL_SPEED / measured_speed
+                                measured = (measured[0] * scale, measured[1] * scale)
+                            pixel_velocity = ((pixel_velocity[0] + measured[0]) * 0.5,
+                                              (pixel_velocity[1] + measured[1]) * 0.5)
                         else:
-                            self.navi.stop_move()
-                        hovering = True
-                    if settled_at is None and is_new:
-                        settled_at = observation.captured_at
-                    action = "settle"
-                elif speed == 0.0:
-                    if not hovering:
-                        if protected:
-                            self._move_translation_only(0.0, 0.0)
+                            pixel_velocity = (0.0, 0.0)
+                        if frame_gap is not None and frame_gap > VISUAL_APPROACH_SETTLE_MAX_GAP_S:
+                            centered_count = 0
+                        previous_at = observation.captured_at
+                        previous_seq = getattr(observation, "frame_seq", 0)
+                        previous_error = error
+                        distance = math.hypot(*error)
+                        speed, predicted = visual_approach_command(error, pixel_velocity)
+                        command = (0, 0)
+                        if distance <= VISUAL_CENTER_THRESHOLD_PX:
+                            centered_count = (centered_count + 1
+                                if centered_count and _is_consecutive_visual_frame(
+                                    observation, centered_seq, centered_at,
+                                    VISUAL_APPROACH_SETTLE_MAX_GAP_S) else 1)
+                            centered_seq = previous_seq
+                            centered_at = observation.captured_at
+                            if not hovering:
+                                if protected:
+                                    self._move_translation_only(0.0, 0.0)
+                                else:
+                                    self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                                hovering = True
+                            action = "center-{}/{}".format(
+                                centered_count, VISUAL_APPROACH_CENTER_FRAMES)
+                        elif speed == 0.0:
+                            centered_count = 0
+                            if not hovering:
+                                if protected:
+                                    self._move_translation_only(0.0, 0.0)
+                                else:
+                                    self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                                hovering = True
+                            action = "brake"
                         else:
-                            self.navi.stop_move()
-                        hovering = True
-                    settled_at = None
-                    action = "brake"
-                else:
-                    settled_at = None
-                    hovering = False
-                    action = "move"
-                    command = self._move_toward(observation, protected,
-                                                speed=speed, control_error=predicted)
-                if now - last_log_at >= VISUAL_APPROACH_LOG_PERIOD_S:
-                    logger.info("[APPROACH] target={} offset=({:.1f},{:.1f})px "
-                                "predicted=({:.1f},{:.1f})px requested_speed={:.1f}cm/s "
-                                "command_body={}cm/s action={} pose={} yaw={:.1f}deg",
-                                target.target_id, *error, *predicted, speed,
-                                command, action, self._position(), self.navi.current_yaw)
-                    last_log_at = now
-                if (settled_at is not None and is_new
-                        and observation.captured_at - settled_at >= VISUAL_APPROACH_SETTLE_S):
-                    logger.info("[APPROACH] Target {} settled for {:.1f}s "
-                                "at error={:.1f}px; descend", target.target_id,
-                                VISUAL_APPROACH_SETTLE_S, distance)
-                    return observation
+                            centered_count = 0
+                            hovering = False
+                            action = "move"
+                            command = self._move_toward(
+                                observation, protected, speed=speed,
+                                control_error=predicted)
+                        if now - last_log_at >= VISUAL_APPROACH_LOG_PERIOD_S:
+                            logger.info("[APPROACH] target={} frame={} offset=({:.1f},{:.1f})px "
+                                        "predicted=({:.1f},{:.1f})px requested_speed={:.1f}cm/s "
+                                        "command_body={}cm/s action={} pose={} yaw={:.1f}deg",
+                                        target.target_id, previous_seq, *error, *predicted,
+                                        speed, command, action, self._position(),
+                                        self.navi.current_yaw)
+                            last_log_at = now
+                        if getattr(self, "vision_diagnostics", False):
+                            self._vision_diagnostic("approach", observation,
+                                                    action, command,
+                                                    jump_previous if jump_reason.startswith("jump") else None)
+                        if centered_count >= VISUAL_APPROACH_CENTER_FRAMES:
+                            self._check()
+                            if protected:
+                                self.navi.set_yaw(float(self.navi.current_yaw))
+                            self.navi.stop_move()  # 此刻记录水平 PID 目标，再开始下降
+                            logger.info("[APPROACH] Target {} centered in {} fresh frames "
+                                        "at error={:.1f}px; hold XY={} and descend",
+                                        target.target_id, centered_count, distance,
+                                        self._position())
+                            return observation
             self.stop_event.wait(VISUAL_PERIOD)
 
     def _set_height(self, height: float,
                     check_deadline: bool = True,
-                    translation_only: bool = False) -> None:
+                    translation_only: bool = False,
+                    preserve_horizontal_hold: bool = False) -> None:
         self._check(check_deadline)
-        if translation_only:
+        if preserve_horizontal_hold:
+            if not self.navi.navigation_flag:
+                raise RuntimeError("horizontal PID hold was not active before descent")
+            logger.info("[VISUAL] Hold horizontal PID target=({}, {}) while descending",
+                        self.navi.navi_x_pid.setpoint, self.navi.navi_y_pid.setpoint)
+        elif translation_only:
             self._move_translation_only(0.0, 0.0)
         else:
             self.navi.stop_move()
-        if translation_only:
+        if translation_only and not preserve_horizontal_hold:
             logger.info("[VISUAL] Height change to {:.1f}cm with zero horizontal/yaw "
                         "command from pose={}", height, self._position())
         self.navi.set_height(height)
         if not self.navi.wait_for_height(timeout=10):
             raise RuntimeError("height {}cm was not confirmed".format(height))
         self._check(check_deadline)
-        if translation_only:
+        if translation_only and not preserve_horizontal_hold:
             logger.info("[VISUAL] Height {:.1f}cm confirmed at pose={}",
                         height, self._position())
 
@@ -1146,13 +1311,21 @@ class Mission:
                     drop_number, *desired_offset)
         started_at = time.monotonic()
         deadline = started_at + LOW_CALIBRATION_TIMEOUT
-        hovering = False
+        # 下降时的水平 PID 目标只用于定点下降；低空从零水平/偏航速度重新开始视觉校准。
+        self._move_translation_only(0.0, 0.0)
+        hovering = True
         position_hold = False
         missing_since = None
-        previous_at = None
+        previous_at = -1.0
+        previous_seq = 0
+        seen_at = -1.0
+        seen_seq = 0
         previous_error = None
         pixel_velocity = (0.0, 0.0)
-        settled_at = None
+        centered_count = 0
+        centered_at = -1.0
+        centered_seq = 0
+        jump_guard = _VisualJumpGuard()
         last_log_at = started_at - LOW_CALIBRATION_LOG_PERIOD_S
         last_error_distance = None
         rebind_id = None
@@ -1204,10 +1377,14 @@ class Mission:
                             target = alternate
                             self.target = alternate
                             observation = alternate
-                            previous_at = None
+                            previous_at = -1.0
+                            previous_seq = 0
+                            seen_at = -1.0
+                            seen_seq = 0
                             previous_error = None
                             pixel_velocity = (0.0, 0.0)
-                            settled_at = None
+                            centered_count = 0
+                            jump_guard = _VisualJumpGuard()
                     else:
                         rebind_id = None
                         rebind_at = None
@@ -1230,14 +1407,14 @@ class Mission:
                         and now - missing_since >= LOW_CALIBRATION_HOLD_AFTER_LOSS_S):
                     self.navi.stop_move()
                     position_hold = True
-                if (previous_at is None
+                if (previous_at < 0
                         or now - previous_at > LOW_CALIBRATION_VELOCITY_MAX_GAP_S):
-                    previous_at = None
+                    previous_at = -1.0
                     previous_error = None
                     pixel_velocity = (0.0, 0.0)
-                if (previous_at is None
+                if (previous_at < 0
                         or now - previous_at > LOW_CALIBRATION_SETTLE_MAX_GAP_S):
-                    settled_at = None
+                    centered_count = 0
                 if now - last_log_at >= LOW_CALIBRATION_LOG_PERIOD_S:
                     alternate = self._observation(color=target.color)
                     if alternate is not None and alternate.target_id != target.target_id:
@@ -1253,14 +1430,35 @@ class Mission:
                                     target.target_id, drop_number,
                                     self._position(), self.navi.current_yaw)
                     last_log_at = now
-            elif previous_at is None or observation.captured_at > previous_at:
+            elif _is_new_visual_frame(observation, seen_seq, seen_at):
+                seen_at = observation.captured_at
+                seen_seq = getattr(observation, "frame_seq", 0)
                 missing_since = None
+                accepted, jump_previous, jump_reason = jump_guard.accept(
+                    observation, desired_offset)
+                if not accepted:
+                    self._move_translation_only(0.0, 0.0)
+                    hovering = True
+                    position_hold = False
+                    centered_count = 0
+                    previous_error = None
+                    pixel_velocity = (0.0, 0.0)
+                    if getattr(self, "vision_diagnostics", False):
+                        self._vision_diagnostic("low", observation, jump_reason,
+                                                (0, 0), jump_previous)
+                    self.stop_event.wait(VISUAL_PERIOD)
+                    continue
+                if position_hold:
+                    self._move_translation_only(0.0, 0.0)
+                    position_hold = False
+                    hovering = True
                 error = (observation.offset_x_px - desired_offset[0],
                          observation.offset_y_px - desired_offset[1])
                 frame_gap = (observation.captured_at - previous_at
-                             if previous_at is not None else None)
-                if previous_at is not None and previous_error is not None:
-                    if 0.04 <= frame_gap <= LOW_CALIBRATION_VELOCITY_MAX_GAP_S:
+                             if previous_at >= 0 else None)
+                if frame_gap is not None and previous_error is not None:
+                    if (0.04 <= frame_gap <= LOW_CALIBRATION_VELOCITY_MAX_GAP_S
+                            and jump_reason != "jump-confirmed"):
                         measured = ((error[0] - previous_error[0]) / frame_gap,
                                     (error[1] - previous_error[1]) / frame_gap)
                         measured_speed = math.hypot(*measured)
@@ -1272,54 +1470,57 @@ class Mission:
                     else:
                         pixel_velocity = (0.0, 0.0)
                 previous_at = observation.captured_at
+                previous_seq = getattr(observation, "frame_seq", 0)
                 previous_error = error
                 distance = math.hypot(*error)
                 last_error_distance = distance
                 speed, predicted_error = low_calibration_command(error, pixel_velocity)
                 command = (0, 0)
                 if distance <= LOW_CALIBRATION_THRESHOLD_PX:
+                    centered_count = (centered_count + 1
+                        if centered_count and _is_consecutive_visual_frame(
+                            observation, centered_seq, centered_at,
+                            LOW_CALIBRATION_SETTLE_MAX_GAP_S) else 1)
+                    centered_seq = previous_seq
+                    centered_at = observation.captured_at
                     if not hovering:
-                        if protected:
-                            self._move_translation_only(0.0, 0.0)
-                        else:
-                            self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                        self._move_translation_only(0.0, 0.0)
                         hovering = True
-                    if settled_at is None:
-                        settled_at = observation.captured_at
-                    action = "settle"
+                    action = "center-{}/{}".format(
+                        centered_count, LOW_CALIBRATION_CENTER_FRAMES)
                 elif speed == 0.0:
                     if not hovering:
-                        if protected:
-                            self._move_translation_only(0.0, 0.0)
-                        else:
-                            self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                        self._move_translation_only(0.0, 0.0)
                         hovering = True
-                    settled_at = None
+                    centered_count = 0
                     action = "brake"
                 else:
-                    settled_at = None
+                    centered_count = 0
                     hovering = False
-                    position_hold = False
                     action = "move"
                     command = self._move_toward(
                         observation, protected, desired_offset,
                         speed=speed, control_error=predicted_error)
                 if now - last_log_at >= LOW_CALIBRATION_LOG_PERIOD_S:
-                    logger.info("[ALIGN] target={} drop={} offset=({:.1f},{:.1f})px "
+                    logger.info("[ALIGN] target={} drop={} frame={} offset=({:.1f},{:.1f})px "
                                 "error=({:.1f},{:.1f})px frame_gap={}s "
                                 "rate=({:.1f},{:.1f})px/s "
                                 "predicted=({:.1f},{:.1f})px speed={:.1f}cm/s "
                                 "command_body={}cm/s action={} pose={} yaw={:.1f}deg",
-                                target.target_id, drop_number,
+                                target.target_id, drop_number, previous_seq,
                                 observation.offset_x_px, observation.offset_y_px,
                                 *error, None if frame_gap is None else round(frame_gap, 3),
                                 *pixel_velocity, *predicted_error, speed,
                                 command, action, self._position(), self.navi.current_yaw)
                     last_log_at = now
-                if (settled_at is not None
-                        and observation.captured_at - settled_at >= LOW_CALIBRATION_SETTLE_S):
-                    logger.info("[RESCUE] Low-altitude calibration settled for {} "
-                                "error={:.1f}px", target.target_id, distance)
+                if getattr(self, "vision_diagnostics", False):
+                    self._vision_diagnostic("low", observation, action, command,
+                                            jump_previous if jump_reason.startswith("jump") else None)
+                if centered_count >= LOW_CALIBRATION_CENTER_FRAMES:
+                    self._check()
+                    logger.info("[RESCUE] Low-altitude calibration centered for {} "
+                                "in {} fresh frames; error={:.1f}px",
+                                target.target_id, centered_count, distance)
                     return True
             self.stop_event.wait(VISUAL_PERIOD)
         if protected:
@@ -1358,7 +1559,7 @@ class Mission:
         if self._approach_target(target, protected=False) is None:
             self._resume_route(self.free_origin)
             return
-        self._set_height(FREE_DROP_HEIGHT)
+        self._set_height(FREE_DROP_HEIGHT, preserve_horizontal_hold=True)
         while self.ledger.has_quota(target.color):
             self._check()
             calibrated = self._calibrate_low(
@@ -1393,7 +1594,7 @@ class Mission:
         logger.info("[MANDATORY] 43cm drop-pose clearance accepted: "
                     "target={} drop={} target_world={} pose={}",
                     target.target_id, drop_number, target_world, desired_pose)
-        self._set_height(MANDATORY_DROP_HEIGHT, translation_only=True)
+        self._set_height(MANDATORY_DROP_HEIGHT, preserve_horizontal_hold=True)
         calibrated = self._calibrate_low(
             target, protected=True, drop_number=drop_number,
             target_world=target_world)
@@ -1550,6 +1751,8 @@ def parse_args() -> argparse.Namespace:
                         help="旧版直连串口参数；FC_Server 运行时不得使用")
     parser.add_argument("--relay-port", default=None,
                         help="LCUS 继电器串口；也可用 D_TASK_RELAY_PORT 环境变量")
+    parser.add_argument("--vision-diagnostics", action="store_true",
+                        help="记录每次新视觉观测、指令和跳变相邻帧；默认关闭")
     parser.add_argument("--red-count", type=int)
     parser.add_argument("--blue-count", type=int)
     parser.add_argument("--green-count", type=int)
@@ -1640,7 +1843,8 @@ def main() -> int:
         navi = Navigation(fc=fc, stop_event=stop_event,
                           obstacle_planner=obstacle_planner,
                           height_source="lio")
-        mission = Mission(fc, navi, None, vision, obstacle, allocation, stop_event)
+        mission = Mission(fc, navi, None, vision, obstacle, allocation, stop_event,
+                          vision_diagnostics=getattr(args, "vision_diagnostics", False))
         mission.prepare_navigation()
 
         if not args.confirm_flight:

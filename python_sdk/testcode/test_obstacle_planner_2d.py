@@ -365,10 +365,17 @@ class MissionVelocityTests(unittest.TestCase):
         source = SDK / "rescue_drop_2026.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                   and n.name in {"body_to_world_velocity", "world_to_body_velocity"}]
+                   and n.name in {"body_to_world_velocity", "world_to_body_velocity",
+                                  "_is_new_visual_frame", "_is_consecutive_visual_frame"}]
+        helpers += [n for n in tree.body if isinstance(n, ast.ClassDef)
+                    and n.name == "_VisualJumpGuard"]
         future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
         tree = ast.fix_missing_locations(ast.Module(body=[future] + helpers, type_ignores=[]))
-        self.namespace = {"math": math, "VISUAL_APPROACH_SPEED": 15.0}
+        self.namespace = {"math": math, "VISUAL_APPROACH_SPEED": 15.0,
+                          "VISUAL_NEAR_CENTER_RADIUS_PX": 100.0,
+                          "VISUAL_JUMP_THRESHOLD_PX": 45.0,
+                          "VISUAL_JUMP_CONFIRM_MAX_GAP_S": 0.65,
+                          "LOW_CALIBRATION_CENTER_FRAMES": 2}
         exec(compile(tree, str(source), "exec"), self.namespace)
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_move_translation_only", "_move_toward", "_position",
@@ -492,7 +499,6 @@ class MissionVelocityTests(unittest.TestCase):
             "LOW_CALIBRATION_HOLD_AFTER_LOSS_S": 1.0,
             "LOW_CALIBRATION_VELOCITY_MAX_GAP_S": 1.0,
             "LOW_CALIBRATION_SETTLE_MAX_GAP_S": 0.65,
-            "LOW_CALIBRATION_SETTLE_S": 0.3,
             "LOW_CALIBRATION_THRESHOLD_PX": 20.0,
             "LOW_CALIBRATION_MAX_PIXEL_SPEED": 120.0,
             "LOW_CALIBRATION_LOG_PERIOD_S": 0.5,
@@ -573,14 +579,18 @@ class VisualApproachTests(unittest.TestCase):
         tree = ast.parse(source.read_text(encoding="utf-8"))
         names = {"VISUAL_CENTER_THRESHOLD_PX", "VISUAL_APPROACH_SPEED",
                  "VISUAL_APPROACH_MIN_SPEED", "VISUAL_APPROACH_SPEED_PER_PX",
-                 "VISUAL_APPROACH_LOOKAHEAD_S", "VISUAL_APPROACH_SETTLE_S",
+                 "VISUAL_APPROACH_LOOKAHEAD_S", "VISUAL_APPROACH_CENTER_FRAMES",
                  "VISUAL_APPROACH_SETTLE_MAX_GAP_S", "VISUAL_APPROACH_LOG_PERIOD_S",
-                 "VISUAL_PERIOD", "TARGET_LOSS_WAIT",
+                 "VISUAL_PERIOD", "TARGET_LOSS_WAIT", "VISUAL_NEAR_CENTER_RADIUS_PX",
+                 "VISUAL_JUMP_THRESHOLD_PX", "VISUAL_JUMP_CONFIRM_MAX_GAP_S",
                  "LOW_CALIBRATION_MAX_PIXEL_SPEED"}
         selected = [n for n in tree.body if isinstance(n, ast.Assign)
                     and any(isinstance(t, ast.Name) and t.id in names for t in n.targets)]
         selected += [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                     and n.name == "visual_approach_command"]
+                     and n.name in {"visual_approach_command", "_is_new_visual_frame",
+                                    "_is_consecutive_visual_frame"}]
+        selected += [n for n in tree.body if isinstance(n, ast.ClassDef)
+                     and n.name == "_VisualJumpGuard"]
         future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
         module = ast.fix_missing_locations(ast.Module(body=[future] + selected, type_ignores=[]))
         self.namespace = {"math": math, "logger": Mock()}
@@ -588,9 +598,26 @@ class VisualApproachTests(unittest.TestCase):
 
     def test_approach_slows_near_center_and_brakes_ahead(self):
         command = self.namespace["visual_approach_command"]
-        self.assertEqual(command((200.0, 0.0), (0.0, 0.0))[0], 15.0)
+        self.assertEqual(command((300.0, 0.0), (0.0, 0.0))[0], 12.0)
         self.assertEqual(command((50.0, 0.0), (0.0, 0.0))[0], 2.0)
         self.assertEqual(command((50.0, 0.0), (-80.0, 0.0))[0], 0.0)
+
+    def test_single_frame_center_jump_requires_next_frame_confirmation(self):
+        guard = self.namespace["_VisualJumpGuard"]()
+
+        def frame(seq, offset):
+            return SimpleNamespace(target_id="red-1", frame_seq=seq,
+                                   offset_x_px=offset, offset_y_px=0.0,
+                                   captured_at=seq * 0.4)
+
+        self.assertTrue(guard.accept(frame(1, 80.0))[0])
+        accepted, previous, reason = guard.accept(frame(2, 5.0))
+        self.assertFalse(accepted)
+        self.assertEqual(previous.frame_seq, 1)
+        self.assertEqual(reason, "jump-pending")
+        self.assertEqual(guard.accept(frame(3, 78.0))[2], "jump-reverted")
+        self.assertFalse(guard.accept(frame(4, 5.0))[0])
+        self.assertEqual(guard.accept(frame(5, 7.0))[2], "jump-confirmed")
 
     def test_approach_waits_for_new_centered_frames_before_descent(self):
         clock = SimpleNamespace(now=0.0)
@@ -609,19 +636,108 @@ class VisualApproachTests(unittest.TestCase):
                   (1.2, 25.0), (1.6, 25.0)]
 
         def observation(target_id):
-            captured_at, offset = max((frame for frame in frames
-                                       if frame[0] <= clock.now), default=(0.0, 100.0))
+            frame_seq, (captured_at, offset) = max(
+                ((index + 1, frame) for index, frame in enumerate(frames)
+                 if frame[0] <= clock.now), default=(1, frames[0]))
             return SimpleNamespace(target_id=target_id, offset_x_px=offset,
-                                   offset_y_px=0.0, captured_at=captured_at)
+                                   offset_y_px=0.0, captured_at=captured_at,
+                                   frame_seq=frame_seq)
 
         mission._observation = observation
         target = SimpleNamespace(target_id="yellow-3")
         result = mission._approach_target(target, protected=True)
         self.assertEqual(result.target_id, "yellow-3")
-        self.assertGreaterEqual(clock.now, 1.2)
-        self.assertLessEqual(clock.now, 1.6)
+        self.assertGreaterEqual(clock.now, 1.6)
+        self.assertLessEqual(clock.now, 1.7)
         mission._move_translation_only.assert_called_with(0.0, 0.0)
         self.assertTrue(mission._move_toward.called)
+        mission.navi.stop_move.assert_called_once()
+        mission.navi.set_yaw.assert_called_once_with(0.0)
+
+    def test_poll_stamps_frame_before_inference_and_increments_sequence(self):
+        clock = iter((10.0, 10.25, 10.4, 10.7))
+        namespace = {"time": SimpleNamespace(monotonic=lambda: next(clock),
+                                                time=lambda: 1234.0),
+                     "TARGET_CAMERA_READ_FAILURES": 10}
+        cls = load_class("rescue_drop_2026.py", "VisionInterface",
+                         names={"__init__", "poll"}, namespace=namespace)
+        vision = cls()
+        vision._camera = Mock()
+        vision._camera.read.return_value = (True, object())
+        vision._detector = Mock()
+        vision._detector.detect.return_value = ()
+        vision._track = Mock(return_value=())
+        vision.poll()
+        vision.poll()
+        calls = vision._track.call_args_list
+        self.assertEqual([call.args[2] for call in calls], [1, 2])
+        self.assertEqual([call.args[1] for call in calls], [10.0, 10.4])
+        self.assertEqual([round(call.args[4]) for call in calls], [250, 300])
+        self.assertEqual([call.args[3] for call in calls], [1234.0, 1234.0])
+
+    def test_low_calibration_uses_two_distinct_centered_frames(self):
+        clock = SimpleNamespace(now=0.0)
+        self.namespace.update({
+            "time": SimpleNamespace(monotonic=lambda: clock.now),
+            "MANDATORY_COLOR": "yellow", "FREE_DROP_HEIGHT": 60.0,
+            "FREE_TARGET_GROUND_HEIGHT_CM": 0.0,
+            "payload_target_offset_px": Mock(return_value=(0.0, 0.0)),
+            "low_calibration_command": lambda error, velocity: (0.0, error),
+            "LOW_CALIBRATION_TIMEOUT": 1.0,
+            "LOW_CALIBRATION_MAX_FRAME_AGE_S": 0.45,
+            "LOW_CALIBRATION_HOLD_AFTER_LOSS_S": 1.0,
+            "LOW_CALIBRATION_VELOCITY_MAX_GAP_S": 1.0,
+            "LOW_CALIBRATION_SETTLE_MAX_GAP_S": 0.65,
+            "LOW_CALIBRATION_MAX_PIXEL_SPEED": 120.0,
+            "LOW_CALIBRATION_THRESHOLD_PX": 20.0,
+            "LOW_CALIBRATION_CENTER_FRAMES": 2,
+            "LOW_CALIBRATION_LOG_PERIOD_S": 0.5,
+        })
+        cls = load_class("rescue_drop_2026.py", "Mission",
+                         names={"_calibrate_low"}, namespace=self.namespace)
+        mission = cls()
+        mission.vision = SimpleNamespace(frame_size=(640, 480))
+        mission.navi = Mock(current_yaw=0.0)
+        mission._check = Mock()
+        mission._position = Mock(return_value=(0.0, 0.0))
+        mission._move_translation_only = Mock()
+        mission.stop_event = SimpleNamespace(
+            wait=lambda period: setattr(clock, "now", round(clock.now + period, 2)))
+
+        def observation(target_id):
+            seq, at = (2, 0.4) if clock.now >= 0.4 else (1, 0.1)
+            return SimpleNamespace(target_id=target_id, color="red",
+                                   offset_x_px=10.0, offset_y_px=0.0,
+                                   captured_at=at, frame_seq=seq)
+
+        mission._observation = observation
+        target = SimpleNamespace(target_id="red-1", color="red")
+        self.assertTrue(mission._calibrate_low(target, False, 1))
+        self.assertGreaterEqual(clock.now, 0.4)
+        self.assertLess(clock.now, 0.5)
+        mission._move_translation_only.assert_called_once_with(0.0, 0.0)
+        mission.navi.stop_move.assert_not_called()
+
+    def test_jump_diagnostics_include_previous_pose_and_command(self):
+        cls = load_class("rescue_drop_2026.py", "Mission",
+                         names={"_vision_diagnostic"}, namespace=self.namespace)
+        mission = cls()
+        mission.vision_diagnostics = True
+        mission._vision_diag_recent = []
+        mission.navi = Mock(current_yaw=0.0)
+        mission._position = Mock(side_effect=[(1.0, 2.0), (3.0, 4.0)])
+        previous = SimpleNamespace(target_id="red-1", frame_seq=1,
+                                   captured_at=0.1, offset_x_px=70.0,
+                                   offset_y_px=0.0)
+        current = SimpleNamespace(target_id="red-1", frame_seq=2,
+                                  captured_at=0.5, offset_x_px=5.0,
+                                  offset_y_px=0.0)
+        mission._vision_diagnostic("approach", previous, "move", (5, 0))
+        mission._vision_diagnostic("approach", current, "jump-pending",
+                                   (0, 0), previous)
+        prior = self.namespace["logger"].debug.call_args.args[3]
+        self.assertEqual(prior[1], (1.0, 2.0))
+        self.assertEqual(prior[3:], ((5, 0), "move"))
 
 
 class CenterMissionOfflineTests(unittest.TestCase):
@@ -690,8 +806,10 @@ class CenterMissionOfflineTests(unittest.TestCase):
         self.assertTrue(mission._mandatory_drop())
         self.assertEqual([call.args[0] for call in mission._set_height.call_args_list],
                          [100.0, 150.0])
-        self.assertTrue(all(call.kwargs == {"translation_only": True}
-                            for call in mission._set_height.call_args_list))
+        self.assertEqual(mission._set_height.call_args_list[0].kwargs,
+                         {"preserve_horizontal_hold": True})
+        self.assertEqual(mission._set_height.call_args_list[1].kwargs,
+                         {"translation_only": True})
         mission._calibrate_low.assert_called_once_with(
             mission.target, protected=True, drop_number=1,
             target_world=(200.0, 0.0))

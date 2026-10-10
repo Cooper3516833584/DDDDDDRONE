@@ -275,6 +275,7 @@ def test_visual_offset_uses_fixed_target_ground_heights():
         "MANDATORY_DROP_HEIGHT": 100.0, "MANDATORY_TARGET_GROUND_HEIGHT_CM": 30.0,
         "FREE_DROP_HEIGHT": 80.0, "FREE_TARGET_GROUND_HEIGHT_CM": 0.0,
         "LOW_CALIBRATION_TIMEOUT": 0.0, "LOW_CALIBRATION_LOG_PERIOD_S": 0.5,
+        "_VisualJumpGuard": Mock(),
         "payload_target_offset_px": lambda _number, height, _frame: (
             heights.append(height) or (0.0, 0.0)),
     }
@@ -282,6 +283,7 @@ def test_visual_offset_uses_fixed_target_ground_heights():
     mission = object.__new__(Mission)
     mission.vision = NS(frame_size=(640, 480))
     mission.navi = NS(current_height=999.0, stop_move=Mock())
+    mission._move_translation_only = Mock()
     assert not mission._calibrate_low(NS(color="red", target_id="free"), False, 1)
     assert not mission._calibrate_low(NS(color="yellow", target_id="mandatory"), False, 2)
     assert heights == [80.0, 70.0]
