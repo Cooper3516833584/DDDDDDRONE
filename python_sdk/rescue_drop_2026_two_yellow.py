@@ -25,6 +25,9 @@ class TwoYellowMission(rescue.Mission):
         target = self.target
         if target is None or target.color != rescue.MANDATORY_COLOR:
             raise RuntimeError("mandatory target missing")
+        boundary_result = self._mandatory_boundary_if_needed(target)
+        if boundary_result is not None:
+            return boundary_result
         approach_observation = self._approach_target(target, protected=True)
         if approach_observation is None:
             self.navi.stop_move()
@@ -37,6 +40,13 @@ class TwoYellowMission(rescue.Mission):
             raise RuntimeError("mandatory quota exhausted")
 
         target_world = self._estimate_target_world_xy(approach_observation)
+        if self.obstacle.point_is_inflated(target_world):
+            boundary_result = self._mandatory_boundary_if_needed(target)
+            if boundary_result is not None:
+                return boundary_result
+            self.navi.stop_move()
+            self._resume_center_route()
+            return False
         next_drop = self.ledger.next_drop_number
         last_drop = next_drop + self.ledger.mandatory_remaining - 1
         if last_drop > rescue.TOTAL_DROP_COUNT:

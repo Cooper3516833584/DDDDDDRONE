@@ -26,11 +26,11 @@ def run_center_avoidance_test(mission):
     if not navi.wait_for_yaw():
         raise RuntimeError("yaw stabilization was not confirmed")
 
-    # 无检测参数：航迹 1 上的自由目标不会中断导航。
-    for waypoint in mission.route_1:
-        mission._navigate_leg(waypoint)
-    if not mission._at_waypoint(mission._position(), mission.route_3[0]):
-        raise RuntimeError("route 1 endpoint was not confirmed")
+    mission._navigate_leg(mission.route_1[0])
+    # 复用主任务的提前边界交接；本测试无视觉观测，不会被自由目标中断。
+    mission._follow_route(rescue.MissionState.ROUTE_1)
+    if not mission._at_waypoint(mission._position(), mission.route_1[-1]):
+        raise RuntimeError("route 1 safe handoff was not confirmed")
 
     mission.state = rescue.MissionState.CENTER
     # 复用主任务的中心点云规划与动态重规划，但不查询黄色目标。

@@ -6,6 +6,7 @@
 """
 
 import sys
+from types import SimpleNamespace
 from typing import Callable, Tuple
 
 import rescue_drop_2026 as rescue
@@ -35,6 +36,30 @@ class ClearAreaPlanner:
     def safe_velocity(self, current: Point, velocity: Point) -> Point:
         return velocity
 
+    def plan_route_window(self, current: Point, candidates):
+        waypoints = tuple(candidates[:3])
+        if not waypoints:
+            return None
+        return SimpleNamespace(waypoints=waypoints,
+                               anchors=tuple(enumerate(waypoints)),
+                               skipped_offsets=(), revision=0)
+
+    def path_is_free(self, points) -> bool:
+        return bool(points)
+
+    def mandatory_drop_pose_is_clear(self, pose: Point) -> bool:
+        return True
+
+
+class ClearAreaObstacleInterface(rescue.ObstacleInterface):
+    """仅限已确认全航段无障碍时，报告没有膨胀区。"""
+
+    def point_is_inflated(self, point: Point) -> bool:
+        return False
+
+    def boundary_crossing(self, start: Point, end: Point, entering: bool) -> Point:
+        return end if entering else start
+
 
 def main() -> int:
     # 独立进程中的任务配置；不改动通用主入口文件的默认参数。
@@ -43,6 +68,7 @@ def main() -> int:
     rescue.RIGHT_SPAN_Y_CM = RIGHT_SPAN_Y_CM
     rescue.LEFT_SPAN_Y_CM = LEFT_SPAN_Y_CM
     rescue.ObstaclePlanner2D = ClearAreaPlanner
+    rescue.ObstacleInterface = ClearAreaObstacleInterface
     return rescue.main()
 
 

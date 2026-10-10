@@ -13,6 +13,7 @@ import math
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -39,6 +40,8 @@ MANDATORY_TARGET_GROUND_HEIGHT_CM = 30.0
 FC_SERVER_HOST = "127.0.0.1"
 FC_SERVER_PORT = 5654
 CRUISE_SPEED = 30.0
+INFLATION_ESCAPE_SPEED_CM_S = 5.0
+INFLATION_ESCAPE_TIMEOUT_S = 20.0  # 60 cm 短退出段以 5 cm/s 飞行，留有制动余量。
 # 以下三个高度均为 FAST-LIO startup-local Z 定高目标（cm），不是激光 AGL。
 CRUISE_HEIGHT = 100.0
 VERTICAL_SPEED = 22.0
@@ -495,6 +498,125 @@ class ObstacleInterface:
     def mandatory_drop_pose_is_clear(self, pose: Point) -> bool:
         return self.planner.mandatory_drop_pose_is_clear(pose)
 
+    def _inflated_snapshot(self):
+        # 仅在任务层读取现有规划器的带新鲜度检查快照，不改变其膨胀或 A* 规则。
+        return self.planner._fresh_inflated_snapshot()[0]
+
+    def _blocked_at(self, blocked, point: Point) -> bool:
+        cell = self.planner._cm_to_cell(point)
+        return cell is None or bool(blocked[cell[1], cell[0]])
+
+    def point_is_inflated(self, point: Point) -> bool:
+        return self._blocked_at(self._inflated_snapshot(), point)
+
+    def boundary_crossing(self, start: Point, end: Point,
+                          entering: bool) -> Optional[Point]:
+        """沿直线找膨胀区交界；进入时取最后自由点，退出时取首个自由点。"""
+        blocked = self._inflated_snapshot()
+        distance = math.hypot(end[0] - start[0], end[1] - start[1])
+        steps = max(1, int(math.ceil(distance / 5.0)))
+        previous = start
+        if entering and self._blocked_at(blocked, start):
+            return None
+        if not entering and not self._blocked_at(blocked, start):
+            return start
+        for index in range(1, steps + 1):
+            fraction = index / steps
+            point = (start[0] + fraction * (end[0] - start[0]),
+                     start[1] + fraction * (end[1] - start[1]))
+            is_blocked = self._blocked_at(blocked, point)
+            if entering and is_blocked:
+                return previous
+            if not entering and not is_blocked:
+                return point
+            previous = point
+        return end if entering else None
+
+    def _boundary_cells(self, blocked):
+        height, width = blocked.shape
+        for y in range(1, height - 1):
+            for x in range(1, width - 1):
+                if (not blocked[y, x]
+                        and (blocked[y - 1, x] or blocked[y + 1, x]
+                             or blocked[y, x - 1] or blocked[y, x + 1])):
+                    yield (x, y)
+
+    def escape_segment_is_clear(self, start: Point, goal: Point) -> bool:
+        """短退出段逐 2 cm 检查原始障碍 43 cm 净空；膨胀区内不用 A*。"""
+        distance = math.hypot(goal[0] - start[0], goal[1] - start[1])
+        steps = max(1, int(math.ceil(distance / 2.0)))
+        for index in range(steps + 1):
+            fraction = index / steps
+            point = (start[0] + fraction * (goal[0] - start[0]),
+                     start[1] + fraction * (goal[1] - start[1]))
+            if not self.mandatory_drop_pose_is_clear(point):
+                return False
+        return True
+
+    def nearest_escape_boundary(self, current: Point) -> Optional[Point]:
+        blocked = self._inflated_snapshot()
+        if not self._blocked_at(blocked, current):
+            return current
+        candidates = sorted(
+            (math.hypot(point[0] - current[0], point[1] - current[1]), point)
+            for cell in self._boundary_cells(blocked)
+            for point in (self.planner._cell_to_cm(cell),))
+        for distance, point in candidates:
+            if distance > 60.0:
+                break
+            if self.escape_segment_is_clear(current, point):
+                return point
+        return None
+
+    def nearest_reachable_boundary(self, current: Point,
+                                   target: Point) -> Optional[Point]:
+        """仅从目标所在膨胀连通区的可达边界选最近且净空合格的机位。"""
+        blocked = self._inflated_snapshot()
+        start = self.planner._cm_to_cell(current)
+        target_cell = self.planner._cm_to_cell(target)
+        if (start is None or blocked[start[1], start[0]]
+                or target_cell is None or not blocked[target_cell[1], target_cell[0]]):
+            return None
+        height, width = blocked.shape
+        neighbors = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        component_queue = deque([target_cell])
+        component = {target_cell}
+        target_boundary = set()
+        while component_queue:
+            x, y = component_queue.popleft()
+            for dx, dy in neighbors:
+                nx, ny = x + dx, y + dy
+                cell = (nx, ny)
+                if not (0 <= nx < width and 0 <= ny < height):
+                    continue
+                if not blocked[ny, nx]:
+                    target_boundary.add(cell)
+                elif cell not in component:
+                    component.add(cell)
+                    component_queue.append(cell)
+        queue = deque([start])
+        visited = {start}
+        candidates = []
+        while queue:
+            x, y = queue.popleft()
+            if (x, y) in target_boundary:
+                point = self.planner._cell_to_cm((x, y))
+                candidates.append((math.hypot(point[0] - target[0],
+                                              point[1] - target[1]), point))
+            for dx, dy in neighbors:
+                nx, ny = x + dx, y + dy
+                cell = (nx, ny)
+                if (0 <= nx < width and 0 <= ny < height
+                        and cell not in visited and not blocked[ny, nx]):
+                    visited.add(cell)
+                    queue.append(cell)
+        for _, point in sorted(candidates):
+            if (self.mandatory_drop_pose_is_clear(point)
+                    and not self.point_is_inflated(point)
+                    and self.planner.plan_path(current, point) is not None):
+                return point
+        return None
+
 
 def validate_allocation(red: int, blue: int, green: int) -> Dict[str, int]:
     counts = {"red": red, "blue": blue, "green": green}
@@ -666,6 +788,8 @@ class Mission:
         self.vision_diagnostics = vision_diagnostics
         self._vision_diag_recent = []
         self.route_1, self.route_3, self.route_2 = build_routes()
+        self._nominal_center_start = self.route_3[0]
+        self._nominal_center_exit = self.route_3[-1]
         self.route_index = {MissionState.ROUTE_1: 1,
                             MissionState.CENTER: 1,
                             MissionState.ROUTE_2: 1}
@@ -892,12 +1016,94 @@ class Mission:
         route = {MissionState.ROUTE_1: self.route_1,
                  MissionState.ROUTE_2: self.route_2}[state]
         while self.route_index[state] < len(route):
+            self._check()
+            goal = route[self.route_index[state]]
+            protected = (state is MissionState.ROUTE_2
+                         and self.route_index[state] == 1
+                         and not self._same_point(self.route_2[0],
+                                                  self._nominal_center_exit))
+            # 航迹 1 的最后一段是右侧拐点 -> 名义航迹 3 起点；仅交接点可前移。
+            if state is MissionState.ROUTE_1 and self.route_index[state] == len(route) - 1:
+                if self.obstacle is None:
+                    raise RuntimeError("obstacle interface missing at route-3 entry")
+                self._escape_center_start()
+                handoff = self.obstacle.boundary_crossing(
+                    self._position(), self._nominal_center_start, entering=True)
+                if handoff is None:
+                    raise RuntimeError("no safe route-3 entry boundary")
+                route[-1] = handoff
+                goal = handoff
+                protected = not self._same_point(handoff, self._nominal_center_start)
+                if protected:
+                    logger.warning("[CENTER] Route-1 ends at inflation boundary {} "
+                                   "instead of blocked route-3 start {}",
+                                   handoff, self._nominal_center_start)
             observation = self._navigate_leg(
-                route[self.route_index[state]], detection="free")
+                goal, detection="free", protected=protected)
             if observation is not None:
                 return observation
             self.route_index[state] += 1
         return None
+
+    def _escape_center_start(self) -> None:
+        """已在膨胀区时，只允许沿逐点通过 43 cm 净空检查的短线低速退出。"""
+        if self.obstacle is None or not self.obstacle.point_is_inflated(self._position()):
+            return
+        start = self._position()
+        exit_point = self.obstacle.nearest_escape_boundary(start)
+        if exit_point is None:
+            raise RuntimeError("no 43cm-clear short exit from inflated route-3 start")
+        logger.warning("[CENTER] Start {} inflated; low-speed escape to {}",
+                       start, exit_point)
+        escape_deadline = time.monotonic() + INFLATION_ESCAPE_TIMEOUT_S
+        try:
+            while self.obstacle.point_is_inflated(self._position()):
+                self._check()
+                if time.monotonic() >= escape_deadline:
+                    raise RuntimeError("route-3 inflation escape timed out")
+                current = self._position()
+                if (math.hypot(current[0] - start[0], current[1] - start[1]) > 75.0
+                        or segment_distance_to_point(start, exit_point, current) > 15.0):
+                    raise RuntimeError("route-3 inflation escape drifted off short exit")
+                if not self.obstacle.escape_segment_is_clear(current, exit_point):
+                    raise RuntimeError("route-3 inflation escape lost 43cm clearance")
+                dx, dy = exit_point[0] - current[0], exit_point[1] - current[1]
+                distance = math.hypot(dx, dy)
+                if distance < 2.0:
+                    raise RuntimeError("route-3 exit point remained inflated")
+                body_x, body_y = world_to_body_velocity(
+                    INFLATION_ESCAPE_SPEED_CM_S * dx / distance,
+                    INFLATION_ESCAPE_SPEED_CM_S * dy / distance,
+                    float(self.navi.current_yaw))
+                self._move_translation_only(
+                    INFLATION_ESCAPE_SPEED_CM_S,
+                    math.degrees(math.atan2(body_y, body_x)))
+                self.stop_event.wait(VISUAL_PERIOD)
+        finally:
+            self._move_translation_only(0.0, 0.0)
+        self.navi.set_yaw(float(self.navi.current_yaw))
+        self.navi.stop_move()
+        logger.info("[CENTER] Escaped inflation at {}", self._position())
+
+    def _refresh_center_exit(self) -> None:
+        if self.obstacle is None:
+            raise RuntimeError("obstacle interface missing at route-3 exit")
+        nominal = self._nominal_center_exit
+        if not self.obstacle.point_is_inflated(nominal):
+            if not self._same_point(self.route_3[-1], nominal):
+                logger.info("[CENTER] Nominal route-3 exit {} clear again", nominal)
+                self.route_3[-1] = nominal
+                self.route_2[0] = nominal
+            return
+        boundary = self.obstacle.boundary_crossing(
+            nominal, self.route_2[1], entering=False)
+        if boundary is None or self.obstacle.point_is_inflated(boundary):
+            raise RuntimeError("no free route-3 exit on following route-2 segment")
+        if not self._same_point(self.route_3[-1], boundary):
+            logger.warning("[CENTER] Route-3 exit {} inflated; move endpoint "
+                           "and route-2 start to {}", nominal, boundary)
+        self.route_3[-1] = boundary
+        self.route_2[0] = boundary
 
     def _start_center_path_with_fallback(self, waypoints: Sequence[Point]) -> threading.Thread:
         if self.obstacle is None:
@@ -979,6 +1185,8 @@ class Mission:
             raise RuntimeError("obstacle interface missing")
         while self.route_index[MissionState.CENTER] < len(self.route_3):
             self._check()
+            self._escape_center_start()
+            self._refresh_center_exit()
             base_index = self.route_index[MissionState.CENTER]
             if self._at_waypoint(self._position(), self.route_3[base_index]):
                 if detect_mandatory:
@@ -1049,6 +1257,8 @@ class Mission:
         return self._execute_center_route(detect_mandatory=True)
 
     def _navigate_center_exit(self) -> None:
+        self._escape_center_start()
+        self._refresh_center_exit()
         goal = self.route_2[0]
         logger.info("[MANDATORY] Exit toward route-2 start: current={} goal={}",
                     self._position(), goal)
@@ -1191,6 +1401,13 @@ class Mission:
                                                     jump_reason, (0, 0), jump_previous)
                     else:
                         error = (observation.offset_x_px, observation.offset_y_px)
+                        if protected and self.obstacle.point_is_inflated(
+                                self._estimate_target_world_xy(observation)):
+                            self._move_translation_only(0.0, 0.0)
+                            logger.warning("[APPROACH] Yellow target {} entered "
+                                           "inflation; switch to boundary drop",
+                                           target.target_id)
+                            return observation
                         frame_gap = (observation.captured_at - previous_at
                                      if previous_at >= 0 else None)
                         if (previous_error is not None and frame_gap is not None
@@ -1572,6 +1789,9 @@ class Mission:
         target = self.target
         if target is None or target.color != MANDATORY_COLOR:
             raise RuntimeError("mandatory target missing")
+        boundary_result = self._mandatory_boundary_if_needed(target)
+        if boundary_result is not None:
+            return boundary_result
         approach_observation = self._approach_target(target, protected=True)
         if approach_observation is None:
             self.navi.stop_move()
@@ -1582,6 +1802,13 @@ class Mission:
             raise RuntimeError("obstacle interface missing")
         drop_number = self.ledger.next_drop_number
         target_world = self._estimate_target_world_xy(approach_observation)
+        if self.obstacle.point_is_inflated(target_world):
+            boundary_result = self._mandatory_boundary_if_needed(target)
+            if boundary_result is not None:
+                return boundary_result
+            self.navi.stop_move()
+            self._resume_center_route()
+            return False
         desired_pose = self._desired_aircraft_drop_pose(target_world, drop_number)
         if not self.obstacle.mandatory_drop_pose_is_clear(desired_pose):
             logger.warning("[MANDATORY] 43cm drop-pose clearance rejected: "
@@ -1599,6 +1826,65 @@ class Mission:
             target, protected=True, drop_number=drop_number,
             target_world=target_world)
         self._drop(MANDATORY_COLOR, self.target.target_id, calibrated)
+        self._set_height(CRUISE_HEIGHT, translation_only=True)
+        self._navigate_center_exit()
+        return True
+
+    def _mandatory_boundary_if_needed(self,
+                                      target: TargetObservation) -> Optional[bool]:
+        """黄色目标位于膨胀区内时，改到最近可达安全边界投放。"""
+        self._check()
+        if self.obstacle is None:
+            raise RuntimeError("obstacle interface missing")
+        self._escape_center_start()
+        observation = self._observation(target_id=target.target_id)
+        if observation is None:
+            return None  # 视觉接近流程负责等待重新看到目标。
+        target_world = self._estimate_target_world_xy(observation)
+        if not self.obstacle.point_is_inflated(target_world):
+            return None
+        boundary = self.obstacle.nearest_reachable_boundary(
+            self._position(), target_world)
+        if boundary is None:
+            logger.warning("[MANDATORY] Inflated yellow target {} has no reachable "
+                           "43cm-clear boundary near world={}",
+                           target.target_id, target_world)
+            self.navi.stop_move()
+            self._mark_mandatory_pose_rejected(target.target_id)
+            self._resume_center_route()
+            return False
+        logger.warning("[MANDATORY] Target {} world={} inflated; "
+                       "boundary drop position={}",
+                       target.target_id, target_world, boundary)
+        self._navigate_leg(boundary, protected=True)
+        self._check()
+        if self.obstacle.point_is_inflated(self._position()):
+            self._escape_center_start()
+        if (self.obstacle.point_is_inflated(self._position())
+                or not self.obstacle.mandatory_drop_pose_is_clear(self._position())):
+            raise RuntimeError("mandatory boundary drop pose became unsafe")
+        self.navi.set_yaw(float(self.navi.current_yaw))
+        self.navi.stop_move()
+        self._set_height(MANDATORY_DROP_HEIGHT, preserve_horizontal_hold=True)
+        while self.ledger.has_quota(MANDATORY_COLOR):
+            self._check()
+            if (self.obstacle.point_is_inflated(self._position())
+                    or not self.obstacle.mandatory_drop_pose_is_clear(self._position())):
+                raise RuntimeError("mandatory boundary drop pose lost clearance")
+            number = self.ledger.next_drop_number
+            payload_body = payload_offset_body_cm(number)
+            payload_world = body_to_world_velocity(
+                *payload_body, float(self.navi.current_yaw))
+            aircraft = self._position()
+            predicted_landing = (aircraft[0] + payload_world[0],
+                                 aircraft[1] + payload_world[1])
+            miss_cm = math.hypot(predicted_landing[0] - target_world[0],
+                                 predicted_landing[1] - target_world[1])
+            logger.warning("[MANDATORY] Boundary drop {} target={} aircraft={} "
+                           "predicted_cargo={} estimated_miss={:.1f}cm "
+                           "without 20px alignment", number, target_world,
+                           aircraft, predicted_landing, miss_cm)
+            self._drop(MANDATORY_COLOR, target.target_id, calibrated=False)
         self._set_height(CRUISE_HEIGHT, translation_only=True)
         self._navigate_center_exit()
         return True
