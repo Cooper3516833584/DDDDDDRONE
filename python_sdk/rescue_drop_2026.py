@@ -55,15 +55,13 @@ MONITOR_INTERVAL = 1.0
 # 视觉初值沿用 former_code/2026_disaster_survey.py；超时和丢失等待由用户指定。
 VISUAL_CENTER_THRESHOLD_PX = 30.0  # 巡航接近结束、开始下降的像素距离
 LOW_CALIBRATION_THRESHOLD_PX = 20.0  # 下降后的悬挂点校准误差
-VISUAL_APPROACH_SPEED = 12.0  # cm/s；仅作为远距离速度上限
-VISUAL_APPROACH_MIN_SPEED = 2.0  # cm/s；接近阈值时减速
-VISUAL_APPROACH_SPEED_PER_PX = 0.07  # cm/s/px；按预测像素误差调速
+VISUAL_APPROACH_SPEED = 10.0  # cm/s；巡航视觉接近的固定非零速度
 VISUAL_APPROACH_LOOKAHEAD_S = 0.40  # 约一帧的预测提前量
 VISUAL_APPROACH_CENTER_FRAMES = 3  # 连续三帧实际偏差达标才下降
 VISUAL_APPROACH_SETTLE_MAX_GAP_S = 0.65
 VISUAL_APPROACH_LOG_PERIOD_S = 1.0
 VISUAL_PERIOD = 0.1
-VISUAL_MAX_AGE = 0.5
+VISUAL_MAX_AGE = 0.65  # 暂按约 0.4s 新帧间隔推定；待观测年龄实测后复核
 VISUAL_NEAR_CENTER_RADIUS_PX = 100.0
 VISUAL_JUMP_THRESHOLD_PX = 45.0
 VISUAL_JUMP_CONFIRM_MAX_GAP_S = 0.65
@@ -116,7 +114,7 @@ Point = Tuple[float, float]
 
 
 def visual_approach_command(error: Point, pixel_velocity: Point) -> Tuple[float, Point]:
-    """巡航接近按像素误差减速；预测进入居中范围时提前发零速。"""
+    """巡航接近固定速度；预测进入居中范围时提前发零速。"""
     predicted = (error[0] + pixel_velocity[0] * VISUAL_APPROACH_LOOKAHEAD_S,
                  error[1] + pixel_velocity[1] * VISUAL_APPROACH_LOOKAHEAD_S)
     distance = math.hypot(*error)
@@ -125,11 +123,7 @@ def visual_approach_command(error: Point, pixel_velocity: Point) -> Tuple[float,
             or predicted_distance <= VISUAL_CENTER_THRESHOLD_PX
             or error[0] * predicted[0] + error[1] * predicted[1] <= 0):
         return 0.0, predicted
-    speed = min(VISUAL_APPROACH_SPEED,
-                max(VISUAL_APPROACH_MIN_SPEED,
-                    VISUAL_APPROACH_SPEED_PER_PX
-                    * (predicted_distance - VISUAL_CENTER_THRESHOLD_PX)))
-    return speed, predicted
+    return VISUAL_APPROACH_SPEED, predicted
 
 
 def low_calibration_command(error: Point, pixel_velocity: Point) -> Tuple[float, Point]:
@@ -777,7 +771,7 @@ class Mission:
     def __init__(self, fc: FC_Like, navi: Navigation,
                  relay: Optional[LCUSRelay], vision: Optional[VisionInterface],
                  obstacle: Optional[ObstacleInterface], allocation: Dict[str, int],
-                 stop_event: threading.Event, vision_diagnostics: bool = False):
+                 stop_event: threading.Event, vision_diagnostics: bool = True):
         self.fc = fc
         self.navi = navi
         self.relay = relay
@@ -867,6 +861,17 @@ class Mission:
                                 or not 0 <= now - observation.captured_at <= VISUAL_MAX_AGE):
                             continue
                         self._latest[observation.target_id] = observation
+                if self.vision_diagnostics and observations:
+                    observation = observations[0]
+                    age_ms = (now - observation.captured_at) * 1000.0
+                    logger.debug("[VISION-AGE] frame={} targets={} "
+                                 "capture_to_publish_ms={:.1f} inference_ms={:.1f} "
+                                 "fresh={} limit_ms={:.0f}",
+                                 getattr(observation, "frame_seq", 0),
+                                 len(observations), age_ms,
+                                 getattr(observation, "inference_ms", 0.0),
+                                 0 <= age_ms <= VISUAL_MAX_AGE * 1000.0,
+                                 VISUAL_MAX_AGE * 1000.0)
                 self._vision_stop.wait(VISUAL_PERIOD)
         except Exception as exc:
             self._vision_error = exc
@@ -911,8 +916,10 @@ class Mission:
                           if key == previous_key), None)
             if prior is None:
                 prior = (fields(previous), None, None, None, "not-recorded")
-        logger.debug("[VISION-DIAG] stage={} current={} previous={}",
-                     stage, current, prior)
+        logger.debug("[VISION-DIAG] stage={} current={} previous={} "
+                     "capture_to_command_ms={:.1f}",
+                     stage, current, prior,
+                     (time.monotonic() - observation.captured_at) * 1000.0)
         key = (stage, observation.target_id,
                getattr(observation, "frame_seq", 0), observation.captured_at)
         self._vision_diag_recent.append((key, current))
@@ -1376,7 +1383,10 @@ class Mission:
                     previous_error = None
                 if now - last_log_at >= VISUAL_APPROACH_LOG_PERIOD_S:
                     logger.info("[APPROACH] target={} no fresh observation; zero horizontal "
-                                "velocity; pose={}", target.target_id, self._position())
+                                "velocity; last_frame_age_ms={} pose={}",
+                                target.target_id,
+                                None if previous_at < 0 else round((now - previous_at) * 1000.0, 1),
+                                self._position())
                     last_log_at = now
                 if now - lost_at >= TARGET_LOSS_WAIT:
                     logger.warning("[RESCUE] Target {} lost for 2 seconds", target.target_id)
@@ -1465,9 +1475,11 @@ class Mission:
                         if now - last_log_at >= VISUAL_APPROACH_LOG_PERIOD_S:
                             logger.info("[APPROACH] target={} frame={} offset=({:.1f},{:.1f})px "
                                         "predicted=({:.1f},{:.1f})px requested_speed={:.1f}cm/s "
-                                        "command_body={}cm/s action={} pose={} yaw={:.1f}deg",
+                                        "capture_to_command_ms={:.1f} command_body={}cm/s "
+                                        "action={} pose={} yaw={:.1f}deg",
                                         target.target_id, previous_seq, *error, *predicted,
-                                        speed, command, action, self._position(),
+                                        speed, (time.monotonic() - observation.captured_at) * 1000.0,
+                                        command, action, self._position(),
                                         self.navi.current_yaw)
                             last_log_at = now
                         if getattr(self, "vision_diagnostics", False):
@@ -1721,12 +1733,14 @@ class Mission:
                 if now - last_log_at >= LOW_CALIBRATION_LOG_PERIOD_S:
                     logger.info("[ALIGN] target={} drop={} frame={} offset=({:.1f},{:.1f})px "
                                 "error=({:.1f},{:.1f})px frame_gap={}s "
+                                "capture_to_command_ms={:.1f} "
                                 "rate=({:.1f},{:.1f})px/s "
                                 "predicted=({:.1f},{:.1f})px speed={:.1f}cm/s "
                                 "command_body={}cm/s action={} pose={} yaw={:.1f}deg",
                                 target.target_id, drop_number, previous_seq,
                                 observation.offset_x_px, observation.offset_y_px,
                                 *error, None if frame_gap is None else round(frame_gap, 3),
+                                (time.monotonic() - observation.captured_at) * 1000.0,
                                 *pixel_velocity, *predicted_error, speed,
                                 command, action, self._position(), self.navi.current_yaw)
                     last_log_at = now
@@ -2037,8 +2051,11 @@ def parse_args() -> argparse.Namespace:
                         help="旧版直连串口参数；FC_Server 运行时不得使用")
     parser.add_argument("--relay-port", default=None,
                         help="LCUS 继电器串口；也可用 D_TASK_RELAY_PORT 环境变量")
-    parser.add_argument("--vision-diagnostics", action="store_true",
-                        help="记录每次新视觉观测、指令和跳变相邻帧；默认关闭")
+    parser.add_argument("--vision-diagnostics", dest="vision_diagnostics",
+                        action="store_true", default=True,
+                        help="记录每次目标观测年龄、指令和跳变相邻帧；默认开启")
+    parser.add_argument("--no-vision-diagnostics", dest="vision_diagnostics",
+                        action="store_false", help="关闭逐帧视觉诊断日志")
     parser.add_argument("--red-count", type=int)
     parser.add_argument("--blue-count", type=int)
     parser.add_argument("--green-count", type=int)
@@ -2130,7 +2147,7 @@ def main() -> int:
                           obstacle_planner=obstacle_planner,
                           height_source="lio")
         mission = Mission(fc, navi, None, vision, obstacle, allocation, stop_event,
-                          vision_diagnostics=getattr(args, "vision_diagnostics", False))
+                          vision_diagnostics=getattr(args, "vision_diagnostics", True))
         mission.prepare_navigation()
 
         if not args.confirm_flight:

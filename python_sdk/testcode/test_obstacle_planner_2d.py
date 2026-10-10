@@ -9,6 +9,7 @@ import importlib.util
 import math
 from pathlib import Path
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -440,7 +441,7 @@ class MissionVelocityTests(unittest.TestCase):
                     and n.name == "_VisualJumpGuard"]
         future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
         tree = ast.fix_missing_locations(ast.Module(body=[future] + helpers, type_ignores=[]))
-        self.namespace = {"math": math, "VISUAL_APPROACH_SPEED": 15.0,
+        self.namespace = {"math": math, "VISUAL_APPROACH_SPEED": 10.0,
                           "VISUAL_NEAR_CENTER_RADIUS_PX": 100.0,
                           "VISUAL_JUMP_THRESHOLD_PX": 45.0,
                           "VISUAL_JUMP_CONFIRM_MAX_GAP_S": 0.65,
@@ -467,13 +468,13 @@ class MissionVelocityTests(unittest.TestCase):
 
     def test_protected_move_passes_world_to_planner_and_body_to_navigation(self):
         mission = self.mission
-        mission.obstacle.safe_velocity.return_value = (15, 0)
+        mission.obstacle.safe_velocity.return_value = (10, 0)
         mission._move_toward(self.observation, protected=True)
         position, velocity = mission.obstacle.safe_velocity.call_args.args
         self.assertEqual(position, (30, 40))
-        np.testing.assert_allclose(velocity, (0, -15), atol=1e-12)
+        np.testing.assert_allclose(velocity, (0, -10), atol=1e-12)
         mission.navi.update_realtime_control.assert_called_once_with(
-            vel_x=0, vel_y=15, yaw=0)
+            vel_x=0, vel_y=10, yaw=0)
         self.assertFalse(mission.navi.navigation_flag)
         mission.navi.move_by_direction.assert_not_called()
         mission.navi.stop_move.assert_not_called()
@@ -481,7 +482,7 @@ class MissionVelocityTests(unittest.TestCase):
     def test_unprotected_move_keeps_body_direction(self):
         self.mission._move_toward(self.observation, protected=False)
         self.mission.obstacle.safe_velocity.assert_not_called()
-        self.mission.navi.move_by_direction.assert_called_once_with(speed=15.0, direction_deg=0.0)
+        self.mission.navi.move_by_direction.assert_called_once_with(speed=10.0, direction_deg=0.0)
 
     def test_protected_zero_velocity_clears_yaw_and_invalid_results_raise(self):
         self.mission.obstacle.safe_velocity.return_value = (0, 0)
@@ -649,10 +650,10 @@ class VisualApproachTests(unittest.TestCase):
         source = SDK / "rescue_drop_2026.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         names = {"VISUAL_CENTER_THRESHOLD_PX", "VISUAL_APPROACH_SPEED",
-                 "VISUAL_APPROACH_MIN_SPEED", "VISUAL_APPROACH_SPEED_PER_PX",
                  "VISUAL_APPROACH_LOOKAHEAD_S", "VISUAL_APPROACH_CENTER_FRAMES",
                  "VISUAL_APPROACH_SETTLE_MAX_GAP_S", "VISUAL_APPROACH_LOG_PERIOD_S",
-                 "VISUAL_PERIOD", "TARGET_LOSS_WAIT", "VISUAL_NEAR_CENTER_RADIUS_PX",
+                 "VISUAL_PERIOD", "VISUAL_MAX_AGE", "TARGET_LOSS_WAIT",
+                 "VISUAL_NEAR_CENTER_RADIUS_PX",
                  "VISUAL_JUMP_THRESHOLD_PX", "VISUAL_JUMP_CONFIRM_MAX_GAP_S",
                  "LOW_CALIBRATION_MAX_PIXEL_SPEED"}
         selected = [n for n in tree.body if isinstance(n, ast.Assign)
@@ -667,11 +668,24 @@ class VisualApproachTests(unittest.TestCase):
         self.namespace = {"math": math, "logger": Mock()}
         exec(compile(module, str(source), "exec"), self.namespace)
 
-    def test_approach_slows_near_center_and_brakes_ahead(self):
+    def test_approach_keeps_fixed_speed_and_brakes_ahead(self):
         command = self.namespace["visual_approach_command"]
-        self.assertEqual(command((300.0, 0.0), (0.0, 0.0))[0], 12.0)
-        self.assertEqual(command((50.0, 0.0), (0.0, 0.0))[0], 2.0)
+        self.assertEqual(command((300.0, 0.0), (0.0, 0.0))[0], 10.0)
+        self.assertEqual(command((50.0, 0.0), (0.0, 0.0))[0], 10.0)
         self.assertEqual(command((50.0, 0.0), (-80.0, 0.0))[0], 0.0)
+
+    def test_observation_expires_after_inferred_freshness_limit(self):
+        clock = SimpleNamespace(now=1.64)
+        self.namespace["time"] = SimpleNamespace(monotonic=lambda: clock.now)
+        cls = load_class("rescue_drop_2026.py", "Mission",
+                         names={"_observation"}, namespace=self.namespace)
+        mission = cls()
+        mission._vision_lock = threading.Lock()
+        observed = SimpleNamespace(target_id="red-1", color="red", captured_at=1.0)
+        mission._latest = {observed.target_id: observed}
+        self.assertIs(mission._observation(target_id="red-1"), observed)
+        clock.now = 1.66
+        self.assertIsNone(mission._observation(target_id="red-1"))
 
     def test_single_frame_center_jump_requires_next_frame_confirmation(self):
         guard = self.namespace["_VisualJumpGuard"]()
@@ -793,6 +807,7 @@ class VisualApproachTests(unittest.TestCase):
         mission.navi.stop_move.assert_not_called()
 
     def test_jump_diagnostics_include_previous_pose_and_command(self):
+        self.namespace["time"] = SimpleNamespace(monotonic=lambda: 0.75)
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_vision_diagnostic"}, namespace=self.namespace)
         mission = cls()
@@ -812,6 +827,7 @@ class VisualApproachTests(unittest.TestCase):
         prior = self.namespace["logger"].debug.call_args.args[3]
         self.assertEqual(prior[1], (1.0, 2.0))
         self.assertEqual(prior[3:], ((5, 0), "move"))
+        self.assertEqual(self.namespace["logger"].debug.call_args.args[4], 250.0)
 
 
 class CenterMissionOfflineTests(unittest.TestCase):

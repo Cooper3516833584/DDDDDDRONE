@@ -426,12 +426,12 @@ def test_visual_approach_speed_is_independent_from_cruise(mission, protected):
     mission._move_toward(observation, protected=protected)
     if protected:
         mission.navi.update_realtime_control.assert_called_once_with(
-            vel_x=15, vel_y=0, yaw=0)
+            vel_x=10, vel_y=0, yaw=0)
         mission.navi.move_by_direction.assert_not_called()
     else:
         mission.navi.move_by_direction.assert_called_once_with(
             speed=namespace["VISUAL_APPROACH_SPEED"], direction_deg=0.0)
-    assert namespace["VISUAL_APPROACH_SPEED"] == 15.0
+    assert namespace["VISUAL_APPROACH_SPEED"] == 10.0
     mission.navi.navigation_to_waypoint_direct.assert_not_called()
 
 
