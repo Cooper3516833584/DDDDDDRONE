@@ -1340,7 +1340,7 @@ class WiringTests(unittest.TestCase):
                 relay.detect_channel_count.return_value = 8
                 relay.query_status.return_value = dict.fromkeys(range(1, 9), False)
                 planner = Mock()
-                namespace = {"parse_args": lambda: SimpleNamespace(confirm_flight=flight,
+                namespace = {"parse_args": lambda: SimpleNamespace(confirm_flight=flight, car_control=False,
                              red_count=2, blue_count=1, green_count=1,
                              fc_host="127.0.0.1", fc_server_port=5654, relay_port="fake"),
                              "threading": module.threading, "FREE_COLORS": ("red", "blue", "green"),
