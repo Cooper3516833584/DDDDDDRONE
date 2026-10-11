@@ -21,66 +21,7 @@ def validate_test_allocation(red: int, blue: int, green: int):
 
 
 class TwoYellowMission(rescue.Mission):
-    def _mandatory_drop(self) -> bool:
-        target = self.target
-        if target is None or target.color != rescue.MANDATORY_COLOR:
-            raise RuntimeError("mandatory target missing")
-        boundary_result = self._mandatory_boundary_if_needed(target)
-        if boundary_result is not None:
-            return boundary_result
-        approach_observation = self._approach_target(target, protected=True)
-        if approach_observation is None:
-            self.navi.stop_move()
-            self._resume_center_route()
-            return False
-        self._check()
-        if self.obstacle is None:
-            raise RuntimeError("obstacle interface missing")
-        if not self.ledger.has_quota(rescue.MANDATORY_COLOR):
-            raise RuntimeError("mandatory quota exhausted")
-
-        target_world = self._estimate_target_world_xy(approach_observation)
-        if self.obstacle.point_is_inflated(target_world):
-            boundary_result = self._mandatory_boundary_if_needed(target)
-            if boundary_result is not None:
-                return boundary_result
-            self.navi.stop_move()
-            self._resume_center_route()
-            return False
-        next_drop = self.ledger.next_drop_number
-        last_drop = next_drop + self.ledger.mandatory_remaining - 1
-        if last_drop > rescue.TOTAL_DROP_COUNT:
-            raise RuntimeError("planned relay channels exhausted")
-        # 两件都将移到各自的悬挂点上方；下降前分别确认目标姿态净空。
-        for drop_number in range(next_drop, last_drop + 1):
-            desired_pose = self._desired_aircraft_drop_pose(target_world, drop_number)
-            if not self.obstacle.mandatory_drop_pose_is_clear(desired_pose):
-                rescue.logger.warning(
-                    "[MANDATORY] 43cm drop-pose clearance rejected: "
-                    "target={} drop={} target_world={} pose={}",
-                    target.target_id, drop_number, target_world, desired_pose)
-                self.navi.stop_move()
-                self._mark_mandatory_pose_rejected(target.target_id)
-                self._resume_center_route()
-                return False
-            rescue.logger.info(
-                "[MANDATORY] 43cm drop-pose clearance accepted: "
-                "target={} drop={} target_world={} pose={}",
-                target.target_id, drop_number, target_world, desired_pose)
-
-        self._set_height(rescue.MANDATORY_DROP_HEIGHT,
-                         preserve_horizontal_hold=True)
-        while self.ledger.has_quota(rescue.MANDATORY_COLOR):
-            self._check()
-            drop_number = self.ledger.next_drop_number
-            calibrated = self._calibrate_low(
-                target, protected=True, drop_number=drop_number,
-                target_world=target_world)
-            target = self.target
-            self._drop(rescue.MANDATORY_COLOR, target.target_id, calibrated)
-        self._set_height(rescue.CRUISE_HEIGHT, translation_only=True)
-        self._navigate_center_exit()
-        return True
+    """沿用主任务的双件偏置中点和低空连续投放流程。"""
 
 
 def main() -> int:

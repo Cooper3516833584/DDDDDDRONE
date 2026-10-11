@@ -67,7 +67,9 @@ VISUAL_JUMP_THRESHOLD_PX = 45.0
 VISUAL_JUMP_CONFIRM_MAX_GAP_S = 0.65
 VISION_WARMUP_S = 6.0
 TARGET_LOSS_WAIT = 2.0
-LOW_CALIBRATION_TIMEOUT = 9.0  # 原 6 秒的 1.5 倍
+LOW_CALIBRATION_TIMEOUT = 9.0  # 旧低空视觉校准保留作离线对照，飞行任务不再调用
+DROP_POSITION_TIMEOUT_S = 9.0
+DROP_POSITION_TOLERANCE_CM = 5.0  # 低空投放前相对巡航定点目标的水平距离
 LOW_CALIBRATION_MIN_SPEED = 2.0  # cm/s；小误差时降低单帧位移
 LOW_CALIBRATION_MAX_SPEED = 8.0  # cm/s；按现场约 0.4s 帧间隔限制位移
 LOW_CALIBRATION_SPEED_PER_PX = 0.10  # cm/s/px；减小近目标修正量
@@ -157,6 +159,17 @@ def payload_target_offset_px(drop_number: int, height_cm: float,
                  / (CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT * height_cm))
     angle = math.radians(PAYLOAD_ANGLES_DEG[drop_number - 1])
     return radius_px * math.cos(angle), radius_px * math.sin(angle)
+
+
+def payload_group_target_offset_px(drop_numbers: Sequence[int], height_cm: float,
+                                   frame_size: Tuple[int, int]) -> Point:
+    """同一目标多件货物共用一次巡航对准；两件时取悬挂点偏置中点。"""
+    if not drop_numbers:
+        raise ValueError("drop group must not be empty")
+    offsets = [payload_target_offset_px(number, height_cm, frame_size)
+               for number in drop_numbers]
+    return (sum(offset[0] for offset in offsets) / len(offsets),
+            sum(offset[1] for offset in offsets) / len(offsets))
 
 
 def pixel_offset_to_ground_cm(offset_px: Point, camera_height_cm: float,
@@ -1344,8 +1357,24 @@ class Mission:
         self.navi.move_by_direction(speed=speed, direction_deg=direction_deg)
         return int(body_velocity[0]), int(body_velocity[1])
 
+    def _pending_drop_numbers(self, color: str) -> Tuple[int, ...]:
+        remaining = (self.ledger.mandatory_remaining if color == MANDATORY_COLOR
+                     else self.ledger.remaining.get(color, 0))
+        first = self.ledger.next_drop_number
+        if remaining < 1 or first + remaining - 1 > TOTAL_DROP_COUNT:
+            raise RuntimeError("invalid pending cargo count for {}".format(color))
+        return tuple(range(first, first + remaining))
+
     def _approach_target(self, target: TargetObservation,
                          protected: bool) -> Optional[TargetObservation]:
+        if self.vision is None:
+            raise RuntimeError("vision interface missing")
+        drop_numbers = self._pending_drop_numbers(target.color)
+        ground_height = (MANDATORY_TARGET_GROUND_HEIGHT_CM
+                         if target.color == MANDATORY_COLOR
+                         else FREE_TARGET_GROUND_HEIGHT_CM)
+        desired_offset = payload_group_target_offset_px(
+            drop_numbers, CRUISE_HEIGHT - ground_height, self.vision.frame_size)
         lost_at = None
         hovering = False
         previous_at = -1.0
@@ -1359,8 +1388,10 @@ class Mission:
         centered_seq = 0
         jump_guard = _VisualJumpGuard()
         last_log_at = time.monotonic() - VISUAL_APPROACH_LOG_PERIOD_S
-        logger.info("[APPROACH] Start target={} protected={} pose={}",
-                    target.target_id, protected, self._position())
+        logger.info("[APPROACH] Start target={} protected={} drops={} "
+                    "desired_offset=({:.1f},{:.1f})px pose={}",
+                    target.target_id, protected, drop_numbers,
+                    *desired_offset, self._position())
         if protected:
             self._move_translation_only(0.0, 0.0)
         while True:
@@ -1396,7 +1427,8 @@ class Mission:
                 if _is_new_visual_frame(observation, seen_seq, seen_at):
                     seen_at = observation.captured_at
                     seen_seq = getattr(observation, "frame_seq", 0)
-                    accepted, jump_previous, jump_reason = jump_guard.accept(observation)
+                    accepted, jump_previous, jump_reason = jump_guard.accept(
+                        observation, desired_offset)
                     if not accepted:
                         if protected:
                             self._move_translation_only(0.0, 0.0)
@@ -1410,7 +1442,8 @@ class Mission:
                             self._vision_diagnostic("approach", observation,
                                                     jump_reason, (0, 0), jump_previous)
                     else:
-                        error = (observation.offset_x_px, observation.offset_y_px)
+                        error = (observation.offset_x_px - desired_offset[0],
+                                 observation.offset_y_px - desired_offset[1])
                         if protected and self.obstacle.point_is_inflated(
                                 self._estimate_target_world_xy(observation)):
                             self._move_translation_only(0.0, 0.0)
@@ -1473,11 +1506,14 @@ class Mission:
                                 observation, protected, speed=speed,
                                 control_error=predicted)
                         if now - last_log_at >= VISUAL_APPROACH_LOG_PERIOD_S:
-                            logger.info("[APPROACH] target={} frame={} offset=({:.1f},{:.1f})px "
+                            logger.info("[APPROACH] target={} frame={} image_offset=({:.1f},{:.1f})px "
+                                        "desired=({:.1f},{:.1f})px error=({:.1f},{:.1f})px "
                                         "predicted=({:.1f},{:.1f})px requested_speed={:.1f}cm/s "
                                         "capture_to_command_ms={:.1f} command_body={}cm/s "
                                         "action={} pose={} yaw={:.1f}deg",
-                                        target.target_id, previous_seq, *error, *predicted,
+                                        target.target_id, previous_seq,
+                                        observation.offset_x_px, observation.offset_y_px,
+                                        *desired_offset, *error, *predicted,
                                         speed, (time.monotonic() - observation.captured_at) * 1000.0,
                                         command, action, self._position(),
                                         self.navi.current_yaw)
@@ -1522,6 +1558,44 @@ class Mission:
         if translation_only and not preserve_horizontal_hold:
             logger.info("[VISUAL] Height {:.1f}cm confirmed at pose={}",
                         height, self._position())
+
+    def _wait_for_drop_position(self) -> bool:
+        """保持巡航时记录的水平 PID 目标，最多等待 9 秒达到 5 cm。"""
+        self._check()
+        if not self.navi.running or not self.navi.navigation_flag:
+            raise RuntimeError("horizontal PID hold inactive before drop")
+        target = (float(self.navi.navi_x_pid.setpoint),
+                  float(self.navi.navi_y_pid.setpoint))
+        deadline = time.monotonic() + DROP_POSITION_TIMEOUT_S
+        # Navigation._reached_waypoint 分轴比较；缩小各轴阈值以保证径向不超过 5 cm。
+        axis_threshold = DROP_POSITION_TOLERANCE_CM / math.sqrt(2.0)
+        while time.monotonic() < deadline:
+            reached = self.navi.wait_for_waypoint(
+                time_thres=2.0, pos_thres=axis_threshold,
+                timeout=max(0.0, deadline - time.monotonic()))
+            self._check()
+            current_target = (float(self.navi.navi_x_pid.setpoint),
+                              float(self.navi.navi_y_pid.setpoint))
+            if (not self.navi.running or not self.navi.navigation_flag
+                    or math.hypot(current_target[0] - target[0],
+                                  current_target[1] - target[1]) > 1e-3):
+                raise RuntimeError("horizontal PID hold changed during drop wait")
+            pose = self._position()
+            distance = math.hypot(pose[0] - target[0], pose[1] - target[1])
+            if reached and distance <= DROP_POSITION_TOLERANCE_CM:
+                logger.info("[DROP-POS] target={} pose={} error={:.1f}cm "
+                            "within {:.1f}cm", target, pose,
+                            distance, DROP_POSITION_TOLERANCE_CM)
+                return True
+            if not reached:
+                break
+        pose = self._position()
+        logger.warning("[DROP-POS] target={} pose={} error={:.1f}cm "
+                       "not confirmed within {:.1f}s; continue drop",
+                       target, pose,
+                       math.hypot(pose[0] - target[0], pose[1] - target[1]),
+                       DROP_POSITION_TIMEOUT_S)
+        return False
 
     def _calibrate_low(self, target: TargetObservation,
                        protected: bool, drop_number: int,
@@ -1763,15 +1837,17 @@ class Mission:
                        LOW_CALIBRATION_TIMEOUT, last_error_distance)
         return False
 
-    def _drop(self, color: str, target_id: str, calibrated: bool) -> None:
+    def _drop(self, color: str, target_id: str,
+              position_confirmed: bool) -> None:
         self._check()
         if self.relay is None:
             raise RuntimeError("relay missing")
         # 先记顺位。即使回读失败，下一件也使用下一路，避免可能已释放时重投。
         drop_number = self.ledger.next_drop_number
         channel = self.ledger.record_attempt(color)
-        logger.info("[DROP] Attempt {} relay={} target={} color={} calibrated={}",
-                    drop_number, channel, target_id, color, calibrated)
+        logger.info("[DROP] Attempt {} relay={} target={} color={} "
+                    "position_confirmed={}",
+                    drop_number, channel, target_id, color, position_confirmed)
         confirmed = self.relay.turn_off(channel, verify=True, retries=1)
         if confirmed:
             logger.info("[DROP] Channel {} OFF confirmed; cargo release not sensor-verified",
@@ -1791,11 +1867,13 @@ class Mission:
             self._resume_route(self.free_origin)
             return
         self._set_height(FREE_DROP_HEIGHT, preserve_horizontal_hold=True)
+        position_confirmed = self._wait_for_drop_position()
+        logger.info("[DROP] Release remaining {} cargo for target={} "
+                    "without low-altitude visual translation",
+                    target.color, target.target_id)
         while self.ledger.has_quota(target.color):
             self._check()
-            calibrated = self._calibrate_low(
-                target, protected=False, drop_number=self.ledger.next_drop_number)
-            self._drop(target.color, target.target_id, calibrated)
+            self._drop(target.color, target.target_id, position_confirmed)
         self._set_height(CRUISE_HEIGHT)
         self._resume_route(self.free_origin)
 
@@ -1814,7 +1892,7 @@ class Mission:
         self._check()
         if self.obstacle is None:
             raise RuntimeError("obstacle interface missing")
-        drop_number = self.ledger.next_drop_number
+        drop_numbers = self._pending_drop_numbers(MANDATORY_COLOR)
         target_world = self._estimate_target_world_xy(approach_observation)
         if self.obstacle.point_is_inflated(target_world):
             boundary_result = self._mandatory_boundary_if_needed(target)
@@ -1823,23 +1901,32 @@ class Mission:
             self.navi.stop_move()
             self._resume_center_route()
             return False
-        desired_pose = self._desired_aircraft_drop_pose(target_world, drop_number)
+        desired_pose = self._desired_aircraft_group_drop_pose(
+            target_world, drop_numbers)
         if not self.obstacle.mandatory_drop_pose_is_clear(desired_pose):
             logger.warning("[MANDATORY] 43cm drop-pose clearance rejected: "
                            "target={} drop={} target_world={} pose={}",
-                           target.target_id, drop_number, target_world, desired_pose)
+                           target.target_id, drop_numbers, target_world, desired_pose)
             self.navi.stop_move()
             self._mark_mandatory_pose_rejected(target.target_id)
             self._resume_center_route()
             return False
         logger.info("[MANDATORY] 43cm drop-pose clearance accepted: "
                     "target={} drop={} target_world={} pose={}",
-                    target.target_id, drop_number, target_world, desired_pose)
+                    target.target_id, drop_numbers, target_world, desired_pose)
         self._set_height(MANDATORY_DROP_HEIGHT, preserve_horizontal_hold=True)
-        calibrated = self._calibrate_low(
-            target, protected=True, drop_number=drop_number,
-            target_world=target_world)
-        self._drop(MANDATORY_COLOR, self.target.target_id, calibrated)
+        position_confirmed = self._wait_for_drop_position()
+        if (self.obstacle.point_is_inflated(self._position())
+                or not self.obstacle.mandatory_drop_pose_is_clear(self._position())):
+            raise RuntimeError("mandatory drop pose lost clearance after descent")
+        logger.info("[DROP] Release remaining yellow cargo for target={} "
+                    "without low-altitude visual translation", target.target_id)
+        while self.ledger.has_quota(MANDATORY_COLOR):
+            self._check()
+            if (self.obstacle.point_is_inflated(self._position())
+                    or not self.obstacle.mandatory_drop_pose_is_clear(self._position())):
+                raise RuntimeError("mandatory drop pose lost clearance between releases")
+            self._drop(MANDATORY_COLOR, target.target_id, position_confirmed)
         self._set_height(CRUISE_HEIGHT, translation_only=True)
         self._navigate_center_exit()
         return True
@@ -1880,6 +1967,7 @@ class Mission:
         self.navi.set_yaw(float(self.navi.current_yaw))
         self.navi.stop_move()
         self._set_height(MANDATORY_DROP_HEIGHT, preserve_horizontal_hold=True)
+        position_confirmed = self._wait_for_drop_position()
         while self.ledger.has_quota(MANDATORY_COLOR):
             self._check()
             if (self.obstacle.point_is_inflated(self._position())
@@ -1898,7 +1986,7 @@ class Mission:
                            "predicted_cargo={} estimated_miss={:.1f}cm "
                            "without 20px alignment", number, target_world,
                            aircraft, predicted_landing, miss_cm)
-            self._drop(MANDATORY_COLOR, target.target_id, calibrated=False)
+            self._drop(MANDATORY_COLOR, target.target_id, position_confirmed)
         self._set_height(CRUISE_HEIGHT, translation_only=True)
         self._navigate_center_exit()
         return True
@@ -1922,6 +2010,15 @@ class Mission:
         payload_world = body_to_world_velocity(
             payload_body[0], payload_body[1], float(self.navi.current_yaw))
         return target_world[0] - payload_world[0], target_world[1] - payload_world[1]
+
+    def _desired_aircraft_group_drop_pose(self, target_world: Point,
+                                          drop_numbers: Sequence[int]) -> Point:
+        if not drop_numbers:
+            raise ValueError("drop group must not be empty")
+        poses = [self._desired_aircraft_drop_pose(target_world, number)
+                 for number in drop_numbers]
+        return (sum(pose[0] for pose in poses) / len(poses),
+                sum(pose[1] for pose in poses) / len(poses))
 
     def _return_and_land(self, check_deadline: bool = True,
                          protected: bool = False) -> None:
