@@ -482,7 +482,10 @@ class MissionVelocityTests(unittest.TestCase):
     def test_unprotected_move_keeps_body_direction(self):
         self.mission._move_toward(self.observation, protected=False)
         self.mission.obstacle.safe_velocity.assert_not_called()
-        self.mission.navi.move_by_direction.assert_called_once_with(speed=10.0, direction_deg=0.0)
+        self.mission.navi.update_realtime_control.assert_called_once_with(
+            vel_x=10, vel_y=0, yaw=0)
+        self.assertFalse(self.mission.navi.navigation_flag)
+        self.mission.navi.move_by_direction.assert_not_called()
 
     def test_protected_zero_velocity_clears_yaw_and_invalid_results_raise(self):
         self.mission.obstacle.safe_velocity.return_value = (0, 0)
@@ -662,7 +665,9 @@ class VisualApproachTests(unittest.TestCase):
                      and n.name in {"visual_approach_command", "_is_new_visual_frame",
                                     "_is_consecutive_visual_frame",
                                     "payload_target_offset_px",
-                                    "payload_group_target_offset_px"}]
+                                    "payload_group_target_offset_px",
+                                    "pixel_offset_to_ground_cm",
+                                    "body_to_world_velocity"}]
         selected += [n for n in tree.body if isinstance(n, ast.ClassDef)
                      and n.name == "_VisualJumpGuard"]
         future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
@@ -723,7 +728,7 @@ class VisualApproachTests(unittest.TestCase):
                          [(("blue", "blue-1", False), {}),
                           (("blue", "blue-1", False), {})])
 
-    def test_low_drop_wait_keeps_pid_target_and_five_cm_radial_limit(self):
+    def test_low_drop_wait_keeps_pid_target_and_five_cm_per_axis_limit(self):
         clock = SimpleNamespace(now=0.0)
         self.namespace.update({
             "time": SimpleNamespace(monotonic=lambda: clock.now),
@@ -742,15 +747,18 @@ class VisualApproachTests(unittest.TestCase):
         mission.navi.wait_for_waypoint.return_value = True
         self.assertTrue(mission._wait_for_drop_position())
         kwargs = mission.navi.wait_for_waypoint.call_args.kwargs
-        self.assertAlmostEqual(kwargs["pos_thres"], 5.0 / math.sqrt(2.0))
+        self.assertAlmostEqual(kwargs["pos_thres"], 5.0)
         self.assertEqual(kwargs["time_thres"], 2.0)
         self.assertEqual(kwargs["timeout"], 9.0)
 
         mission.navi.current_x = 4.0
         mission.navi.current_y = 4.0
+        self.assertTrue(mission._wait_for_drop_position())
+
+        mission.navi.current_x = 5.1
         mission.navi.wait_for_waypoint.side_effect = [True, False]
         self.assertFalse(mission._wait_for_drop_position())
-        self.assertEqual(mission.navi.wait_for_waypoint.call_count, 3)
+        self.assertEqual(mission.navi.wait_for_waypoint.call_count, 4)
 
     def test_observation_expires_after_inferred_freshness_limit(self):
         clock = SimpleNamespace(now=1.64)
@@ -789,7 +797,7 @@ class VisualApproachTests(unittest.TestCase):
                          names={"_approach_target", "_position"},
                          namespace=self.namespace)
         mission = cls()
-        mission.navi = Mock(current_x=0.0, current_y=0.0, current_yaw=0.0)
+        mission.navi = Mock(current_x=30.0, current_y=40.0, current_yaw=90.0)
         mission.vision = SimpleNamespace(frame_size=(640, 480))
         mission._pending_drop_numbers = Mock(return_value=(1,))
         self.namespace["payload_group_target_offset_px"] = Mock(return_value=(10.0, 0.0))
@@ -821,10 +829,36 @@ class VisualApproachTests(unittest.TestCase):
         mission._move_translation_only.assert_called_with(0.0, 0.0)
         self.assertTrue(mission._move_toward.called)
         mission.navi.stop_move.assert_called_once()
-        mission.navi.set_yaw.assert_called_once_with(0.0)
+        mission.navi.set_yaw.assert_called_once_with(90.0)
+        expected_world_dy = -(35.0 - 10.0) * 300.0 * 70.0 / (640.0 * 160.0)
+        self.assertAlmostEqual(mission.navi.navi_x_pid.setpoint, 30.0)
+        self.assertAlmostEqual(mission.navi.navi_y_pid.setpoint,
+                               40.0 + expected_world_dy)
+        mission.obstacle.mandatory_drop_pose_is_clear.assert_called_once()
         self.namespace["payload_group_target_offset_px"].assert_called_once_with(
             (1,), self.namespace["CRUISE_HEIGHT"]
             - self.namespace["MANDATORY_TARGET_GROUND_HEIGHT_CM"], (640, 480))
+
+        clock.now = 0.0
+        mission.navi.reset_mock()
+        free_result = mission._approach_target(
+            SimpleNamespace(target_id="red-1", color="red"), protected=False)
+        self.assertEqual(free_result.target_id, "red-1")
+        mission.navi.set_yaw.assert_called_once_with(90.0)
+        mission.navi.stop_move.assert_called_once()
+        expected_free_dy = -(35.0 - 10.0) * 300.0 * 100.0 / (640.0 * 160.0)
+        self.assertAlmostEqual(mission.navi.navi_x_pid.setpoint, 30.0)
+        self.assertAlmostEqual(mission.navi.navi_y_pid.setpoint,
+                               40.0 + expected_free_dy)
+        mission.obstacle.mandatory_drop_pose_is_clear.assert_called_once()
+
+        clock.now = 0.0
+        mission.navi.reset_mock()
+        mission.obstacle.mandatory_drop_pose_is_clear.return_value = False
+        mission._mark_mandatory_pose_rejected = Mock()
+        self.assertIsNone(mission._approach_target(target, protected=True))
+        mission.navi.stop_move.assert_not_called()
+        mission._mark_mandatory_pose_rejected.assert_called_once_with("yellow-3")
 
     def test_poll_stamps_frame_before_inference_and_increments_sequence(self):
         clock = iter((10.0, 10.25, 10.4, 10.7))

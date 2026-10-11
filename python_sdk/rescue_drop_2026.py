@@ -44,6 +44,7 @@ INFLATION_ESCAPE_SPEED_CM_S = 5.0
 INFLATION_ESCAPE_TIMEOUT_S = 20.0  # 60 cm 短退出段以 5 cm/s 飞行，留有制动余量。
 # 以下三个高度均为 FAST-LIO startup-local Z 定高目标（cm），不是激光 AGL。
 CRUISE_HEIGHT = 100.0
+LANDING_APPROACH_HEIGHT = 20.0
 VERTICAL_SPEED = 22.0
 FREE_DROP_HEIGHT = 40.0
 MANDATORY_DROP_HEIGHT = 60.0
@@ -69,7 +70,7 @@ VISION_WARMUP_S = 6.0
 TARGET_LOSS_WAIT = 2.0
 LOW_CALIBRATION_TIMEOUT = 9.0  # 旧低空视觉校准保留作离线对照，飞行任务不再调用
 DROP_POSITION_TIMEOUT_S = 9.0
-DROP_POSITION_TOLERANCE_CM = 5.0  # 低空投放前相对巡航定点目标的水平距离
+DROP_POSITION_TOLERANCE_CM = 5.0  # 低空投放前相对巡航定点目标的 x、y 分轴误差
 LOW_CALIBRATION_MIN_SPEED = 2.0  # cm/s；小误差时降低单帧位移
 LOW_CALIBRATION_MAX_SPEED = 8.0  # cm/s；按现场约 0.4s 帧间隔限制位移
 LOW_CALIBRATION_SPEED_PER_PX = 0.10  # cm/s/px；减小近目标修正量
@@ -1349,13 +1350,7 @@ class Mission:
             body_velocity = world_to_body_velocity(*safe_world_velocity, yaw)
         speed = math.hypot(*body_velocity)
         direction_deg = math.degrees(math.atan2(body_velocity[1], body_velocity[0]))
-        if protected:
-            return self._move_translation_only(speed, direction_deg)
-        if speed < 1.0:
-            self.navi.stop_move()
-            return 0, 0
-        self.navi.move_by_direction(speed=speed, direction_deg=direction_deg)
-        return int(body_velocity[0]), int(body_velocity[1])
+        return self._move_translation_only(speed, direction_deg)
 
     def _pending_drop_numbers(self, color: str) -> Tuple[int, ...]:
         remaining = (self.ledger.mandatory_remaining if color == MANDATORY_COLOR
@@ -1392,18 +1387,14 @@ class Mission:
                     "desired_offset=({:.1f},{:.1f})px pose={}",
                     target.target_id, protected, drop_numbers,
                     *desired_offset, self._position())
-        if protected:
-            self._move_translation_only(0.0, 0.0)
+        self._move_translation_only(0.0, 0.0)
         while True:
             self._check()
             now = time.monotonic()
             observation = self._observation(target_id=target.target_id)
             if observation is None:
                 if not hovering:
-                    if protected:
-                        self._move_translation_only(0.0, 0.0)
-                    else:
-                        self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                    self._move_translation_only(0.0, 0.0)
                     hovering = True
                 if lost_at is None:
                     lost_at = now
@@ -1430,10 +1421,7 @@ class Mission:
                     accepted, jump_previous, jump_reason = jump_guard.accept(
                         observation, desired_offset)
                     if not accepted:
-                        if protected:
-                            self._move_translation_only(0.0, 0.0)
-                        else:
-                            self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                        self._move_translation_only(0.0, 0.0)
                         hovering = True
                         centered_count = 0
                         pixel_velocity = (0.0, 0.0)
@@ -1482,20 +1470,14 @@ class Mission:
                             centered_seq = previous_seq
                             centered_at = observation.captured_at
                             if not hovering:
-                                if protected:
-                                    self._move_translation_only(0.0, 0.0)
-                                else:
-                                    self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                                self._move_translation_only(0.0, 0.0)
                                 hovering = True
                             action = "center-{}/{}".format(
                                 centered_count, VISUAL_APPROACH_CENTER_FRAMES)
                         elif speed == 0.0:
                             centered_count = 0
                             if not hovering:
-                                if protected:
-                                    self._move_translation_only(0.0, 0.0)
-                                else:
-                                    self.navi.move_by_direction(speed=0.0, direction_deg=0.0)
+                                self._move_translation_only(0.0, 0.0)
                                 hovering = True
                             action = "brake"
                         else:
@@ -1524,13 +1506,37 @@ class Mission:
                                                     jump_previous if jump_reason.startswith("jump") else None)
                         if centered_count >= VISUAL_APPROACH_CENTER_FRAMES:
                             self._check()
-                            if protected:
-                                self.navi.set_yaw(float(self.navi.current_yaw))
-                            self.navi.stop_move()  # 此刻记录水平 PID 目标，再开始下降
+                            yaw = float(self.navi.current_yaw)
+                            body_correction = pixel_offset_to_ground_cm(
+                                error, CRUISE_HEIGHT - ground_height,
+                                self.vision.frame_size)
+                            world_correction = body_to_world_velocity(
+                                *body_correction, yaw)
+                            pose = self._position()
+                            hold_target = (pose[0] + world_correction[0],
+                                           pose[1] + world_correction[1])
+                            if protected and (
+                                    self.obstacle.point_is_inflated(hold_target)
+                                    or not self.obstacle.mandatory_drop_pose_is_clear(
+                                        hold_target)):
+                                self._move_translation_only(0.0, 0.0)
+                                self._mark_mandatory_pose_rejected(target.target_id)
+                                logger.warning("[APPROACH] Yellow target {} corrected "
+                                               "hold={} lacks obstacle clearance; "
+                                               "resume center route", target.target_id,
+                                               hold_target)
+                                return None
+                            self.navi.set_yaw(yaw)
+                            self.navi.stop_move()  # 清零手动速度并开启水平、偏航 PID
+                            self.navi.navi_x_pid.setpoint = hold_target[0]
+                            self.navi.navi_y_pid.setpoint = hold_target[1]
                             logger.info("[APPROACH] Target {} centered in {} fresh frames "
-                                        "at error={:.1f}px; hold XY={} and descend",
-                                        target.target_id, centered_count, distance,
-                                        self._position())
+                                        "at error=({:.1f},{:.1f})px; pose={} yaw={:.1f}deg "
+                                        "correction_body={}cm correction_world={}cm "
+                                        "hold XY={} and descend",
+                                        target.target_id, centered_count, *error,
+                                        pose, yaw, body_correction,
+                                        world_correction, hold_target)
                             return observation
             self.stop_event.wait(VISUAL_PERIOD)
 
@@ -1560,18 +1566,16 @@ class Mission:
                         height, self._position())
 
     def _wait_for_drop_position(self) -> bool:
-        """保持巡航时记录的水平 PID 目标，最多等待 9 秒达到 5 cm。"""
+        """保持巡航时记录的水平 PID 目标，最多等待 9 秒使两轴各小于 5 cm。"""
         self._check()
         if not self.navi.running or not self.navi.navigation_flag:
             raise RuntimeError("horizontal PID hold inactive before drop")
         target = (float(self.navi.navi_x_pid.setpoint),
                   float(self.navi.navi_y_pid.setpoint))
         deadline = time.monotonic() + DROP_POSITION_TIMEOUT_S
-        # Navigation._reached_waypoint 分轴比较；缩小各轴阈值以保证径向不超过 5 cm。
-        axis_threshold = DROP_POSITION_TOLERANCE_CM / math.sqrt(2.0)
         while time.monotonic() < deadline:
             reached = self.navi.wait_for_waypoint(
-                time_thres=2.0, pos_thres=axis_threshold,
+                time_thres=2.0, pos_thres=DROP_POSITION_TOLERANCE_CM,
                 timeout=max(0.0, deadline - time.monotonic()))
             self._check()
             current_target = (float(self.navi.navi_x_pid.setpoint),
@@ -1581,19 +1585,19 @@ class Mission:
                                   current_target[1] - target[1]) > 1e-3):
                 raise RuntimeError("horizontal PID hold changed during drop wait")
             pose = self._position()
-            distance = math.hypot(pose[0] - target[0], pose[1] - target[1])
-            if reached and distance <= DROP_POSITION_TOLERANCE_CM:
-                logger.info("[DROP-POS] target={} pose={} error={:.1f}cm "
-                            "within {:.1f}cm", target, pose,
-                            distance, DROP_POSITION_TOLERANCE_CM)
+            error_x, error_y = pose[0] - target[0], pose[1] - target[1]
+            if (reached and abs(error_x) < DROP_POSITION_TOLERANCE_CM
+                    and abs(error_y) < DROP_POSITION_TOLERANCE_CM):
+                logger.info("[DROP-POS] target={} pose={} error_xy=({:.1f},{:.1f})cm "
+                            "within {:.1f}cm per axis", target, pose,
+                            error_x, error_y, DROP_POSITION_TOLERANCE_CM)
                 return True
             if not reached:
                 break
         pose = self._position()
-        logger.warning("[DROP-POS] target={} pose={} error={:.1f}cm "
+        logger.warning("[DROP-POS] target={} pose={} error_xy=({:.1f},{:.1f})cm "
                        "not confirmed within {:.1f}s; continue drop",
-                       target, pose,
-                       math.hypot(pose[0] - target[0], pose[1] - target[1]),
+                       target, pose, pose[0] - target[0], pose[1] - target[1],
                        DROP_POSITION_TIMEOUT_S)
         return False
 
@@ -2028,7 +2032,7 @@ class Mission:
                            check_deadline=check_deadline)
         self._check(check_deadline)
         if not self.navi.pointing_landing(
-                TAKEOFF_POINT, height_timeout=LANDING_HEIGHT_TIMEOUT):
+                TAKEOFF_POINT, height_timeout=LANDING_HEIGHT_TIMEOUT, approach_height=LANDING_APPROACH_HEIGHT,):
             raise RuntimeError("pointing landing at takeoff point was not confirmed")
         self.landed = True
         logger.info("[RESCUE] Landed and locked at takeoff point")
