@@ -65,8 +65,10 @@ class AirFleetNode:
         wait: Callable[[float], None] = time.sleep,
         trace_options: TraceSamplingOptions = TraceSamplingOptions(),
         allowed_readonly_command_ids=frozenset(),
+        controller_node: NodeId = NodeId.GROUND,
     ) -> None:
         self._transport = transport
+        self._controller_node = int(controller_node)
         self._state_provider = state_provider
         self._commands = command_queue
         self._flight_stop_event = stop_event
@@ -204,7 +206,7 @@ class AirFleetNode:
                     )
 
     def _handle(self, frame: Frame) -> Optional[bytes]:
-        if frame.src != int(NodeId.GROUND):
+        if frame.src != self._controller_node:
             return None
         self._cache.begin_ground_session(frame.session)
         trace_request = None
@@ -420,7 +422,7 @@ class AirFleetNode:
             Frame(
                 version=1,
                 src=int(NodeId.DRONE),
-                dst=int(NodeId.GROUND),
+                dst=request.src,
                 kind=int(kind),
                 flags=0,
                 session=self._session,
@@ -445,6 +447,8 @@ def attach_air_fleet_node(
     hc14_port: Optional[str] = None,
     hc14_baudrate: Optional[int] = None,
     transport_factory=None,
+    controller_node: NodeId = NodeId.GROUND,
+    node_factory=AirFleetNode,
 ) -> AirFleetNode:
     """Create the airborne FleetBus endpoint through the FC wireless bridge.
 
@@ -495,7 +499,7 @@ def attach_air_fleet_node(
         position_transform=position_transform,
         heading_offset_deg=heading_offset_deg,
     )
-    node = AirFleetNode(
+    node = node_factory(
         transport,
         default_state_provider if state_provider is None else state_provider,
         commands,
@@ -505,6 +509,7 @@ def attach_air_fleet_node(
         allowed_readonly_command_ids=allowed_readonly_command_ids,
         survey_provider=survey_provider,
         trace_options=trace_options,
+        controller_node=controller_node,
     )
     holder["node"] = node
     node.start()

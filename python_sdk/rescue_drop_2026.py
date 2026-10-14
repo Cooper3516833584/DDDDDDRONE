@@ -1,7 +1,8 @@
 """2026 空地协同救援物资投放赛无人机主入口。
 
 默认通过 FC_Server 连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
-避障接口实现、投放数量、继电器端口和终端 ``start_mission`` 指令。
+避障接口实现、继电器端口和开始指令。``--car-control`` 从小车接收实际投放配额
+及匹配的启动请求；手动模式使用命令行配额和终端 ``start_mission``。
 机上自启动的 server_ros.py / FC_Server 独占飞控串口，本任务不直连串口。
 
 导航坐标单位为 cm，x 向前、y 向左；高度单位为 cm。
@@ -2213,13 +2214,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--red-count", type=int)
     parser.add_argument("--blue-count", type=int)
     parser.add_argument("--green-count", type=int)
+    parser.add_argument("--car-control", action="store_true",
+                        help="使用小车 FleetBus 实际配额及启动请求，经 FC_Server/飞控 UART2")
     args = parser.parse_args()
     if args.fc_port is not None:
         parser.error("--fc-port cannot be used while FC_Server owns the serial port; "
                      "use --fc-host and --fc-server-port")
     if not 1 <= args.fc_server_port <= 65535:
         parser.error("--fc-server-port must be between 1 and 65535")
-    if args.confirm_flight:
+    if args.car_control and FREE_DROP_COUNT != 4:
+        parser.error("--car-control requires the competition's four free-drop items; "
+                     "it is unavailable in altered-quota test entries")
+    if args.car_control and any(count is not None for count in (
+            args.red_count, args.blue_count, args.green_count)):
+        parser.error("--car-control receives counts from the car; do not supply CLI counts")
+    if args.confirm_flight and not args.car_control:
         if any(count is None for count in (
                 args.red_count, args.blue_count, args.green_count)):
             parser.error("--confirm-flight requires --red-count, --blue-count "
@@ -2267,6 +2276,8 @@ def main() -> int:
     vision = None
     obstacle = None
     obstacle_planner = None
+    fleet_node = None
+    task_receiver = None
 
     try:
         if args.confirm_flight:
@@ -2276,8 +2287,9 @@ def main() -> int:
                     or any(channel < 1 or channel > RELAY_CHANNEL_COUNT
                            for channel in PAYLOAD_RELAY_CHANNELS)):
                 raise RuntimeError("invalid payload relay/angle configuration")
-            allocation = validate_allocation(
-                args.red_count, args.blue_count, args.green_count)
+            if not args.car_control:
+                allocation = validate_allocation(
+                    args.red_count, args.blue_count, args.green_count)
             vision = VisionInterface()
             obstacle_planner = ObstaclePlanner2D()
             obstacle = ObstacleInterface(obstacle_planner)
@@ -2306,6 +2318,10 @@ def main() -> int:
         mission.prepare_navigation()
 
         if not args.confirm_flight:
+            if args.car_control:
+                from fleet_bus.rescue_task import attach_rescue_fleet_node
+                fleet_node, task_receiver = attach_rescue_fleet_node(fc, navi, stop_event)
+                logger.info("[RESCUE] Car allocation receiver active; flight/start disabled")
             mission.monitor_pose()
             return 0
 
@@ -2322,7 +2338,17 @@ def main() -> int:
             if not relay.turn_on(channel, verify=True, retries=1):
                 raise RuntimeError("failed to confirm payload channel {} ON".format(channel))
         mission.relay = relay
-        wait_for_start_command()
+        if args.car_control:
+            from fleet_bus.rescue_task import attach_rescue_fleet_node
+            fleet_node, task_receiver = attach_rescue_fleet_node(
+                fc, navi, stop_event, allow_start=True)
+            logger.info("[RESCUE] Ready; waiting for car allocation and matching start")
+            task = task_receiver.wait_for_start()
+            allocation = validate_allocation(task.red, task.blue, task.green)
+            mission.ledger = DropLedger(allocation)
+            logger.info("[RESCUE] Car task {} allocation {}", task.task_id, allocation)
+        else:
+            wait_for_start_command()
         mission.deadline = time.monotonic() + MISSION_TIMEOUT
         mission._check()
         takeoff_attempted = True
@@ -2335,6 +2361,11 @@ def main() -> int:
         logger.exception("[RESCUE] Mission failed")
         return 1
     finally:
+        if fleet_node is not None:
+            try:
+                fleet_node.close()
+            except Exception:
+                logger.exception("[RESCUE] Failed to close car task receiver")
         if mission is not None:
             try:
                 mission.stop()

@@ -1,5 +1,7 @@
 # FleetBus task-layer integration
 
+The 2026 rescue-drop entry now supports car-supplied red/blue/green quotas and a matching start through `--car-control`. See [rescue task wire contract](RESCUE_TASK.md). This endpoint accepts the car as controller; existing endpoints keep their ground-controller default.
+
 The airborne HC-14 is connected to the flight controller's UART2. `AirFleetNode`
 uses the existing FC wireless bridge while FleetBus mode is active; it does not
 open a CH340 device on the airborne Linux computer.
