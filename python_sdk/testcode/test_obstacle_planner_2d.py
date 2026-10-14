@@ -54,6 +54,76 @@ def load_class(relative_path, class_name, names=None, namespace=None):
     return namespace[class_name]
 
 
+def load_route_builder():
+    source = SDK / "rescue_drop_2026.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    constants = {"TRACK_START_OFFSET_X_CM", "TRACK_LENGTH_X_CM",
+                 "LEFT_SPAN_Y_CM", "RIGHT_SPAN_Y_CM", "CENTER_INSET_X_CM",
+                 "CENTER_ENTRY_TRANSITION_CM"}
+    nodes = [node for node in tree.body
+             if (isinstance(node, ast.FunctionDef) and node.name == "build_routes")
+             or (isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id in constants
+                         for target in node.targets))]
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(
+        ast.Module(body=[future] + nodes, type_ignores=[])), str(source), "exec"), namespace)
+    return namespace["build_routes"]
+
+
+class DirectionalRoutesOfflineTests(unittest.TestCase):
+    def test_direction_cli_defaults_right_and_accepts_left(self):
+        source = SDK / "rescue_drop_2026.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        parse_args = next(node for node in tree.body
+                          if isinstance(node, ast.FunctionDef) and node.name == "parse_args")
+        namespace = {"argparse": __import__("argparse"),
+                     "FC_SERVER_HOST": "127.0.0.1", "FC_SERVER_PORT": 5654}
+        exec(compile(ast.fix_missing_locations(
+            ast.Module(body=[parse_args], type_ignores=[])), str(source), "exec"), namespace)
+        for argv, expected in ((["rescue"], "right"),
+                               (["rescue", "--route-direction", "left"], "left")):
+            with patch.object(sys, "argv", argv):
+                self.assertEqual(namespace["parse_args"]().route_direction, expected)
+
+    def test_left_center_mirrors_right_with_same_fold_points(self):
+        build = load_route_builder()
+        right_entry, right_center, right_exit = build("right", transition_cm=50.0)
+        left_entry, left_center, left_exit = build("left", transition_cm=50.0)
+        self.assertEqual(right_entry, [(0.0, 0.0), (0.0, -160.0), (150.0, -160.0)])
+        self.assertEqual(left_entry, [(0.0, 0.0), (0.0, 157.0), (150.0, 157.0)])
+        self.assertEqual(right_exit, [(200.0, 157.0), (0.0, 157.0), (0.0, 0.0)])
+        self.assertEqual(left_exit, [(200.0, -160.0), (0.0, -160.0), (0.0, 0.0)])
+        self.assertEqual(len(right_center), len(left_center))
+        self.assertEqual([point[0] for point in right_center],
+                         [point[0] for point in left_center])
+        for right, left in zip(right_center, left_center):
+            self.assertAlmostEqual(right[1] + left[1], -3.0)
+        self.assertEqual(build(), build("right", transition_cm=50.0))
+        self.assertEqual(build("left"), build("left", transition_cm=50.0))
+
+    def test_mission_selects_matching_entry_center_and_exit_without_state_copy(self):
+        stages = SimpleNamespace(ROUTE_1=object(), CENTER=object(), ROUTE_2=object())
+        namespace = {"build_routes": load_route_builder(),
+                     "CENTER_ENTRY_TRANSITION_CM": 50.0,
+                     "MissionState": stages, "DropLedger": lambda allocation: allocation,
+                     "threading": threading}
+        mission_class = load_class("rescue_drop_2026.py", "Mission",
+                                   names={"__init__", "_same_point"}, namespace=namespace)
+        for direction in ("right", "left"):
+            with self.subTest(direction=direction):
+                mission = mission_class(None, None, None, None, None, {},
+                                        threading.Event(), route_direction=direction)
+                expected = ((mission.route_1, mission.route_3, mission.route_2)
+                            if direction == "right" else
+                            (mission.route_4, mission.route_6, mission.route_5))
+                self.assertTrue(all(actual is route for actual, route in zip(
+                    (mission.entry_route, mission.center_route, mission.exit_route), expected)))
+                self.assertEqual(mission._entry_path[-1], mission.center_route[0])
+                self.assertEqual(mission.entry_route[-1][0], 150.0)
+
+
 class PlannerTests(unittest.TestCase):
     def setUp(self):
         self.clock = patch.object(module.time, "monotonic", return_value=100.0).start()
@@ -207,6 +277,16 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan.waypoints, tuple(points[:3]))
         self.assertEqual(plan.skipped_offsets, ())
         self.assertTrue(self.planner.path_is_free([(200, -175)] + list(plan.waypoints)))
+
+    def test_left_center_window_uses_same_planner_and_avoids_blocked_segment(self):
+        points = [(200, 93.6), (80, 93.6), (80, 30.2), (200, 30.2)]
+        clear = self.planner.plan_route_window((200, 157), points)
+        self.assertEqual(clear.anchors, tuple(enumerate(points[:3])))
+        self.seed([(150, 93.6)])
+        blocked = self.planner.plan_route_window((200, 157), points)
+        self.assertIsNotNone(blocked)
+        self.assertTrue(self.planner.path_is_free(
+            [(200, 157)] + list(blocked.waypoints)))
 
     def test_center_window_skips_blocked_corner_and_keeps_searching(self):
         points = [(200, -105), (130, -105), (130, -35), (200, -35),
@@ -519,6 +599,8 @@ class MissionVelocityTests(unittest.TestCase):
         mission.navi.set_height.assert_called_once_with(100.0)
 
         mission.route_2 = [(200.0, 160.0)]
+        mission.exit_route = mission.route_2
+        mission.route_direction = "right"
         mission._navigate_leg = Mock()
         mission._escape_center_start = Mock()
         mission._refresh_center_exit = Mock()
@@ -975,7 +1057,8 @@ class CenterMissionOfflineTests(unittest.TestCase):
             "_desired_aircraft_group_drop_pose", "_pending_drop_numbers",
             "_mandatory_drop", "_mandatory_boundary_if_needed",
             "_mark_mandatory_pose_rejected", "_refresh_center_exit", "_follow_route",
-            "_escape_center_start",
+            "_escape_center_start", "_resume_route", "_resume_center_route",
+            "_navigate_center_exit",
             "_mandatory_observation_allowed", "_start_center_path_with_fallback",
             "_at_waypoint", "_same_point", "_execute_center_route",
             "_update_center_route_progress",
@@ -1083,6 +1166,8 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission._nominal_center_exit = (200.0, 157.0)
         mission.route_3 = [(200.0, -160.0), (200.0, 157.0)]
         mission.route_2 = [(200.0, 157.0), (0.0, 157.0), (0.0, 0.0)]
+        mission.center_route = mission.route_3
+        mission.exit_route = mission.route_2
         mission.obstacle.point_is_inflated.side_effect = (
             lambda point: point == (200.0, 157.0))
         mission.obstacle.boundary_crossing.return_value = (150.0, 157.0)
@@ -1096,6 +1181,21 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission._refresh_center_exit()
         self.assertEqual(mission.route_3[-1], (200.0, 157.0))
         self.assertEqual(mission.route_2[0], mission.route_3[-1])
+
+    def test_left_center_exit_migration_targets_route_five(self):
+        mission = self.mission
+        mission._refresh_center_exit = type(mission)._refresh_center_exit.__get__(mission)
+        mission._nominal_center_exit = (200.0, -160.0)
+        mission.center_route = [(200.0, 157.0), (200.0, -160.0)]
+        mission.exit_route = [(200.0, -160.0), (0.0, -160.0), (0.0, 0.0)]
+        mission.obstacle.point_is_inflated.side_effect = (
+            lambda point: point == (200.0, -160.0))
+        mission.obstacle.boundary_crossing.return_value = (150.0, -160.0)
+        mission._refresh_center_exit()
+        self.assertEqual(mission.center_route[-1], (150.0, -160.0))
+        self.assertEqual(mission.exit_route[0], (150.0, -160.0))
+        mission.obstacle.boundary_crossing.assert_called_once_with(
+            (200.0, -160.0), (0.0, -160.0), entering=False)
 
     def test_inflation_escape_timeout_sends_zero_speed(self):
         mission = self.mission
@@ -1116,6 +1216,8 @@ class CenterMissionOfflineTests(unittest.TestCase):
             ROUTE_1=route_one, ROUTE_2=route_two, CENTER=center)
         mission.route_1 = [(0.0, 0.0)]
         mission.route_2 = [(150.0, 157.0), (0.0, 157.0), (0.0, 0.0)]
+        mission._entry_path = mission.route_1
+        mission.exit_route = mission.route_2
         mission.route_index = {route_two: 1}
         mission._nominal_center_exit = (200.0, 157.0)
         mission._navigate_leg = Mock(return_value=None)
@@ -1130,6 +1232,9 @@ class CenterMissionOfflineTests(unittest.TestCase):
             ROUTE_1=route_one, ROUTE_2=route_two, CENTER=center)
         mission.route_1 = [(0.0, 0.0), (0.0, -160.0), (200.0, -160.0)]
         mission.route_2 = [(200.0, 157.0)]
+        mission.entry_route = mission.route_1
+        mission._entry_path = list(mission.route_1)
+        mission.exit_route = mission.route_2
         mission.route_index = {route_one: 2}
         mission._nominal_center_start = (200.0, -160.0)
         mission.navi.current_x, mission.navi.current_y = 0.0, -160.0
@@ -1137,9 +1242,81 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission._same_point = lambda a, b: a == b
         mission._navigate_leg = Mock(return_value=None)
         self.assertIsNone(mission._follow_route(route_one))
-        self.assertEqual(mission.route_1[-1], (150.0, -160.0))
+        self.assertEqual(mission._entry_path[-1], (150.0, -160.0))
         mission._navigate_leg.assert_called_once_with(
             (150.0, -160.0), detection="free", protected=True)
+
+    def test_left_entry_hands_off_before_blocked_center_start(self):
+        mission = self.mission
+        entry, outer_return, center = object(), object(), object()
+        self.namespace["MissionState"] = SimpleNamespace(
+            ROUTE_1=entry, ROUTE_2=outer_return, CENTER=center)
+        mission.entry_route = [(0.0, 0.0), (0.0, 157.0), (150.0, 157.0)]
+        mission._entry_path = mission.entry_route + [(200.0, 157.0)]
+        mission.exit_route = [(200.0, -160.0)]
+        mission.route_index = {entry: 3}
+        mission._nominal_center_start = (200.0, 157.0)
+        mission.navi.current_x, mission.navi.current_y = 150.0, 157.0
+        mission.obstacle.boundary_crossing.return_value = (175.0, 157.0)
+        mission._same_point = lambda a, b: a == b
+        mission._navigate_leg = Mock(return_value=None)
+        self.assertIsNone(mission._follow_route(entry))
+        self.assertEqual(mission._entry_path[-1], (175.0, 157.0))
+        mission.obstacle.boundary_crossing.assert_called_once_with(
+            (150.0, 157.0), (200.0, 157.0), entering=True)
+        mission._navigate_leg.assert_called_once_with(
+            (175.0, 157.0), detection="free", protected=True)
+
+    def test_entry_boundary_before_transition_point_stops_early_on_both_sides(self):
+        for side_y in (-160.0, 157.0):
+            with self.subTest(side_y=side_y):
+                mission = self.mission
+                entry, outer_return, center = object(), object(), object()
+                self.namespace["MissionState"] = SimpleNamespace(
+                    ROUTE_1=entry, ROUTE_2=outer_return, CENTER=center)
+                mission.entry_route = [(0.0, 0.0), (0.0, side_y), (150.0, side_y)]
+                mission._entry_path = mission.entry_route + [(200.0, side_y)]
+                mission.exit_route = [(200.0, -side_y)]
+                mission.route_index = {entry: 2}
+                mission._nominal_center_start = (200.0, side_y)
+                mission.navi.current_x, mission.navi.current_y = 0.0, side_y
+                mission.obstacle.boundary_crossing.return_value = (120.0, side_y)
+                observation = object()
+                mission._navigate_leg = Mock(return_value=observation)
+                self.assertIs(mission._follow_route(entry), observation)
+                self.assertEqual(mission._entry_path[2], (120.0, side_y))
+                mission._navigate_leg.assert_called_once_with(
+                    (120.0, side_y), detection="free", protected=True)
+
+    def test_left_free_return_projects_to_active_route_and_mandatory_exit_uses_route_five(self):
+        mission = self.mission
+        entry = type("Stage", (), {"value": "entry"})()
+        outer_return = type("Stage", (), {"value": "outer return"})()
+        center = object()
+        self.namespace["MissionState"] = SimpleNamespace(
+            ROUTE_1=entry, ROUTE_2=outer_return, CENTER=center)
+        projection = SimpleNamespace(point=(180.0, 157.0), segment_index=2)
+        nearest = Mock(return_value=projection)
+        self.namespace["nearest_point_on_route"] = nearest
+        mission.entry_route = [(0.0, 0.0), (0.0, 157.0), (150.0, 157.0)]
+        mission._entry_path = mission.entry_route + [(200.0, 157.0)]
+        mission.exit_route = [(200.0, -160.0), (0.0, -160.0), (0.0, 0.0)]
+        mission._nominal_center_exit = (200.0, -160.0)
+        mission.route_direction = "left"
+        mission.route_index = {entry: 1, outer_return: 1}
+        mission._navigate_leg = Mock()
+        mission._resume_route(entry)
+        nearest.assert_called_once_with((200.0, 0.0), mission._entry_path)
+        self.assertEqual(mission.route_index[entry], 3)
+        mission._navigate_leg.assert_called_once_with(
+            (180.0, 157.0), protected=True)
+        mission._resume_route(outer_return)
+        self.assertIs(nearest.call_args.args[1], mission.exit_route)
+        mission._escape_center_start = Mock()
+        mission._refresh_center_exit = Mock()
+        mission._navigate_center_exit = type(mission)._navigate_center_exit.__get__(mission)
+        mission._navigate_center_exit()
+        mission._navigate_leg.assert_any_call((200.0, -160.0), protected=True)
 
     def test_payload_sequence_and_yaw_change_desired_pose(self):
         mission = self.mission
@@ -1178,6 +1355,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         center = object()
         self.namespace["MissionState"] = SimpleNamespace(CENTER=center)
         mission.route_3 = [(0, 0), (100, 0)]
+        mission.center_route = mission.route_3
         mission.route_index = {center: 1}
         mission.navi.current_x = 0.0
         mission.navi.traj_running_event.is_set.return_value = False
@@ -1205,6 +1383,45 @@ class CenterMissionOfflineTests(unittest.TestCase):
                          (40.0, 0.0))
         mission._stop_center_worker.assert_called_once_with(first)
         self.assertEqual(mission.route_index[center], 2)
+
+    def test_left_center_uses_same_window_planner_with_route_six_points(self):
+        mission = self.mission
+        center = object()
+        self.namespace["MissionState"] = SimpleNamespace(CENTER=center)
+        mission.center_route = [(200.0, 157.0), (200.0, 93.6)]
+        mission.route_index = {center: 1}
+        mission.navi.current_x, mission.navi.current_y = (200.0, 157.0)
+        mission.navi.traj_running_event.is_set.return_value = False
+        plan = SimpleNamespace(waypoints=((200.0, 93.6),),
+                               anchors=((0, (200.0, 93.6)),),
+                               revision=1, skipped_offsets=())
+        mission.obstacle.plan_route_window.return_value = plan
+        worker = Mock()
+        worker.is_alive.return_value = False
+        def start(_waypoints):
+            mission.navi.current_y = 93.6
+            return worker
+        mission._start_center_path_with_fallback = Mock(side_effect=start)
+        self.assertIsNone(mission._execute_center_route(detect_mandatory=False))
+        mission.obstacle.plan_route_window.assert_called_once_with(
+            (200.0, 157.0), [(200.0, 93.6)])
+        self.assertEqual(mission.route_index[center], 2)
+
+    def test_left_mandatory_failure_resumes_active_center_route(self):
+        mission = self.mission
+        center = object()
+        self.namespace["MissionState"] = SimpleNamespace(CENTER=center)
+        mission.center_route = [(200.0, 157.0), (200.0, 93.6),
+                                (80.0, 93.6), (80.0, 30.2)]
+        mission.route_index = {center: 2}
+        projection = SimpleNamespace(segment_index=2)
+        nearest = Mock(return_value=projection)
+        self.namespace["nearest_point_on_route"] = nearest
+        mission._resume_center_route = type(mission)._resume_center_route.__get__(mission)
+        mission._resume_center_route()
+        nearest.assert_called_once_with(
+            (200.0, 0.0), mission.center_route, minimum_segment=1)
+        self.assertEqual(mission.route_index[center], 3)
 
 
 class WiringTests(unittest.TestCase):
