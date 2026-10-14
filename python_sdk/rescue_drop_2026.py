@@ -1,7 +1,7 @@
 """2026 空地协同救援物资投放赛无人机主入口。
 
 默认通过 FC_Server 连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
-避障接口实现、继电器端口和开始指令。``--car-control`` 从小车接收实际投放配额
+避障接口实现、继电器端口和开始指令。默认从小车接收实际投放配额
 及匹配的启动请求；手动模式使用命令行配额和终端 ``start_mission``。
 机上自启动的 server_ros.py / FC_Server 独占飞控串口，本任务不直连串口。
 
@@ -2089,12 +2089,16 @@ class Mission:
         self.warmup_vision()
         logger.warning("[RESCUE] Confirmed real-flight mission started")
         try:
+            self._check()
             self.navi.pointing_takeoff(TAKEOFF_POINT, target_height=CRUISE_HEIGHT)
+            self._check()
             if not self.navi.wait_for_height(timeout=10):
                 raise RuntimeError("150cm takeoff height was not confirmed")
+            self._check()
             self.navi.set_yaw(0)
             if not self.navi.wait_for_yaw():
                 raise RuntimeError("yaw stabilization was not confirmed")
+            self._check()
             self._navigate_leg(self.entry_route[0])
 
             while self.state is not MissionState.DONE:
@@ -2161,7 +2165,8 @@ class Mission:
             if self.vision is not None:
                 self.vision.close()
         finally:
-            self.navi.stop()
+            if self.navi.running:
+                self.navi.stop()
 
 
 def emergency_land(fc: FC_Like) -> bool:
@@ -2214,8 +2219,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--red-count", type=int)
     parser.add_argument("--blue-count", type=int)
     parser.add_argument("--green-count", type=int)
-    parser.add_argument("--car-control", action="store_true",
-                        help="使用小车 FleetBus 实际配额及启动请求，经 FC_Server/飞控 UART2")
+    parser.add_argument("--car-control", action="store_true", default=True,
+                        help="默认使用小车 FleetBus 实际配额及启动请求，经 FC_Server/飞控 UART2")
     args = parser.parse_args()
     if args.fc_port is not None:
         parser.error("--fc-port cannot be used while FC_Server owns the serial port; "
@@ -2361,6 +2366,19 @@ def main() -> int:
         logger.exception("[RESCUE] Mission failed")
         return 1
     finally:
+        stop_event.set()
+        if (takeoff_attempted and fc is not None and fc.connected
+                and fc.state.unlock.value):
+            if navi is not None:
+                try:
+                    navi.stop()
+                except Exception:
+                    logger.exception("[RESCUE] Failed to stop navigation before landing")
+            try:
+                emergency_land(fc)
+            except Exception:
+                logger.exception("[RESCUE] Emergency landing request failed")
+
         if fleet_node is not None:
             try:
                 fleet_node.close()
@@ -2381,13 +2399,6 @@ def main() -> int:
                 vision.close()
             except Exception:
                 logger.exception("[RESCUE] Failed to close preflight vision")
-
-        if (takeoff_attempted and fc is not None and fc.connected
-                and fc.state.unlock.value):
-            try:
-                emergency_land(fc)
-            except Exception:
-                logger.exception("[RESCUE] Emergency landing request failed")
 
         if relay is not None:
             try:
