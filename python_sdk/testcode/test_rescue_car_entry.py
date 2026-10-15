@@ -74,6 +74,10 @@ class CarEntryTests(unittest.TestCase):
         namespace = dict(argparse=argparse, FC_SERVER_HOST="127.0.0.1", FC_SERVER_PORT=5654, FREE_DROP_COUNT=3,
                          validate_allocation=Mock())
         exec(compile(ast.fix_missing_locations(ast.Module(body=[parse], type_ignores=[])), str(source), "exec"), namespace)
+        with patch.object(sys, "argv", ["rescue", "--confirm-flight", "--route-direction", "left"]):
+            args = namespace["parse_args"]()
+            self.assertTrue(args.car_control)
+            self.assertEqual(args.route_direction, "left")
         with patch.object(sys, "argv", ["rescue", "--car-control", "--confirm-flight"]):
             args = namespace["parse_args"]()
             self.assertTrue(args.confirm_flight)
@@ -88,6 +92,63 @@ class CarEntryTests(unittest.TestCase):
         with patch.object(sys, "argv", ["rescue", "--car-control", "--confirm-flight"]):
             with self.assertRaises(SystemExit):
                 namespace["parse_args"]()
+
+    def test_stop_requests_landing_before_receiver_and_vision_cleanup(self):
+        source = Path(__file__).resolve().parents[1]/"rescue_drop_2026.py"
+        tree = ast.parse(source.read_text(encoding="utf8"))
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        tree = ast.fix_missing_locations(ast.Module(body=[main], type_ignores=[]))
+        events = []
+        fc, payload, mission, navi, node, receiver = [Mock() for _ in range(6)]
+        fc.connected = True
+        fc.state.is_fresh.return_value = True
+        fc.state.unlock.value = False
+        receiver.wait_for_start.return_value = SimpleNamespace(task_id=42, red=0, blue=2, green=1)
+        navi.stop.side_effect = lambda: events.append("navigation_stop")
+        node.close.side_effect = lambda: events.append("receiver_close")
+        mission.stop.side_effect = lambda: events.append("mission_stop")
+        def interrupted():
+            fc.state.unlock.value = True
+            raise RuntimeError("mission stopped")
+        mission.run.side_effect = interrupted
+        namespace = dict(parse_args=lambda: SimpleNamespace(confirm_flight=True, car_control=True,
+            fc_host="127.0.0.1", fc_server_port=5654, relay_port="fake",
+            red_count=None, blue_count=None, green_count=None), threading=threading, time=time, signal=Mock(),
+            FREE_COLORS=("red", "blue", "green"), validate_allocation=lambda r,b,g: dict(red=r,blue=b,green=g),
+            DropLedger=Mock(), VisionInterface=Mock(), ObstaclePlanner2D=Mock(), ObstacleInterface=Mock(),
+            require_flight_interfaces=Mock(), FC_Client=Mock(return_value=fc), Navigation=Mock(return_value=navi),
+            Mission=Mock(return_value=mission), DronePayloadServos=Mock(return_value=payload), validate_drop_plan=Mock(),
+            TOTAL_DROP_COUNT=4,
+            MISSION_TIMEOUT=1200, stop_navigation_ros=Mock(),
+            emergency_land=Mock(side_effect=lambda _: events.append("landing_request")), logger=Mock())
+        exec(compile(tree, str(source), "exec"), namespace)
+        with patch("fleet_bus.rescue_task.attach_rescue_fleet_node", return_value=(node, receiver)):
+            self.assertEqual(namespace["main"](), 1)
+        self.assertEqual(events[:4], ["navigation_stop", "landing_request",
+                                     "receiver_close", "mission_stop"])
+        namespace["emergency_land"].assert_called_once_with(fc)
+        self.assertEqual(payload.open_all.call_count,2)
+
+    def test_stop_at_takeoff_handoff_blocks_following_flight_commands(self):
+        source = Path(__file__).resolve().parents[1]/"rescue_drop_2026.py"
+        tree = ast.parse(source.read_text(encoding="utf8"))
+        mission_class = next(node for node in tree.body
+                             if isinstance(node, ast.ClassDef) and node.name == "Mission")
+        run = next(node for node in mission_class.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "run")
+        tree = ast.fix_missing_locations(ast.Module(body=[run], type_ignores=[]))
+        namespace = dict(TAKEOFF_POINT=(0, 0), CRUISE_HEIGHT=100,
+                         MissionDeadline=type("MissionDeadline", (RuntimeError,), {}), logger=Mock())
+        exec(compile(tree, str(source), "exec"), namespace)
+        for checks, should_take_off in (([None, RuntimeError("stopped")], False),
+                                        ([None, None, RuntimeError("stopped")], True)):
+            navi = Mock()
+            mission = SimpleNamespace(_check=Mock(side_effect=checks),
+                                      start_vision=Mock(), warmup_vision=Mock(), navi=navi)
+            with self.assertRaisesRegex(RuntimeError, "stopped"):
+                namespace["run"](mission)
+            self.assertEqual(navi.pointing_takeoff.call_count, int(should_take_off))
+            navi.wait_for_height.assert_not_called()
 
 
 if __name__ == "__main__":

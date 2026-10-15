@@ -1,7 +1,7 @@
 """2026 空地协同救援物资投放赛无人机主入口。
 
 默认通过 FC_Server 连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
-避障接口实现、已确认的释放映射和开始指令。``--car-control`` 从小车接收实际投放配额
+避障接口实现、已确认的释放映射和开始指令。默认从小车接收实际投放配额
 及匹配的启动请求；手动模式使用命令行配额和终端 ``start_mission``。
 机上自启动的 server_ros.py / FC_Server 独占飞控串口，本任务不直连串口。
 
@@ -36,6 +36,8 @@ TRACK_LENGTH_X_CM = 200.0       # x_2：航迹前后方向长度
 LEFT_SPAN_Y_CM = 157.0          # y_l：航迹起点左侧范围
 RIGHT_SPAN_Y_CM = 160.0         # y_r：航迹起点右侧范围
 CENTER_INSET_X_CM = 80.0        # 航迹 3 折返到距航迹起点前方 80 cm
+# 航迹 1/4 在名义中心起点前 50 cm 进入避障预检测交接段。
+CENTER_ENTRY_TRANSITION_CM = 50.0  # 航迹 1/4 末段交给中心避障预检测的距离
 # 目标地面高度相对起飞前 LIO 标定平面；更换场地时须重新测量这两项。
 FREE_TARGET_GROUND_HEIGHT_CM = 0.0
 MANDATORY_TARGET_GROUND_HEIGHT_CM = 30.0
@@ -637,16 +639,25 @@ def validate_allocation(red: int, blue: int, green: int) -> Dict[str, int]:
     return counts
 
 
-def build_routes() -> Tuple[List[Point], List[Point], List[Point]]:
-    """返回导航绝对坐标中的航迹 1、3、2，保留所有直角拐点。"""
+def build_routes(route_direction: str = "right",
+                 transition_cm: Optional[float] = None) -> Tuple[List[Point], List[Point], List[Point]]:
+    """返回进入、中心、退出航迹；左行按同一组折返点反向推进。"""
+    if route_direction not in ("right", "left"):
+        raise ValueError("route direction must be right or left")
+    if transition_cm is None:
+        transition_cm = CENTER_ENTRY_TRANSITION_CM
+    if not 0.0 <= transition_cm < TRACK_LENGTH_X_CM:
+        raise ValueError("center entry transition must be within track length")
     origin_x = TRACK_START_OFFSET_X_CM
-    span = LEFT_SPAN_Y_CM + RIGHT_SPAN_Y_CM
-    route_1 = [
+    entry_y, exit_y = ((-RIGHT_SPAN_Y_CM, LEFT_SPAN_Y_CM)
+                       if route_direction == "right"
+                       else (LEFT_SPAN_Y_CM, -RIGHT_SPAN_Y_CM))
+    entry_route = [
         (origin_x, 0.0),
-        (origin_x, -RIGHT_SPAN_Y_CM),
-        (origin_x + TRACK_LENGTH_X_CM, -RIGHT_SPAN_Y_CM),
+        (origin_x, entry_y),
+        (origin_x + TRACK_LENGTH_X_CM - transition_cm, entry_y),
     ]
-    route_3 = [route_1[-1]]
+    center_route = [(origin_x + TRACK_LENGTH_X_CM, entry_y)]
     # 题目原式写作 (y, x)；此处转成 Navigation 使用的 (x, y)。
     for fraction, x in (
         (0.2, TRACK_LENGTH_X_CM), (0.2, CENTER_INSET_X_CM),
@@ -655,13 +666,14 @@ def build_routes() -> Tuple[List[Point], List[Point], List[Point]]:
         (0.8, CENTER_INSET_X_CM), (0.8, TRACK_LENGTH_X_CM),
         (1.0, TRACK_LENGTH_X_CM),
     ):
-        route_3.append((origin_x + x, fraction * span - RIGHT_SPAN_Y_CM))
-    route_2 = [
-        route_3[-1],
-        (origin_x, LEFT_SPAN_Y_CM),
+        center_route.append((origin_x + x,
+                             entry_y + fraction * (exit_y - entry_y)))
+    exit_route = [
+        center_route[-1],
+        (origin_x, exit_y),
         (origin_x, 0.0),
     ]
-    return route_1, route_3, route_2
+    return entry_route, center_route, exit_route
 
 
 def nearest_point_on_route(point: Point, route: Sequence[Point],
@@ -791,7 +803,8 @@ class Mission:
     def __init__(self, fc: FC_Like, navi: Navigation,
                  payload: Optional[DronePayloadServos], vision: Optional[VisionInterface],
                  obstacle: Optional[ObstacleInterface], allocation: Dict[str, int],
-                 stop_event: threading.Event, vision_diagnostics: bool = True):
+                 stop_event: threading.Event, vision_diagnostics: bool = True,
+                 route_direction: str = "right"):
         self.fc = fc
         self.navi = navi
         self.payload = payload
@@ -801,9 +814,24 @@ class Mission:
         self.stop_event = stop_event
         self.vision_diagnostics = vision_diagnostics
         self._vision_diag_recent = []
-        self.route_1, self.route_3, self.route_2 = build_routes()
-        self._nominal_center_start = self.route_3[0]
-        self._nominal_center_exit = self.route_3[-1]
+        self.route_direction = route_direction
+        self.route_1, self.route_3, self.route_2 = build_routes(
+            "right", CENTER_ENTRY_TRANSITION_CM)
+        self.route_4, self.route_6, self.route_5 = build_routes(
+            "left", CENTER_ENTRY_TRANSITION_CM)
+        if route_direction == "right":
+            self.entry_route, self.center_route, self.exit_route = (
+                self.route_1, self.route_3, self.route_2)
+        elif route_direction == "left":
+            self.entry_route, self.center_route, self.exit_route = (
+                self.route_4, self.route_6, self.route_5)
+        else:
+            raise ValueError("route direction must be right or left")
+        self._entry_path = list(self.entry_route)
+        if not self._same_point(self.entry_route[-1], self.center_route[0]):
+            self._entry_path.append(self.center_route[0])
+        self._nominal_center_start = self.center_route[0]
+        self._nominal_center_exit = self.center_route[-1]
         self.route_index = {MissionState.ROUTE_1: 1,
                             MissionState.CENTER: 1,
                             MissionState.ROUTE_2: 1}
@@ -1044,31 +1072,42 @@ class Mission:
             # 避障给出新的中间航点，或完成中间航点后继续向原目标前进。
 
     def _follow_route(self, state: MissionState) -> Optional[TargetObservation]:
-        route = {MissionState.ROUTE_1: self.route_1,
-                 MissionState.ROUTE_2: self.route_2}[state]
+        route = {MissionState.ROUTE_1: self._entry_path,
+                 MissionState.ROUTE_2: self.exit_route}[state]
         while self.route_index[state] < len(route):
             self._check()
             goal = route[self.route_index[state]]
             protected = (state is MissionState.ROUTE_2
                          and self.route_index[state] == 1
-                         and not self._same_point(self.route_2[0],
+                         and not self._same_point(self.exit_route[0],
                                                   self._nominal_center_exit))
-            # 航迹 1 的最后一段是右侧拐点 -> 名义航迹 3 起点；仅交接点可前移。
-            if state is MissionState.ROUTE_1 and self.route_index[state] == len(route) - 1:
+            # 保留原有的整段前视检查：膨胀区若早于预检测点，先停在边界。
+            if (state is MissionState.ROUTE_1
+                    and self.route_index[state] >= len(self.entry_route) - 1):
                 if self.obstacle is None:
-                    raise RuntimeError("obstacle interface missing at route-3 entry")
+                    raise RuntimeError("obstacle interface missing at center entry")
                 self._escape_center_start()
                 handoff = self.obstacle.boundary_crossing(
                     self._position(), self._nominal_center_start, entering=True)
                 if handoff is None:
-                    raise RuntimeError("no safe route-3 entry boundary")
-                route[-1] = handoff
-                goal = handoff
-                protected = not self._same_point(handoff, self._nominal_center_start)
-                if protected:
-                    logger.warning("[CENTER] Route-1 ends at inflation boundary {} "
-                                   "instead of blocked route-3 start {}",
-                                   handoff, self._nominal_center_start)
+                    raise RuntimeError("no safe center entry boundary")
+                if self.route_index[state] == len(route) - 1:
+                    route[-1] = handoff
+                    goal = handoff
+                    protected = not self._same_point(handoff, self._nominal_center_start)
+                    if protected:
+                        logger.warning("[CENTER] Entry ends at inflation boundary {} "
+                                       "instead of blocked center start {}",
+                                       handoff, self._nominal_center_start)
+                elif math.hypot(handoff[0] - self.navi.current_x,
+                                handoff[1] - self.navi.current_y) < math.hypot(
+                                    goal[0] - self.navi.current_x,
+                                    goal[1] - self.navi.current_y) - 1.0:
+                    route[self.route_index[state]] = handoff
+                    goal = handoff
+                    protected = True
+                    logger.warning("[CENTER] Inflation boundary {} precedes "
+                                   "entry transition point", handoff)
             observation = self._navigate_leg(
                 goal, detection="free", protected=protected)
             if observation is not None:
@@ -1118,23 +1157,23 @@ class Mission:
 
     def _refresh_center_exit(self) -> None:
         if self.obstacle is None:
-            raise RuntimeError("obstacle interface missing at route-3 exit")
+            raise RuntimeError("obstacle interface missing at center exit")
         nominal = self._nominal_center_exit
         if not self.obstacle.point_is_inflated(nominal):
-            if not self._same_point(self.route_3[-1], nominal):
-                logger.info("[CENTER] Nominal route-3 exit {} clear again", nominal)
-                self.route_3[-1] = nominal
-                self.route_2[0] = nominal
+            if not self._same_point(self.center_route[-1], nominal):
+                logger.info("[CENTER] Nominal center exit {} clear again", nominal)
+                self.center_route[-1] = nominal
+                self.exit_route[0] = nominal
             return
         boundary = self.obstacle.boundary_crossing(
-            nominal, self.route_2[1], entering=False)
+            nominal, self.exit_route[1], entering=False)
         if boundary is None or self.obstacle.point_is_inflated(boundary):
-            raise RuntimeError("no free route-3 exit on following route-2 segment")
-        if not self._same_point(self.route_3[-1], boundary):
-            logger.warning("[CENTER] Route-3 exit {} inflated; move endpoint "
-                           "and route-2 start to {}", nominal, boundary)
-        self.route_3[-1] = boundary
-        self.route_2[0] = boundary
+            raise RuntimeError("no free center exit on following outer segment")
+        if not self._same_point(self.center_route[-1], boundary):
+            logger.warning("[CENTER] Center exit {} inflated; move endpoint "
+                           "and outer return start to {}", nominal, boundary)
+        self.center_route[-1] = boundary
+        self.exit_route[0] = boundary
 
     def _start_center_path_with_fallback(self, waypoints: Sequence[Point]) -> threading.Thread:
         if self.obstacle is None:
@@ -1214,12 +1253,12 @@ class Mission:
     def _execute_center_route(self, detect_mandatory: bool) -> Optional[TargetObservation]:
         if self.obstacle is None:
             raise RuntimeError("obstacle interface missing")
-        while self.route_index[MissionState.CENTER] < len(self.route_3):
+        while self.route_index[MissionState.CENTER] < len(self.center_route):
             self._check()
             self._escape_center_start()
             self._refresh_center_exit()
             base_index = self.route_index[MissionState.CENTER]
-            if self._at_waypoint(self._position(), self.route_3[base_index]):
+            if self._at_waypoint(self._position(), self.center_route[base_index]):
                 if detect_mandatory:
                     observation = self._observation(color=MANDATORY_COLOR)
                     if (observation is not None
@@ -1229,13 +1268,13 @@ class Mission:
                 continue
             try:
                 plan = self.obstacle.plan_route_window(
-                    self._position(), self.route_3[base_index:])
+                    self._position(), self.center_route[base_index:])
             except Exception:
                 self.navi.navigation_stop_here()
                 raise
             if plan is None or not plan.waypoints:
                 self.navi.navigation_stop_here()
-                raise RuntimeError("no safe route-3 window")
+                raise RuntimeError("no safe center route window")
             logger.info("[CENTER] Window revision={} anchors={} skipped={}",
                         plan.revision, plan.anchors, plan.skipped_offsets)
             try:
@@ -1290,9 +1329,9 @@ class Mission:
     def _navigate_center_exit(self) -> None:
         self._escape_center_start()
         self._refresh_center_exit()
-        goal = self.route_2[0]
-        logger.info("[MANDATORY] Exit toward route-2 start: current={} goal={}",
-                    self._position(), goal)
+        goal = self.exit_route[0]
+        logger.info("[MANDATORY] Exit toward {} outer return start: current={} goal={}",
+                    self.route_direction, self._position(), goal)
         self.navi.stop_move()  # 完成全部必投后才恢复航迹导航 PID
         self._navigate_leg(goal, protected=True)
 
@@ -1311,22 +1350,28 @@ class Mission:
         if state is MissionState.CENTER:
             self._resume_center_route()
             return
-        route = {MissionState.ROUTE_1: self.route_1,
-                 MissionState.ROUTE_2: self.route_2}[state]
+        route = {MissionState.ROUTE_1: self._entry_path,
+                 MissionState.ROUTE_2: self.exit_route}[state]
         self._check()
         projection = nearest_point_on_route(self._position(), route)
         logger.info("[RESCUE] Return to {} segment {} at {}",
                     state.value, projection.segment_index, projection.point)
-        self._navigate_leg(projection.point)
+        protected = ((state is MissionState.ROUTE_1
+                      and projection.segment_index >= len(self.entry_route) - 1)
+                     or (state is MissionState.ROUTE_2
+                         and projection.segment_index == 0
+                         and not self._same_point(self.exit_route[0],
+                                                  self._nominal_center_exit)))
+        self._navigate_leg(projection.point, protected=protected)
         self.route_index[state] = projection.segment_index + 1
 
     def _resume_center_route(self) -> None:
         self._check()
         index = self.route_index[MissionState.CENTER]
-        if index >= len(self.route_3):
+        if index >= len(self.center_route):
             return
         projection = nearest_point_on_route(
-            self._position(), self.route_3, minimum_segment=max(0, index - 1))
+            self._position(), self.center_route, minimum_segment=max(0, index - 1))
         self.route_index[MissionState.CENTER] = max(index, projection.segment_index + 1)
         logger.info("[CENTER] Resume from current position at route index {}",
                     self.route_index[MissionState.CENTER])
@@ -2067,17 +2112,27 @@ class Mission:
         self.warmup_vision()
         logger.warning("[RESCUE] Confirmed real-flight mission started")
         try:
+            self._check()
             self.navi.pointing_takeoff(TAKEOFF_POINT, target_height=CRUISE_HEIGHT)
+            self._check()
             if not self.navi.wait_for_height(timeout=10):
                 raise RuntimeError("150cm takeoff height was not confirmed")
+            self._check()
             self.navi.set_yaw(0)
             if not self.navi.wait_for_yaw():
                 raise RuntimeError("yaw stabilization was not confirmed")
-            self._navigate_leg(self.route_1[0])
+            self._check()
+            self._navigate_leg(self.entry_route[0])
 
             while self.state is not MissionState.DONE:
                 self._check()
-                logger.info("[RESCUE] State: {}", self.state.value)
+                state_label = self.state.value
+                if self.route_direction == "left":
+                    if self.state is MissionState.ROUTE_1:
+                        state_label = "沿线飞行（左飞、前飞）"
+                    elif self.state is MissionState.ROUTE_2:
+                        state_label = "沿线飞行（后飞、左飞）"
+                logger.info("[RESCUE] State: {}", state_label)
                 if self.state is MissionState.ROUTE_1:
                     self.target = self._follow_route(self.state)
                     if self.target is None:
@@ -2133,7 +2188,8 @@ class Mission:
             if self.vision is not None:
                 self.vision.close()
         finally:
-            self.navi.stop()
+            if self.navi.running:
+                self.navi.stop()
 
 
 def emergency_land(fc: FC_Like) -> bool:
@@ -2168,6 +2224,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="2026 救援物资投放无人机主入口")
     parser.add_argument("--confirm-flight", action="store_true",
                         help="启用真实飞行；默认仅监视 LIO 位姿")
+    parser.add_argument("--route-direction", choices=("right", "left"),
+                        default="right", help="任务航迹方向，默认 right（航迹 1→3→2）")
     parser.add_argument("--fc-host", default=FC_SERVER_HOST,
                         help="FC_Server 地址；机上自启动服务默认在本机")
     parser.add_argument("--fc-server-port", type=int, default=FC_SERVER_PORT,
@@ -2182,8 +2240,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--red-count", type=int)
     parser.add_argument("--blue-count", type=int)
     parser.add_argument("--green-count", type=int)
-    parser.add_argument("--car-control", action="store_true",
-                        help="使用小车 FleetBus 实际配额及启动请求，经 FC_Server/飞控 UART2")
+    parser.add_argument("--car-control", action="store_true", default=True,
+                        help="默认使用小车 FleetBus 实际配额及启动请求，经 FC_Server/飞控 UART2")
     args = parser.parse_args()
     if args.fc_port is not None:
         parser.error("--fc-port cannot be used while FC_Server owns the serial port; "
@@ -2279,7 +2337,8 @@ def main() -> int:
                           obstacle_planner=obstacle_planner,
                           height_source="lio")
         mission = Mission(fc, navi, payload, vision, obstacle, allocation, stop_event,
-                          vision_diagnostics=getattr(args, "vision_diagnostics", True))
+                          vision_diagnostics=getattr(args, "vision_diagnostics", True),
+                          route_direction=getattr(args, "route_direction", "right"))
         if args.car_control:
             from fleet_bus.rescue_task import attach_rescue_fleet_node
             fleet_node, task_receiver = attach_rescue_fleet_node(
@@ -2323,6 +2382,18 @@ def main() -> int:
                 logger.info("[RESCUE] Finally PAYLOAD OPEN SENT (no mechanical feedback)")
             except Exception:
                 logger.exception("[RESCUE] Finally payload OPEN failed")
+        if (takeoff_attempted and fc is not None and fc.connected
+                and fc.state.unlock.value):
+            if navi is not None:
+                try:
+                    navi.stop()
+                except Exception:
+                    logger.exception("[RESCUE] Failed to stop navigation before landing")
+            try:
+                emergency_land(fc)
+            except Exception:
+                logger.exception("[RESCUE] Emergency landing request failed")
+
         if task_receiver is not None and not task_receiver.join_remap(timeout=35.0):
             logger.error("[RESCUE] Remap cancellation pending; no navigation reuse")
         if fleet_node is not None:
@@ -2346,12 +2417,6 @@ def main() -> int:
             except Exception:
                 logger.exception("[RESCUE] Failed to close preflight vision")
 
-        if (takeoff_attempted and fc is not None and fc.connected
-                and fc.state.unlock.value):
-            try:
-                emergency_land(fc)
-            except Exception:
-                logger.exception("[RESCUE] Emergency landing request failed")
 
         if navi is not None:
             try:
