@@ -1,0 +1,1 @@
+fc ALL=(root) NOPASSWD: /usr/bin/systemctl restart mid360s-fastlio.service

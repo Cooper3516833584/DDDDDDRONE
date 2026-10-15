@@ -143,6 +143,23 @@ class RescueLinkTests(unittest.TestCase):
         self.assertEqual(self.receiver.remap_state,'cancelled')
         self.assertEqual(self.receiver.close_payload(123,7)[0],AckStatus.REJECTED)
 
+    def test_fastlio_instance_or_calibration_failure_never_becomes_ready(self):
+        for failure in (RuntimeError('new FAST-LIO instance unavailable'),
+                        RuntimeError('calibration timed out')):
+            with self.subTest(failure=str(failure)):
+                receiver = RescueTaskReceiver(threading.Event(), allow_start=True,
+                    payload=self.payload, fc=self.fc, navigation=self.navi,
+                    validate_plan=lambda: None)
+                self.assertEqual(receiver.close_payload(123, 7)[0], AckStatus.COMPLETED)
+                receiver.set_task(123, DropTask(42, 2, 1, 0))
+                with patch('fastlio_control.restart_and_calibrate_fastlio',
+                           side_effect=failure):
+                    self.assertEqual(receiver.rebuild_map(123, 7)[0], AckStatus.ACCEPTED)
+                    self.assertTrue(receiver.join_remap(1))
+                self.assertEqual(receiver.remap_state, 'failed')
+                self.assertEqual(receiver.request_start(123, 42),
+                                 (AckStatus.REJECTED, AckReason.NOT_READY))
+
     def test_start_requires_current_run_ready_and_physical_mapping(self):
         self.receiver.set_task(123,DropTask(42,2,1,0))
         self.assertEqual(self.receiver.request_start(123,42)[0],AckStatus.REJECTED)
