@@ -112,7 +112,7 @@ class CarEntryTests(unittest.TestCase):
         module = ast.fix_missing_locations(ast.Module(body=[main], type_ignores=[]))
         namespace = dict(parse_args=lambda: SimpleNamespace(confirm_flight=True, car_control=True),
             threading=threading, signal=Mock(), FREE_COLORS=("red", "blue", "green"),
-            TOTAL_DROP_COUNT=4, PAYLOAD_COUNT=4,
+            TOTAL_DROP_COUNT=2, PAYLOAD_COUNT=4,
             sys=SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: False)),
             FC_Client=Mock(), STM32Servos=Mock(), VisionInterface=Mock(), logger=Mock())
         exec(compile(module, str(source), "exec"), namespace)
@@ -145,9 +145,9 @@ class CarEntryTests(unittest.TestCase):
         def prepare_navigation(**_kwargs):
             self.assertTrue(navi.pose_is_fresh(), "LIO must be restored after model loading")
         mission.prepare_navigation.side_effect = prepare_navigation
-        receiver.wait_for_start.return_value = SimpleNamespace(task_id=42, red=0, blue=2, green=1)
+        receiver.wait_for_start.return_value = SimpleNamespace(task_id=42, red=0, blue=0, green=1)
         receiver.remap_state = "ready"
-        allocation = dict(red=0, blue=2, green=1)
+        allocation = dict(red=0, blue=0, green=1)
         ledger = Mock(return_value=allocation)
         def run():
             self.assertEqual(mission.ledger, allocation)
@@ -162,7 +162,7 @@ class CarEntryTests(unittest.TestCase):
             require_flight_interfaces=Mock(), FC_Client=Mock(return_value=fc), Navigation=Mock(return_value=navi),
             Mission=Mock(return_value=mission), STM32Servos=Mock(return_value=payload),
             validate_drop_plan=Mock(),
-            TOTAL_DROP_COUNT=4, PAYLOAD_COUNT=4,
+            TOTAL_DROP_COUNT=2, PAYLOAD_COUNT=4,
             MISSION_TIMEOUT=1200,
             wait_for_operator_command=Mock(side_effect=lambda word, *_: events.append(word)),
             connect_stm32_until_ready=Mock(side_effect=lambda p, *_: p.connect()),
@@ -235,7 +235,7 @@ class CarEntryTests(unittest.TestCase):
         future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
         import argparse
         namespace = dict(argparse=argparse, FC_SERVER_HOST="127.0.0.1",
-                         FC_SERVER_PORT=5654, FREE_DROP_COUNT=3)
+                         FC_SERVER_PORT=5654, FREE_DROP_COUNT=1)
         module = ast.fix_missing_locations(ast.Module(body=[future, validate, parse], type_ignores=[]))
         exec(compile(module, str(source), "exec"), namespace)
         with patch.object(sys, "argv", ["rescue", "--confirm-flight", "--route-direction", "left"]):
@@ -253,11 +253,11 @@ class CarEntryTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 namespace["parse_args"]()
         with patch.object(sys, "argv", ["rescue", "--manual-control", "--confirm-flight",
-                                        "--red-count", "1", "--blue-count", "1",
+                                        "--red-count", "0", "--blue-count", "0",
                                         "--green-count", "1"]):
             args = namespace["parse_args"]()
             self.assertFalse(args.car_control)
-            self.assertEqual((args.red_count, args.blue_count, args.green_count), (1, 1, 1))
+            self.assertEqual((args.red_count, args.blue_count, args.green_count), (0, 0, 1))
         with patch.object(sys, "argv", ["rescue", "--manual-control", "--confirm-flight",
                                         "--red-count", "1", "--blue-count", "1",
                                         "--green-count", "0"]):
@@ -288,7 +288,7 @@ class CarEntryTests(unittest.TestCase):
         payload.connected = True
         payload.get_states.return_value = {channel: False for channel in range(1, 5)}
         preflight_result = dict(needs_calibration=False, pose={"stamp_ns": 123})
-        receiver.wait_for_start.return_value = SimpleNamespace(task_id=42, red=0, blue=2, green=1)
+        receiver.wait_for_start.return_value = SimpleNamespace(task_id=42, red=0, blue=0, green=1)
         navi.stop.side_effect = lambda: events.append("navigation_stop")
         node.close.side_effect = lambda: events.append("receiver_close")
         mission.stop.side_effect = lambda: events.append("mission_stop")
@@ -304,7 +304,7 @@ class CarEntryTests(unittest.TestCase):
             DropLedger=Mock(), VisionInterface=Mock(), ObstaclePlanner2D=Mock(), ObstacleInterface=Mock(),
             require_flight_interfaces=Mock(), FC_Client=Mock(return_value=fc), Navigation=Mock(return_value=navi),
             Mission=Mock(return_value=mission), STM32Servos=Mock(return_value=payload), validate_drop_plan=Mock(),
-            TOTAL_DROP_COUNT=4, PAYLOAD_COUNT=4,
+            TOTAL_DROP_COUNT=2, PAYLOAD_COUNT=4,
             wait_for_operator_command=Mock(),
             connect_stm32_until_ready=Mock(side_effect=lambda p, *_: p.connect()),
             MISSION_TIMEOUT=1200, stop_navigation_ros=Mock(),

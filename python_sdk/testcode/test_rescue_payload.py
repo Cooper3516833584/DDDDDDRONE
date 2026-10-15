@@ -17,12 +17,12 @@ class ReleaseTests(unittest.TestCase):
         mission.body=[n for n in mission.body if isinstance(n,ast.FunctionDef) and n.name in ('_drop','_skip_unconfigured_drop','_free_drop','_mandatory_drop','log_drop_summary','validate_payload_ready','_check')]
         future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
         tree=ast.fix_missing_locations(ast.Module(body=[future,mapping,ledger,mission],type_ignores=[]))
-        self.names=dict(TOTAL_DROP_COUNT=4,MANDATORY_DROP_COUNT=1,MANDATORY_COLOR='yellow',
+        self.names=dict(TOTAL_DROP_COUNT=2,MANDATORY_DROP_COUNT=1,MANDATORY_COLOR='yellow',
             FREE_COLORS=('red','blue','green'),logger=Mock(),slot_for_drop_attempt=Mock(return_value=2),drop_plan_ready=Mock(return_value=True),
             validate_drop_plan=Mock(return_value=True),
             time=SimpleNamespace(strftime=lambda *args:'2026-10-15 15:00:00',localtime=lambda:None))
         exec(compile(tree,str(source),'exec'),self.names)
-        self.ledger=self.names['DropLedger'](dict(red=1,blue=1,green=1))
+        self.ledger=self.names['DropLedger'](dict(red=0,blue=1,green=0))
         self.mission=self.names['Mission']()
         self.mission.ledger=self.ledger
         self.mission.payload=Mock()
@@ -49,9 +49,9 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'STM32 servo connection lost'):
             self.names['Mission']._check(self.mission)
 
-    def test_four_attempts_and_quota_are_preserved(self):
+    def test_two_attempts_and_quota_are_preserved(self):
         self.assertEqual([self.ledger.record_attempt(color) for color in
-                         ('red','yellow','blue','green')],[1,2,3,4])
+                         ('blue','yellow')],[1,2])
         with self.assertRaisesRegex(RuntimeError,'quota'):
             self.ledger.record_attempt('red')
 
@@ -65,13 +65,13 @@ class ReleaseTests(unittest.TestCase):
             self.mission._drop('blue','target',True)
         self.mission.payload.open_servo.assert_called_once()
 
-    def test_four_visual_slots_map_to_measured_stm32_channels(self):
+    def test_two_production_slots_map_to_measured_stm32_channels(self):
         self.assertEqual(self.names['STM32_CHANNEL_BY_SLOT'], (2,1,3,4))
-        self.names['slot_for_drop_attempt'].side_effect=(0,1,2,3)
-        for color in ('red','yellow','blue','green'):
+        self.names['slot_for_drop_attempt'].side_effect=(0,1)
+        for color in ('blue','yellow'):
             self.mission._drop(color,'target',True)
         self.assertEqual([call.args[0] for call in self.mission.payload.open_servo.call_args_list],
-                         [2,1,3,4])
+                         [2,1])
 
     def test_end_summary_has_only_four_color_counts_in_order(self):
         self.mission._drop('blue','target',True)
@@ -138,7 +138,7 @@ class RecognitionFilterTests(unittest.TestCase):
                    TARGET_CAMERA_READ_FAILURES=10,time=SimpleNamespace(monotonic=lambda:1.,time=lambda:1.))
         exec(compile(module,str(source),'exec'),names)
         instance=names['VisionInterface']()
-        instance.set_allocation(dict(red=2,blue=0,green=1))
+        instance.set_allocation(dict(red=0,blue=0,green=1))
         instance._camera=Mock()
         instance._camera.read.return_value=(True,object())
         instance._detector=Mock()
@@ -146,4 +146,24 @@ class RecognitionFilterTests(unittest.TestCase):
                                               ('red','blue','green','yellow')]
         instance._track=Mock(return_value=())
         instance.poll()
-        self.assertEqual([d.color for d in instance._track.call_args.args[0]],['red','green','yellow'])
+        self.assertEqual([d.color for d in instance._track.call_args.args[0]],['green','yellow'])
+
+
+class AllocationTests(unittest.TestCase):
+    def test_production_quota_is_one_optional_and_one_yellow(self):
+        tree = ast.parse((Path(__file__).resolve().parents[1]/'rescue_drop_2026.py').read_text(encoding='utf8'))
+        names = {'FREE_DROP_COUNT','MANDATORY_DROP_COUNT','TOTAL_DROP_COUNT'}
+        body = [node for node in tree.body if
+                (isinstance(node,ast.Assign) and isinstance(node.targets[0],ast.Name)
+                 and node.targets[0].id in names) or
+                (isinstance(node,ast.FunctionDef) and node.name == 'validate_allocation')]
+        future = ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
+        module = ast.fix_missing_locations(ast.Module(body=[future]+body,type_ignores=[]))
+        namespace = {}
+        exec(compile(module,'quota','exec'),namespace)
+        self.assertEqual(namespace['TOTAL_DROP_COUNT'],2)
+        validate = namespace['validate_allocation']
+        for counts in ((1,0,0),(0,1,0),(0,0,1)):
+            self.assertEqual(tuple(validate(*counts).values()),counts)
+        for counts in ((2,0,1),(1,1,1),(0,0,0),(True,0,0),(-1,1,1)):
+            with self.subTest(counts=counts), self.assertRaises(ValueError): validate(*counts)

@@ -79,7 +79,7 @@ class DirectionalRoutesOfflineTests(unittest.TestCase):
         parse_args = next(node for node in tree.body
                           if isinstance(node, ast.FunctionDef) and node.name == "parse_args")
         namespace = {"argparse": __import__("argparse"),
-                     "FC_SERVER_HOST": "127.0.0.1", "FC_SERVER_PORT": 5654, "FREE_DROP_COUNT": 3}
+                     "FC_SERVER_HOST": "127.0.0.1", "FC_SERVER_PORT": 5654, "FREE_DROP_COUNT": 1}
         exec(compile(ast.fix_missing_locations(
             ast.Module(body=[parse_args], type_ignores=[])), str(source), "exec"), namespace)
         for argv, expected in ((["rescue"], "right"),

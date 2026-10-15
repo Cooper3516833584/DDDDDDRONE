@@ -111,7 +111,7 @@ MANDATORY_REBIND_MAX_DISTANCE_CM = 30.0  # 只接续原目标附近的新黄色�
 MANDATORY_REBIND_MIN_FRAMES = 2
 TARGET_CAMERA_READ_FAILURES = 10  # 连续读帧失败达到该次数即判定相机失效
 
-FREE_DROP_COUNT = 3  # 红蓝绿合计3件，另有黄色必投1件，共4件
+FREE_DROP_COUNT = 1  # 小车分配的单件选投目标，另有黄色必投1件，共2件
 MANDATORY_DROP_COUNT = 1
 TOTAL_DROP_COUNT = FREE_DROP_COUNT + MANDATORY_DROP_COUNT
 # 投放槽位按 0°、72°、144°、216° 逆时针排列；对应实测 STM32 通道。
@@ -649,7 +649,7 @@ def validate_allocation(red: int, blue: int, green: int) -> Dict[str, int]:
            for value in counts.values()):
         raise ValueError("red/blue/green counts must be non-negative integers")
     if sum(counts.values()) != FREE_DROP_COUNT:
-        raise ValueError("free-target counts must total 3")
+        raise ValueError("free-target counts must total 1")
     return counts
 
 
@@ -2282,8 +2282,8 @@ def parse_args() -> argparse.Namespace:
                      "use --fc-host and --fc-server-port")
     if not 1 <= args.fc_server_port <= 65535:
         parser.error("--fc-server-port must be between 1 and 65535")
-    if args.car_control and FREE_DROP_COUNT != 3:
-        parser.error("--car-control requires the competition's three free-drop items; "
+    if args.car_control and FREE_DROP_COUNT != 1:
+        parser.error("--car-control requires the competition's one free-drop item; "
                      "it is unavailable in altered-quota test entries")
     if args.car_control and any(count is not None for count in (
             args.red_count, args.blue_count, args.green_count)):
@@ -2292,7 +2292,7 @@ def parse_args() -> argparse.Namespace:
         if any(count is None for count in (
                 args.red_count, args.blue_count, args.green_count)):
             parser.error("--confirm-flight requires --red-count, --blue-count "
-                         "and --green-count; their sum must be 3")
+                         "and --green-count; their sum must be 1")
         try:
             validate_allocation(args.red_count, args.blue_count, args.green_count)
         except ValueError as exc:
@@ -2377,8 +2377,8 @@ def main() -> int:
 
     try:
         if args.confirm_flight:
-            if TOTAL_DROP_COUNT != PAYLOAD_COUNT:
-                raise RuntimeError("drop count does not match four servo payload slots")
+            if not 1 <= TOTAL_DROP_COUNT <= PAYLOAD_COUNT:
+                raise RuntimeError("drop count exceeds available servo payload slots")
             if not sys.stdin.isatty():
                 raise RuntimeError("loaded/position_ok require an interactive terminal")
             if not args.car_control:
