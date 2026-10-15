@@ -1103,9 +1103,9 @@ class Mission:
                          and self.route_index[state] == 1
                          and not self._same_point(self.exit_route[0],
                                                   self._nominal_center_exit))
-            # 保留原有的整段前视检查：膨胀区若早于预检测点，先停在边界。
+            # 沿线前飞到距名义入口 50 cm 的航点后，才检查入口交接段。
             if (state is MissionState.ROUTE_1
-                    and self.route_index[state] >= len(self.entry_route) - 1):
+                    and self.route_index[state] == len(route) - 1):
                 if self.obstacle is None:
                     raise RuntimeError("obstacle interface missing at center entry")
                 self._escape_center_start()
@@ -1113,23 +1113,13 @@ class Mission:
                     self._position(), self._nominal_center_start, entering=True)
                 if handoff is None:
                     raise RuntimeError("no safe center entry boundary")
-                if self.route_index[state] == len(route) - 1:
-                    route[-1] = handoff
-                    goal = handoff
-                    protected = not self._same_point(handoff, self._nominal_center_start)
-                    if protected:
-                        logger.warning("[CENTER] Entry ends at inflation boundary {} "
-                                       "instead of blocked center start {}",
-                                       handoff, self._nominal_center_start)
-                elif math.hypot(handoff[0] - self.navi.current_x,
-                                handoff[1] - self.navi.current_y) < math.hypot(
-                                    goal[0] - self.navi.current_x,
-                                    goal[1] - self.navi.current_y) - 1.0:
-                    route[self.route_index[state]] = handoff
-                    goal = handoff
-                    protected = True
-                    logger.warning("[CENTER] Inflation boundary {} precedes "
-                                   "entry transition point", handoff)
+                route[-1] = handoff
+                goal = handoff
+                protected = not self._same_point(handoff, self._nominal_center_start)
+                if protected:
+                    logger.warning("[CENTER] Entry ends at inflation boundary {} "
+                                   "instead of blocked center start {}",
+                                   handoff, self._nominal_center_start)
             observation = self._navigate_leg(
                 goal, detection="free", protected=protected)
             if observation is not None:

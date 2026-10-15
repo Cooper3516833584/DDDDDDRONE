@@ -1279,7 +1279,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission._navigate_leg.assert_called_once_with(
             (175.0, 157.0), detection="free", protected=True)
 
-    def test_entry_boundary_before_transition_point_stops_early_on_both_sides(self):
+    def test_entry_lookahead_starts_after_transition_waypoint_on_both_sides(self):
         for side_y in (-160.0, 157.0):
             with self.subTest(side_y=side_y):
                 mission = self.mission
@@ -1292,13 +1292,26 @@ class CenterMissionOfflineTests(unittest.TestCase):
                 mission.route_index = {entry: 2}
                 mission._nominal_center_start = (200.0, side_y)
                 mission.navi.current_x, mission.navi.current_y = 0.0, side_y
-                mission.obstacle.boundary_crossing.return_value = (120.0, side_y)
-                observation = object()
-                mission._navigate_leg = Mock(return_value=observation)
-                self.assertIs(mission._follow_route(entry), observation)
-                self.assertEqual(mission._entry_path[2], (120.0, side_y))
-                mission._navigate_leg.assert_called_once_with(
-                    (120.0, side_y), detection="free", protected=True)
+                mission.obstacle.boundary_crossing.reset_mock()
+                mission.obstacle.boundary_crossing.return_value = (175.0, side_y)
+                mission._same_point = lambda a, b: a == b
+
+                def arrive(goal, **_kwargs):
+                    mission.navi.current_x, mission.navi.current_y = goal
+                    return None
+
+                mission._navigate_leg = Mock(side_effect=arrive)
+                self.assertIsNone(mission._follow_route(entry))
+                self.assertEqual(mission._entry_path[2], (150.0, side_y))
+                self.assertEqual(mission._navigate_leg.call_count, 2)
+                self.assertEqual(mission._navigate_leg.call_args_list[0][0],
+                                 ((150.0, side_y),))
+                self.assertEqual(mission._navigate_leg.call_args_list[0][1],
+                                 {"detection": "free", "protected": False})
+                mission.obstacle.boundary_crossing.assert_called_once_with(
+                    (150.0, side_y), (200.0, side_y), entering=True)
+                mission._navigate_leg.assert_any_call(
+                    (175.0, side_y), detection="free", protected=True)
 
     def test_left_free_return_projects_to_active_route_and_mandatory_exit_uses_route_five(self):
         mission = self.mission
