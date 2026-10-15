@@ -14,7 +14,7 @@ LOG = logging.getLogger(__name__)
 
 class RescueTaskReceiver:
     def __init__(self, stop_event, *, allow_start=False, payload=None, fc=None,
-                 navigation=None, validate_plan=None):
+                 navigation=None, validate_plan=None, preflight_result=None):
         self.stop_event = stop_event
         self.allow_start = allow_start
         self._condition = threading.Condition()
@@ -23,6 +23,7 @@ class RescueTaskReceiver:
         self._started = False
         self.payload, self.fc, self.navigation = payload, fc, navigation
         self._validate_plan = validate_plan
+        self._preflight_result = preflight_result
         self._payload_lock = threading.RLock()
         self.run_id = None
         self._run_session = None
@@ -48,12 +49,17 @@ class RescueTaskReceiver:
                         (AckStatus.FAILED, AckReason.INTERNAL_ERROR))
             self.run_id, self._run_session = run_id, session
             try:
-                self.payload.close_all()
+                if self._preflight_result is None:
+                    self.payload.close_all()
+                elif (not self.payload.connected or
+                      self.payload.get_states() != {channel: False for channel in range(1, 5)}):
+                    raise RuntimeError('operator-loaded STM32 targets are not all closed')
                 if self.stop_event.is_set():
-                    self.payload.open_all()
+                    if self._preflight_result is None:
+                        self.payload.open_all()
                     return AckStatus.REJECTED, AckReason.NOT_READY
                 self.close_done = True
-                LOG.info("DRONE CLOSE SENT run_id=%d (no mechanical feedback)", run_id)
+                LOG.info("DRONE CLOSE confirmed run_id=%d (no mechanical feedback)", run_id)
                 return AckStatus.COMPLETED, AckReason.NONE
             except Exception:
                 LOG.exception("DRONE CLOSE failed run_id=%d", run_id)
@@ -65,6 +71,21 @@ class RescueTaskReceiver:
                     (run_id, session) != (self.run_id, self._run_session)):
                 return AckStatus.REJECTED, AckReason.NOT_READY
             if self.remap_state == 'idle':
+                if self._preflight_result is not None:
+                    try:
+                        ready = (self._preflight_result.get('needs_calibration') is False and
+                                 bool(self._preflight_result.get('pose')) and
+                                 self.navigation.running and self.navigation.pose_is_fresh() and
+                                 self.navigation.height_is_fresh())
+                    except Exception:
+                        LOG.exception('DRONE prepared LIO readiness check failed')
+                        return AckStatus.FAILED, AckReason.INTERNAL_ERROR
+                    if not ready:
+                        return AckStatus.REJECTED, AckReason.NOT_READY
+                    self.remap_result = self._preflight_result
+                    self.remap_state = 'ready'
+                    LOG.info('DRONE NEW LIO confirmed run_id=%d', run_id)
+                    return AckStatus.ACCEPTED, AckReason.NONE
                 self.remap_state = 'running'
                 self._remap_worker = threading.Thread(target=self._rebuild,
                     name='rescue-remap', daemon=True)
@@ -121,12 +142,22 @@ class RescueTaskReceiver:
 
     def request_start(self, session, task_id):
         with self._condition:
-            if (self.stop_event.is_set() or not self.allow_start or self._task is None
+            if self.stop_event.is_set():
+                return AckStatus.REJECTED, AckReason.NOT_READY
+            if self._started:
+                return ((AckStatus.ACCEPTED, AckReason.NONE)
+                        if self._session == session and self._task.task_id == task_id else
+                        (AckStatus.REJECTED, AckReason.NOT_READY))
+            if (not self._ground_ready() or not self.allow_start or self._task is None
                     or self._session != session or self._task.task_id != task_id
                     or self._run_session != session or not self.close_done
                     or self.remap_state != 'ready'):
                 return AckStatus.REJECTED, AckReason.NOT_READY
             try:
+                if (self._preflight_result is not None and
+                        (not self.navigation.running or not self.navigation.pose_is_fresh()
+                         or not self.navigation.height_is_fresh())):
+                    raise RuntimeError('operator-prepared LIO pose is stale')
                 if self._validate_plan is None:
                     raise RuntimeError('physical release plan validator missing')
                 if self._validate_plan() is False:
@@ -208,9 +239,10 @@ class RescueFleetNode(AirFleetNode):
 
 
 def attach_rescue_fleet_node(fc, navigation, stop_event, *, allow_start=False, payload=None,
-                            validate_plan=None):
+                            validate_plan=None, preflight_result=None):
     receiver = RescueTaskReceiver(stop_event, allow_start=allow_start, payload=payload,
-        fc=fc, navigation=navigation, validate_plan=validate_plan)
+        fc=fc, navigation=navigation, validate_plan=validate_plan,
+        preflight_result=preflight_result)
     node = attach_air_fleet_node(fc, navigation, stop_event, readonly=True,
         controller_node=NodeId.CAR,
         node_factory=lambda *args, **kwargs: RescueFleetNode(*args, receiver=receiver, **kwargs))

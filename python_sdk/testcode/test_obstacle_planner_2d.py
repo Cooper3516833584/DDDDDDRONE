@@ -1560,11 +1560,11 @@ class WiringTests(unittest.TestCase):
         for flight in (False, True):
             with self.subTest(flight=flight):
                 fc, payload, mission, vision = Mock(), Mock(), Mock(), Mock()
-                fc.connect.side_effect = lambda **kwargs: self.assertEqual(
-                    vision.prime.call_count, int(flight))
                 fc.connected = True
                 fc.state.is_fresh.return_value = True
                 fc.state.unlock.value = False
+                payload.connected = True
+                payload.get_states.return_value = {channel: False for channel in range(1, 5)}
                 planner = Mock()
                 namespace = {"parse_args": lambda: SimpleNamespace(confirm_flight=flight, car_control=False,
                              red_count=2, blue_count=1, green_count=1,
@@ -1575,14 +1575,20 @@ class WiringTests(unittest.TestCase):
                              "ObstaclePlanner2D": Mock(return_value=planner),
                              "ObstacleInterface": Mock(), "require_flight_interfaces": Mock(),
                              "FC_Client": Mock(return_value=fc), "Navigation": Mock(),
-                             "Mission": Mock(return_value=mission), "DronePayloadServos": Mock(return_value=payload),
+                             "Mission": Mock(return_value=mission), "STM32Servos": Mock(return_value=payload),
                              "validate_drop_plan": Mock(), "signal": Mock(),
+                             "sys": SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: True)),
                              "TOTAL_DROP_COUNT": 4, "PAYLOAD_COUNT": 4,
                              "MISSION_TIMEOUT": 1200,
-                                "wait_for_start_command": Mock(), "time": module.time, "logger": Mock(),
+                             "wait_for_start_command": Mock(), "wait_for_operator_command": Mock(),
+                             "connect_stm32_until_ready": Mock(side_effect=lambda p, *_: p.connect()),
+                             "time": module.time, "logger": Mock(),
                              "stop_navigation_ros": Mock()}
                 exec(compile(tree, str(source), "exec"), namespace)
-                self.assertEqual(namespace["main"](), 0)
+                fake_fastlio = SimpleNamespace(restart_and_calibrate_fastlio=Mock(
+                    return_value=dict(needs_calibration=False, pose={"stamp_ns": 123})))
+                with patch.dict(sys.modules, {"fastlio_control": fake_fastlio}):
+                    self.assertEqual(namespace["main"](), 0)
                 fc.connect.assert_called_once_with(
                     host="127.0.0.1", port=5654, authkey=b"fc",
                     print_state=False, block=True, timeout=10)
@@ -1598,8 +1604,11 @@ class WiringTests(unittest.TestCase):
                 else:
                     mission.monitor_pose.assert_called_once()
                     payload.close_all.assert_not_called()
-                    namespace["DronePayloadServos"].assert_not_called()
+                    namespace["STM32Servos"].assert_not_called()
                 self.assertEqual(payload.open_all.call_count,2 if flight else 0)
+                self.assertEqual(payload.connect.call_count,1 if flight else 0)
+                self.assertEqual(payload.close.call_count,1 if flight else 0)
+                fc.set_PWM_output.assert_not_called()
 
 
 if __name__ == "__main__":

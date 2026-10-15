@@ -12,11 +12,14 @@ class ReleaseTests(unittest.TestCase):
         tree=ast.parse(source.read_text(encoding='utf8'))
         ledger=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='DropLedger')
         mission=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Mission')
-        mission.body=[n for n in mission.body if isinstance(n,ast.FunctionDef) and n.name in ('_drop','_skip_unconfigured_drop','_free_drop','_mandatory_drop','log_drop_summary')]
+        mapping=next(n for n in tree.body if isinstance(n,ast.Assign) and
+                     any(isinstance(t,ast.Name) and t.id=='STM32_CHANNEL_BY_SLOT' for t in n.targets))
+        mission.body=[n for n in mission.body if isinstance(n,ast.FunctionDef) and n.name in ('_drop','_skip_unconfigured_drop','_free_drop','_mandatory_drop','log_drop_summary','validate_payload_ready','_check')]
         future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
-        tree=ast.fix_missing_locations(ast.Module(body=[future,ledger,mission],type_ignores=[]))
+        tree=ast.fix_missing_locations(ast.Module(body=[future,mapping,ledger,mission],type_ignores=[]))
         self.names=dict(TOTAL_DROP_COUNT=4,MANDATORY_DROP_COUNT=1,MANDATORY_COLOR='yellow',
             FREE_COLORS=('red','blue','green'),logger=Mock(),slot_for_drop_attempt=Mock(return_value=2),drop_plan_ready=Mock(return_value=True),
+            validate_drop_plan=Mock(return_value=True),
             time=SimpleNamespace(strftime=lambda *args:'2026-10-15 15:00:00',localtime=lambda:None))
         exec(compile(tree,str(source),'exec'),self.names)
         self.ledger=self.names['DropLedger'](dict(red=1,blue=1,green=1))
@@ -26,6 +29,26 @@ class ReleaseTests(unittest.TestCase):
         self.mission._check=Mock()
         self.mission._completed_free_colors=set()
 
+    def test_start_requires_connected_stm32(self):
+        self.mission.payload.connected=False
+        with self.assertRaisesRegex(RuntimeError,'STM32 servo connection'):
+            self.mission.validate_payload_ready()
+        self.names['validate_drop_plan'].assert_not_called()
+        self.mission.payload.connected=True
+        self.assertTrue(self.mission.validate_payload_ready())
+        self.names['validate_drop_plan'].assert_called_once_with()
+
+    def test_known_stm32_disconnect_stops_mission_check(self):
+        self.mission.stop_event=Mock()
+        self.mission.stop_event.is_set.return_value=False
+        self.mission._vision_error=None
+        self.mission.fc=Mock()
+        self.mission.fc.connected=True
+        self.mission.fc.state.is_fresh.return_value=True
+        self.mission.payload.connected=False
+        with self.assertRaisesRegex(RuntimeError,'STM32 servo connection lost'):
+            self.names['Mission']._check(self.mission)
+
     def test_four_attempts_and_quota_are_preserved(self):
         self.assertEqual([self.ledger.record_attempt(color) for color in
                          ('red','yellow','blue','green')],[1,2,3,4])
@@ -34,13 +57,21 @@ class ReleaseTests(unittest.TestCase):
 
     def test_release_writes_only_mapped_slot(self):
         self.mission._drop('blue','target',True)
-        self.mission.payload.open_slot.assert_called_once_with(2)
+        self.mission.payload.open_servo.assert_called_once_with(3)
         self.mission.payload.open_all.assert_not_called()
         self.assertEqual(self.ledger.remaining['blue'],0)
         self.assertEqual(self.ledger.sent['blue'],1)
         with self.assertRaisesRegex(RuntimeError,'quota'):
             self.mission._drop('blue','target',True)
-        self.mission.payload.open_slot.assert_called_once()
+        self.mission.payload.open_servo.assert_called_once()
+
+    def test_four_visual_slots_map_to_measured_stm32_channels(self):
+        self.assertEqual(self.names['STM32_CHANNEL_BY_SLOT'], (2,1,3,4))
+        self.names['slot_for_drop_attempt'].side_effect=(0,1,2,3)
+        for color in ('red','yellow','blue','green'):
+            self.mission._drop(color,'target',True)
+        self.assertEqual([call.args[0] for call in self.mission.payload.open_servo.call_args_list],
+                         [2,1,3,4])
 
     def test_end_summary_has_only_four_color_counts_in_order(self):
         self.mission._drop('blue','target',True)
@@ -60,11 +91,11 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.ledger.remaining['blue'],0)
         self.assertEqual(self.ledger.skipped,[(1,'blue')])
         self.assertEqual(self.ledger.sent['blue'],0)
-        self.mission.payload.open_slot.assert_not_called()
+        self.mission.payload.open_servo.assert_not_called()
 
     def test_failed_ipc_consumes_attempt_instead_of_claiming_retry_cargo(self):
-        self.mission.payload.open_slot.side_effect=RuntimeError('IPC failed')
-        with self.assertRaisesRegex(RuntimeError,'IPC failed'):
+        self.mission.payload.open_servo.side_effect=RuntimeError('STM32 ACK missing')
+        with self.assertRaisesRegex(RuntimeError,'STM32 ACK missing'):
             self.mission._drop('blue','target',True)
         self.assertEqual(self.ledger.next_drop_number,2)
         self.assertEqual(self.ledger.remaining['blue'],0)
@@ -81,7 +112,7 @@ class ReleaseTests(unittest.TestCase):
         self.mission._resume_route.assert_called_once_with('route')
         self.mission._approach_target.assert_not_called()
         self.mission._set_height.assert_not_called()
-        self.mission.payload.open_slot.assert_not_called()
+        self.mission.payload.open_servo.assert_not_called()
 
     def test_unknown_yellow_skips_drop_and_continues_to_center_exit(self):
         self.names['drop_plan_ready'].return_value=False

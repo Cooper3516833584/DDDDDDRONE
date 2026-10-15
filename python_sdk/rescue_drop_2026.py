@@ -3,6 +3,7 @@
 默认通过 FC_Server 连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
 避障接口实现、已确认的释放映射和开始指令。默认从小车接收实际投放配额
 及匹配的启动请求；手动模式使用命令行配额和终端 ``start_mission``。
+实飞通过交互式终端依次输入 ``loaded``、``position_ok``，随后重建 FAST-LIO 位姿。
 机上自启动的 server_ros.py / FC_Server 独占飞控串口，本任务不直连串口。
 
 导航坐标单位为 cm，x 向前、y 向左；高度单位为 cm。
@@ -11,6 +12,7 @@
 
 import argparse
 import math
+import select
 import signal
 import sys
 import threading
@@ -25,9 +27,10 @@ from loguru import logger
 from FlightController import FC_Client, FC_Like
 from FlightController.Components import LD_Radar
 from FlightController.Components.ObstaclePlanner2D import ObstaclePlanner2D
-from payload_servos import (DronePayloadServos, slot_for_drop_attempt, validate_drop_plan,
+from payload_servos import (slot_for_drop_attempt, validate_drop_plan,
                             drop_plan_ready, PAYLOAD_COUNT, PAYLOAD_ANGLES_DEG,
                             PAYLOAD_RADIUS_CM)
+from stm32_servos import STM32Servos
 from FlightController.Solutions.Navigation import Navigation
 
 
@@ -58,6 +61,7 @@ TAKEOFF_POINT = (0.0, 0.0)
 LANDING_HEIGHT_TIMEOUT = 8.0
 LIO_POSE_READY_TIMEOUT = 15.0
 MONITOR_INTERVAL = 1.0
+STM32_CONNECT_RETRY_S = 2.0
 
 # 视觉初值沿用 former_code/2026_disaster_survey.py；超时和丢失等待由用户指定。
 VISUAL_CENTER_THRESHOLD_PX = 30.0  # 巡航接近结束、开始下降的像素距离
@@ -110,6 +114,8 @@ TARGET_CAMERA_READ_FAILURES = 10  # 连续读帧失败达到该次数即判定�
 FREE_DROP_COUNT = 3  # 红蓝绿合计3件，另有黄色必投1件，共4件
 MANDATORY_DROP_COUNT = 1
 TOTAL_DROP_COUNT = FREE_DROP_COUNT + MANDATORY_DROP_COUNT
+# 投放槽位按 0°、72°、144°、216° 逆时针排列；对应实测 STM32 通道。
+STM32_CHANNEL_BY_SLOT = (2, 1, 3, 4)
 CAMERA_VIEW_REFERENCE_HEIGHT_CM = 160.0  # 高度 160cm 时长边视野 300cm
 CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT = 300.0
 FREE_COLORS = ("red", "blue", "green")
@@ -810,7 +816,7 @@ def wait_for_radar_pose(navi, radar, timeout=15.0, newer_than=0.0):
 
 class Mission:
     def __init__(self, fc: FC_Like, navi: Navigation,
-                 payload: Optional[DronePayloadServos], vision: Optional[VisionInterface],
+                 payload: Optional[STM32Servos], vision: Optional[VisionInterface],
                  obstacle: Optional[ObstacleInterface], allocation: Dict[str, int],
                  stop_event: threading.Event, vision_diagnostics: bool = True,
                  route_direction: str = "right"):
@@ -986,6 +992,11 @@ class Mission:
         self._vision_diag_recent.append((key, current))
         del self._vision_diag_recent[:-4]
 
+    def validate_payload_ready(self) -> bool:
+        if self.payload is None or not self.payload.connected:
+            raise RuntimeError("STM32 servo connection is not ready")
+        return validate_drop_plan()
+
     def _check(self, check_deadline: bool = True) -> None:
         if self.stop_event.is_set():
             raise RuntimeError("mission stopped")
@@ -995,6 +1006,8 @@ class Mission:
             raise RuntimeError("FC_Server connection lost")
         if not self.fc.state.is_fresh(0.5):
             raise RuntimeError("flight-controller telemetry is stale")
+        if self.payload is not None and not self.payload.connected:
+            raise RuntimeError("STM32 servo connection lost")
         if not self.navi.pose_is_fresh():
             raise RuntimeError("LIO navigation pose is stale")
         if not self.navi.height_is_fresh():
@@ -1914,12 +1927,13 @@ class Mission:
             raise RuntimeError("payload missing")
         # Unknown/reused mechanisms fail before a cargo attempt is consumed.
         slot = slot_for_drop_attempt(self.ledger.next_drop_number)
+        channel = STM32_CHANNEL_BY_SLOT[slot]
         drop_number = self.ledger.record_attempt(color)
-        logger.info("[DROP] Attempt {} slot={} target={} color={} position_confirmed={}",
-                    drop_number, slot, target_id, color, position_confirmed)
-        self.payload.open_slot(slot)
+        logger.info("[DROP] Attempt {} slot={} stm32_channel={} target={} color={} position_confirmed={}",
+                    drop_number, slot, channel, target_id, color, position_confirmed)
+        self.payload.open_servo(channel)
         self.ledger.sent[color] += 1
-        logger.info("[DROP] OPEN SENT slot={} (release not sensor-verified)", slot)
+        logger.info("[DROP] OPEN ACK stm32_channel={} (release not sensor-verified)", channel)
         # 只在该颜色的指定投掷次数均已尝试后，禁止再次进入自由投掷。
         if color in FREE_COLORS and not self.ledger.has_quota(color):
             self._completed_free_colors.add(color)
@@ -2305,13 +2319,49 @@ def wait_for_start_command() -> None:
         logger.warning("[RESCUE] Ignored command; enter exactly start_mission")
 
 
+def wait_for_operator_command(expected: str, stop_event: threading.Event) -> None:
+    """Read a confirmation from a real terminal while remaining responsive to STOP."""
+    logger.warning("[RESCUE] Enter {} in this terminal to continue", expected)
+    while not stop_event.is_set():
+        ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+        if not ready:
+            continue
+        command = sys.stdin.readline()
+        if not command:
+            raise RuntimeError("operator terminal closed while waiting for " + expected)
+        command = command.rstrip("\r\n")
+        if command == expected:
+            return
+        logger.warning("[RESCUE] Ignored command; enter exactly {}", expected)
+    raise RuntimeError("task stopped while waiting for " + expected)
+
+
+def connect_stm32_until_ready(payload: STM32Servos, fc: FC_Client,
+                              stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        if not fc.connected or not fc.state.is_fresh(0.5) or fc.state.unlock.value:
+            raise RuntimeError("FC telemetry/lock lost while waiting for STM32")
+        try:
+            payload.connect()
+            return
+        except Exception as exc:
+            logger.warning("[RESCUE] STM32 connect/handshake failed: {}; retry in {:.0f}s",
+                           exc, STM32_CONNECT_RETRY_S)
+            try:
+                payload.close()
+            except Exception:
+                logger.exception("[RESCUE] Failed to close STM32 link before retry")
+            stop_event.wait(STM32_CONNECT_RETRY_S)
+    raise RuntimeError("task stopped while waiting for STM32")
+
+
 def main() -> int:
     args = parse_args()
     stop_event = threading.Event()
     previous_sigterm = signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     fc: Optional[FC_Client] = None
     navi: Optional[Navigation] = None
-    payload: Optional[DronePayloadServos] = None
+    payload: Optional[STM32Servos] = None
     mission: Optional[Mission] = None
     takeoff_attempted = False
     allocation = {color: 0 for color in FREE_COLORS}
@@ -2320,11 +2370,14 @@ def main() -> int:
     obstacle_planner = None
     fleet_node = None
     task_receiver = None
+    preflight_result = None
 
     try:
         if args.confirm_flight:
             if TOTAL_DROP_COUNT != PAYLOAD_COUNT:
                 raise RuntimeError("drop count does not match four servo payload slots")
+            if not sys.stdin.isatty():
+                raise RuntimeError("loaded/position_ok require an interactive terminal")
             if not args.car_control:
                 allocation = validate_allocation(
                     args.red_count, args.blue_count, args.green_count)
@@ -2332,7 +2385,6 @@ def main() -> int:
             obstacle_planner = ObstaclePlanner2D()
             obstacle = ObstacleInterface(obstacle_planner)
             require_flight_interfaces(vision, obstacle)
-            vision.prime()
 
         fc = FC_Client()
         fc.connect(host=args.fc_host, port=args.fc_server_port, authkey=b"fc",
@@ -2348,24 +2400,51 @@ def main() -> int:
             raise RuntimeError("flight controller already unlocked; refuse takeover")
 
         if args.confirm_flight:
-            payload = DronePayloadServos(fc)
-            try:
-                payload.open_all()
-                logger.info("[RESCUE] Startup PAYLOAD OPEN SENT (no mechanical feedback)")
-            except Exception:
-                logger.exception("[RESCUE] Startup payload OPEN failed")
+            payload = STM32Servos()
+            connect_stm32_until_ready(payload, fc, stop_event)
+            if stop_event.is_set() or not fc.connected or not fc.state.is_fresh(0.5) or fc.state.unlock.value:
+                raise RuntimeError("FC lock/telemetry lost before payload open")
+            payload.open_all()
+            logger.info("[RESCUE] Startup STM32 PAYLOAD OPEN ACK (no mechanical feedback)")
+            wait_for_operator_command("loaded", stop_event)
+            if stop_event.is_set() or not fc.connected or not fc.state.is_fresh(0.5) or fc.state.unlock.value:
+                raise RuntimeError("FC lock/telemetry lost before payload close")
+            payload.close_all()
+            if payload.get_states() != {channel: False for channel in range(1, 5)}:
+                raise RuntimeError("STM32 did not report all four payload targets closed")
+            logger.info("[RESCUE] All four STM32 payload targets CLOSED (no mechanical feedback)")
+            wait_for_operator_command("position_ok", stop_event)
         navi = Navigation(fc=fc, stop_event=stop_event,
                           obstacle_planner=obstacle_planner,
                           height_source="lio")
+        if args.confirm_flight:
+            from fastlio_control import restart_and_calibrate_fastlio
+
+            if stop_event.is_set():
+                raise RuntimeError("task stopped before FAST-LIO rebuild")
+            navi.start()
+            preflight_result = restart_and_calibrate_fastlio(fc, navi, timeout=45)
+            if (preflight_result.get("needs_calibration") is not False
+                    or not preflight_result.get("pose")):
+                raise RuntimeError("new FAST-LIO pose/calibration is not ready")
         mission = Mission(fc, navi, payload, vision, obstacle, allocation, stop_event,
                           vision_diagnostics=getattr(args, "vision_diagnostics", True),
                           route_direction=getattr(args, "route_direction", "right"))
+        if args.confirm_flight:
+            mission.prepare_navigation(remap_ready=True)
+            vision.prime()
+            if not args.car_control:
+                logger.warning("[RESCUE] FAST-LIO 位姿重建成功")
         if args.car_control:
             from fleet_bus.rescue_task import attach_rescue_fleet_node
             fleet_node, task_receiver = attach_rescue_fleet_node(
                 fc, navi, stop_event, allow_start=args.confirm_flight, payload=payload,
-                validate_plan=validate_drop_plan)
-            logger.info("[RESCUE] Listening for CLOSE, REMAP, quota and matching START")
+                validate_plan=mission.validate_payload_ready,
+                preflight_result=preflight_result)
+            if args.confirm_flight:
+                logger.warning("[RESCUE] FAST-LIO 位姿重建成功；无线接收已就绪，现在可启动小车")
+            else:
+                logger.info("[RESCUE] Waiting for car task information and matching START")
             if not args.confirm_flight:
                 mission.prepare_navigation()
                 mission.monitor_pose()
@@ -2376,12 +2455,12 @@ def main() -> int:
             mission.prepare_navigation(remap_ready=task_receiver.remap_state == 'ready')
             logger.info("[RESCUE] Car task {} allocation {}", task.task_id, allocation)
         else:
-            mission.prepare_navigation()
+            if not args.confirm_flight:
+                mission.prepare_navigation()
             if not args.confirm_flight:
                 mission.monitor_pose()
                 return 0
-            validate_drop_plan()
-            payload.close_all()
+            mission.validate_payload_ready()
             wait_for_start_command()
         vision.set_allocation(allocation)
         mission.deadline = time.monotonic() + MISSION_TIMEOUT
@@ -2414,9 +2493,13 @@ def main() -> int:
                 locked = (fc is not None and fc.connected
                           and fc.state.is_fresh(0.5)
                           and not fc.state.unlock.value)
-                if locked:
+                if locked and payload.connected and takeoff_attempted:
                     payload.open_all()
-                    logger.info("[RESCUE] Locked PAYLOAD OPEN SENT (no mechanical feedback)")
+                    logger.info("[RESCUE] Locked STM32 PAYLOAD OPEN ACK (no mechanical feedback)")
+                elif locked and payload.connected:
+                    logger.info("[RESCUE] No takeoff; retain last STM32 payload target state")
+                elif locked:
+                    logger.error("[RESCUE] STM32 disconnected; keep remaining payloads closed")
                 else:
                     logger.error("[RESCUE] Lock not confirmed; keep remaining payloads closed")
             except Exception:
@@ -2444,6 +2527,12 @@ def main() -> int:
                 vision.close()
             except Exception:
                 logger.exception("[RESCUE] Failed to close preflight vision")
+
+        if payload is not None:
+            try:
+                payload.close()
+            except Exception:
+                logger.exception("[RESCUE] Failed to close STM32 servo serial connection")
 
 
         if navi is not None:

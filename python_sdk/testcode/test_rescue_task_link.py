@@ -127,6 +127,66 @@ class RescueLinkTests(unittest.TestCase):
             self.assertEqual(self.request(CommandId.DRONE_REBUILD_MAP,body,seq=100),ack)
             restart.assert_called_once_with(self.fc,self.navi,timeout=45)
 
+    def test_operator_preflight_car_commands_only_acknowledge_completed_work(self):
+        self.payload.connected = True
+        self.payload.get_states.return_value = {channel: False for channel in range(1, 5)}
+        self.navi.pose_is_fresh.return_value = True
+        self.navi.height_is_fresh.return_value = True
+        result = dict(needs_calibration=False, pose={'stamp_ns': 123})
+        self.receiver = RescueTaskReceiver(self.stop_event, allow_start=True,
+            payload=self.payload, fc=self.fc, navigation=self.navi,
+            validate_plan=lambda: None, preflight_result=result)
+        self.node.receiver = self.receiver
+        body = struct.pack('<BI', 1, 7)
+        self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK,
+                         encode_drop_task(DropTask(42, 2, 1, 0))).status, AckStatus.COMPLETED)
+        with patch('fastlio_control.restart_and_calibrate_fastlio') as restart:
+            self.assertEqual(self.request(CommandId.DRONE_PAYLOAD_CLOSE, body).status,
+                             AckStatus.COMPLETED)
+            self.assertEqual(self.request(CommandId.DRONE_REBUILD_MAP, body).status,
+                             AckStatus.ACCEPTED)
+            self.assertEqual(self.request(CommandId.DRONE_REBUILD_MAP, body).status,
+                             AckStatus.COMPLETED)
+            self.assertEqual(self.request(CommandId.DRONE_START_DROP_TASK,
+                             encode_drop_start(42)).status, AckStatus.ACCEPTED)
+            restart.assert_not_called()
+        self.payload.close_all.assert_not_called()
+        self.payload.open_all.assert_not_called()
+        self.payload.get_states.assert_called_once_with()
+        self.assertIs(self.receiver.remap_result, result)
+
+    def test_operator_preflight_refuses_open_payload_or_stale_pose(self):
+        self.payload.connected = True
+        self.payload.get_states.return_value = {1: True, 2: False, 3: False, 4: False}
+        self.navi.pose_is_fresh.return_value = True
+        self.navi.height_is_fresh.return_value = True
+        self.receiver = RescueTaskReceiver(self.stop_event, allow_start=True,
+            payload=self.payload, fc=self.fc, navigation=self.navi,
+            validate_plan=lambda: None,
+            preflight_result=dict(needs_calibration=False, pose={'stamp_ns': 123}))
+        self.node.receiver = self.receiver
+        self.receiver.set_task(123, DropTask(42, 2, 1, 0))
+        self.assertEqual(self.receiver.close_payload(123, 7)[0], AckStatus.FAILED)
+        self.assertEqual(self.receiver.request_start(123, 42)[0], AckStatus.REJECTED)
+        self.payload.get_states.return_value = {channel: False for channel in range(1, 5)}
+        self.receiver = RescueTaskReceiver(self.stop_event, allow_start=True,
+            payload=self.payload, fc=self.fc, navigation=self.navi,
+            validate_plan=lambda: None,
+            preflight_result=dict(needs_calibration=False, pose={'stamp_ns': 123}))
+        self.receiver.set_task(123, DropTask(42, 2, 1, 0))
+        self.assertEqual(self.receiver.close_payload(123, 7)[0], AckStatus.COMPLETED)
+        self.navi.pose_is_fresh.return_value = False
+        self.assertEqual(self.receiver.rebuild_map(123, 7),
+                         (AckStatus.REJECTED, AckReason.NOT_READY))
+        self.navi.pose_is_fresh.side_effect = RuntimeError('pose unavailable')
+        self.assertEqual(self.receiver.rebuild_map(123, 7),
+                         (AckStatus.FAILED, AckReason.INTERNAL_ERROR))
+        self.navi.pose_is_fresh.side_effect = None
+        self.navi.pose_is_fresh.return_value = True
+        self.assertEqual(self.receiver.rebuild_map(123, 7)[0], AckStatus.ACCEPTED)
+        self.navi.height_is_fresh.return_value = False
+        self.assertEqual(self.receiver.request_start(123, 42)[0], AckStatus.REJECTED)
+
     def test_stop_during_remap_cannot_become_ready_or_close_again(self):
         self.ready()
         self.receiver.remap_state='idle'
