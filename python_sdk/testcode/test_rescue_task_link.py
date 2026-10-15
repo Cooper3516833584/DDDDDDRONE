@@ -3,7 +3,9 @@ from pathlib import Path
 import sys
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+import struct
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fleet_bus.command_queue import AirCommandQueue
@@ -16,7 +18,12 @@ from fleet_bus.rescue_task import RescueFleetNode, RescueTaskReceiver
 class RescueLinkTests(unittest.TestCase):
     def setUp(self):
         self.stop_event = threading.Event()
-        self.receiver = RescueTaskReceiver(self.stop_event, allow_start=True)
+        self.payload = Mock()
+        self.fc = SimpleNamespace(connected=True, state=SimpleNamespace(
+            is_fresh=lambda age: True, unlock=SimpleNamespace(value=False)))
+        self.navi = Mock(running=True)
+        self.receiver = RescueTaskReceiver(self.stop_event, allow_start=True, payload=self.payload,
+            fc=self.fc, navigation=self.navi, validate_plan=lambda: None)
         self.node = RescueFleetNode(Mock(), lambda: AirFleetState(0, 0), AirCommandQueue(),
                                    self.stop_event, receiver=self.receiver)
         self.seq = 0
@@ -32,17 +39,22 @@ class RescueLinkTests(unittest.TestCase):
         self.assertEqual(frame.dst, source)
         return decode_ack(frame.payload)
 
+    def ready(self):
+        self.assertEqual(self.receiver.close_payload(123, 7)[0], AckStatus.COMPLETED)
+        self.receiver.remap_state = 'ready'
+
     def test_counts_saved_before_start_no_localization_required(self):
-        task = DropTask(42, 0, 1, 3)
+        self.ready()
+        task = DropTask(42, 0, 1, 2)
         self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(task)).status, AckStatus.COMPLETED)
         self.assertEqual(self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42)).status, AckStatus.ACCEPTED)
-        self.assertEqual(self.receiver.wait_for_start(.01).allocation(), dict(red=0, blue=1, green=3))
+        self.assertEqual(self.receiver.wait_for_start(.01).allocation(), dict(red=0, blue=1, green=2))
 
     def test_missing_mismatched_task_or_controller_session_never_starts(self):
         for session, task_id in ((123, 42), (124, 41)):
             ack = self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(task_id), session=session)
             self.assertEqual((ack.status, ack.reason), (AckStatus.REJECTED, AckReason.NOT_READY))
-        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(41, 2, 1, 1)))
+        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(41, 2, 1, 0)))
         self.assertEqual(self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42)).status, AckStatus.REJECTED)
         self.assertEqual(self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(41), session=124).status, AckStatus.REJECTED)
         with self.assertRaises(TimeoutError):
@@ -50,10 +62,11 @@ class RescueLinkTests(unittest.TestCase):
 
     def test_ground_station_cannot_directly_supply_tasks(self):
         self.assertIsNone(self.request(CommandId.DRONE_SET_DROP_TASK,
-                         encode_drop_task(DropTask(42, 1, 2, 1)), source=NodeId.GROUND))
+                         encode_drop_task(DropTask(42, 1, 1, 1)), source=NodeId.GROUND))
 
     def test_duplicate_task_and_start_do_not_reinitialize_active_task(self):
-        body = encode_drop_task(DropTask(42, 1, 2, 1))
+        self.ready()
+        body = encode_drop_task(DropTask(42, 1, 1, 1))
         ack1 = self.request(CommandId.DRONE_SET_DROP_TASK, body, seq=10)
         self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK, body, seq=10), ack1)
         self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42))
@@ -61,24 +74,95 @@ class RescueLinkTests(unittest.TestCase):
         self.assertEqual(self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42)).status, AckStatus.ACCEPTED)
         self.assertIs(self.receiver.wait_for_start(.01), task)
         self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK,
-                         encode_drop_task(DropTask(43, 2, 1, 1))).reason, AckReason.BUSY)
+                         encode_drop_task(DropTask(43, 2, 1, 0))).reason, AckReason.BUSY)
 
     def test_bad_data_and_same_id_changed_quota_rejected(self):
-        for data in (b"", b"\x01\x2a\0\0\0\x01\x01\x01", b"\x02\x2a\0\0\0\x02\x01\x01"):
+        for data in (b"", b"\x01\x2a\0\0\0\x02\x01\x01", b"\x02\x2a\0\0\0\x02\x01\x01"):
             self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK, data).reason, AckReason.BAD_PAYLOAD)
-        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(42, 2, 1, 1)))
+        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(42, 2, 1, 0)))
         self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK,
-                         encode_drop_task(DropTask(42, 1, 2, 1))).reason, AckReason.BAD_PAYLOAD)
+                         encode_drop_task(DropTask(42, 1, 1, 1))).reason, AckReason.BAD_PAYLOAD)
 
     def test_stop_before_launch_cancels_and_monitor_mode_refuses_start(self):
-        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(42, 2, 1, 1)))
+        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(42, 2, 1, 0)))
         self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42))
         self.assertEqual(self.request(CommandId.TARGETED_STOP).status, AckStatus.ACCEPTED)
         with self.assertRaises(RuntimeError):
             self.receiver.wait_for_start(.01)
         receiver = RescueTaskReceiver(threading.Event())
-        receiver.set_task(1, DropTask(1, 1, 1, 2))
+        receiver.set_task(1, DropTask(1, 1, 1, 1))
         self.assertEqual(receiver.request_start(1, 1), (AckStatus.REJECTED, AckReason.NOT_READY))
+
+    def test_run_body_authorization_and_late_close_after_stop(self):
+        for command in (CommandId.DRONE_PAYLOAD_CLOSE, CommandId.DRONE_REBUILD_MAP):
+            for body in (b'', b'\x01', struct.pack('<BI', 2, 7), struct.pack('<BI', 1, 0)):
+                self.assertEqual(self.request(command, body).reason, AckReason.BAD_PAYLOAD)
+            self.assertIsNone(self.request(command, struct.pack('<BI', 1, 7), source=NodeId.GROUND))
+        self.assertEqual(self.request(CommandId.DRONE_REBUILD_MAP, struct.pack('<BI',1,7)).status,
+                         AckStatus.REJECTED)
+        self.assertEqual(self.request(CommandId.DRONE_PAYLOAD_CLOSE, struct.pack('<BI',1,7)).status,
+                         AckStatus.COMPLETED)
+        self.request(CommandId.TARGETED_STOP)
+        self.payload.open_all.assert_not_called()
+        self.assertEqual(self.request(CommandId.DRONE_PAYLOAD_CLOSE, struct.pack('<BI',1,7)).status,
+                         AckStatus.REJECTED)
+        self.assertEqual(self.payload.close_all.call_count,1)
+
+    def test_one_async_remap_cached_ack_and_new_seq_status_queries(self):
+        body = struct.pack('<BI',1,7)
+        self.request(CommandId.DRONE_PAYLOAD_CLOSE,body)
+        entered, release = threading.Event(), threading.Event()
+        def rebuild(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(1))
+            return dict(needs_calibration=False, pose={'stamp_ns':123})
+        with patch('fastlio_control.restart_and_calibrate_fastlio',side_effect=rebuild) as restart:
+            ack = self.request(CommandId.DRONE_REBUILD_MAP,body,seq=100)
+            self.assertEqual(ack.status,AckStatus.ACCEPTED)
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(self.request(CommandId.DRONE_REBUILD_MAP,body).status,AckStatus.ACCEPTED)
+            release.set()
+            self.assertTrue(self.receiver.join_remap(1))
+            self.assertEqual(self.request(CommandId.DRONE_REBUILD_MAP,body).status,AckStatus.COMPLETED)
+            self.assertEqual(self.request(CommandId.DRONE_REBUILD_MAP,body,seq=100),ack)
+            restart.assert_called_once_with(self.fc,self.navi,timeout=45)
+
+    def test_stop_during_remap_cannot_become_ready_or_close_again(self):
+        self.ready()
+        self.receiver.remap_state='idle'
+        entered, release=threading.Event(),threading.Event()
+        def rebuild(*args,**kwargs):
+            entered.set(); release.wait(1)
+            return dict(needs_calibration=False,pose={'stamp_ns':123})
+        with patch('fastlio_control.restart_and_calibrate_fastlio',side_effect=rebuild):
+            self.receiver.rebuild_map(123,7)
+            self.assertTrue(entered.wait(1))
+            self.receiver.stop()
+            release.set()
+            self.assertTrue(self.receiver.join_remap(1))
+        self.assertEqual(self.receiver.remap_state,'cancelled')
+        self.assertEqual(self.receiver.close_payload(123,7)[0],AckStatus.REJECTED)
+
+    def test_start_requires_current_run_ready_and_physical_mapping(self):
+        self.receiver.set_task(123,DropTask(42,2,1,0))
+        self.assertEqual(self.receiver.request_start(123,42)[0],AckStatus.REJECTED)
+        self.ready()
+        self.receiver._validate_plan=Mock(side_effect=RuntimeError('mapping unknown'))
+        self.assertEqual(self.receiver.request_start(123,42)[0],AckStatus.REJECTED)
+        self.receiver._validate_plan=lambda:None
+        self.assertEqual(self.receiver.request_start(123,42)[0],AckStatus.ACCEPTED)
+
+    def test_unknown_installation_allows_start_with_release_skipped(self):
+        self.ready()
+        self.receiver.set_task(123,DropTask(42,2,1,0))
+        self.receiver._validate_plan=lambda:False
+        self.assertEqual(self.receiver.request_start(123,42)[0],AckStatus.ACCEPTED)
+
+    def test_close_failure_and_stale_run_never_report_ready(self):
+        self.payload.close_all.side_effect=RuntimeError('IPC failed')
+        self.assertEqual(self.receiver.close_payload(123,7)[0],AckStatus.FAILED)
+        self.assertEqual(self.receiver.rebuild_map(123,7)[0],AckStatus.REJECTED)
+        self.assertEqual(self.receiver.close_payload(124,8)[0],AckStatus.REJECTED)
 
 
 if __name__ == "__main__":

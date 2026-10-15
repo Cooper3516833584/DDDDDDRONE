@@ -1,0 +1,23 @@
+[Unit]
+Description=RoboCup single FC_Client rescue receiver (one process per run)
+After=network.target
+Conflicts=d-task-drone-dispatcher.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=fc
+WorkingDirectory=@PYTHON_SDK_DIR@
+# Substitute the interpreter/environment already used by the aircraft.
+# Audit and disable other FC_Client task owners before enabling this template.
+ExecStart=@PYTHON_EXECUTABLE@ -u @PYTHON_SDK_DIR@/rescue_drop_2026.py --car-control --confirm-flight
+Restart=always
+RestartSec=2
+TimeoutStopSec=50
+KillMode=control-group
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

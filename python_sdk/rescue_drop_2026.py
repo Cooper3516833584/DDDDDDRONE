@@ -1,7 +1,7 @@
 """2026 空地协同救援物资投放赛无人机主入口。
 
 默认通过 FC_Server 连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
-避障接口实现、继电器端口和开始指令。默认从小车接收实际投放配额
+避障接口实现、已确认的释放映射和开始指令。默认从小车接收实际投放配额
 及匹配的启动请求；手动模式使用命令行配额和终端 ``start_mission``。
 机上自启动的 server_ros.py / FC_Server 独占飞控串口，本任务不直连串口。
 
@@ -11,6 +11,7 @@
 
 import argparse
 import math
+import signal
 import sys
 import threading
 import time
@@ -24,7 +25,9 @@ from loguru import logger
 from FlightController import FC_Client, FC_Like
 from FlightController.Components import LD_Radar
 from FlightController.Components.ObstaclePlanner2D import ObstaclePlanner2D
-from FlightController.Components.relay_lcus import LCUSRelay
+from payload_servos import (DronePayloadServos, slot_for_drop_attempt, validate_drop_plan,
+                            drop_plan_ready, PAYLOAD_COUNT, PAYLOAD_ANGLES_DEG,
+                            PAYLOAD_RADIUS_CM)
 from FlightController.Solutions.Navigation import Navigation
 
 
@@ -104,13 +107,9 @@ MANDATORY_REBIND_MAX_DISTANCE_CM = 30.0  # 只接续原目标附近的新黄色�
 MANDATORY_REBIND_MIN_FRAMES = 2
 TARGET_CAMERA_READ_FAILURES = 10  # 连续读帧失败达到该次数即判定相机失效
 
-FREE_DROP_COUNT = 4  # 任务牌配额仍合计 4；同一目标低空连续投完该颜色配额
+FREE_DROP_COUNT = 3  # 红蓝绿合计3件，另有黄色必投1件，共4件
 MANDATORY_DROP_COUNT = 1
 TOTAL_DROP_COUNT = FREE_DROP_COUNT + MANDATORY_DROP_COUNT
-RELAY_CHANNEL_COUNT = 8
-PAYLOAD_RELAY_CHANNELS = (8, 6, 4, 1, 5)  # 第 n 次投掷对应的继电器路号
-PAYLOAD_ANGLES_DEG = (0.0, 72.0, 144.0, 216.0, 288.0)  # 机头 0°，逆时针为正
-PAYLOAD_RADIUS_CM = 8.7
 CAMERA_VIEW_REFERENCE_HEIGHT_CM = 160.0  # 高度 160cm 时长边视野 300cm
 CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT = 300.0
 FREE_COLORS = ("red", "blue", "green")
@@ -336,6 +335,14 @@ class VisionInterface:
         self._next_track_id = 1
         self._frame_seq = 0
         self._read_failures = 0
+        self._enabled_colors = frozenset(FREE_COLORS + (MANDATORY_COLOR,))
+
+    def set_allocation(self, allocation):
+        """Exclude zero-quota colors before tracking or publishing targets."""
+        self._enabled_colors = frozenset(
+            [MANDATORY_COLOR] + [color for color in FREE_COLORS if allocation[color] > 0])
+        self._tracks.clear()
+        logger.info('[RESCUE] Drone recognition colors={}', sorted(self._enabled_colors))
 
     @property
     def frame_size(self) -> Tuple[int, int]:
@@ -421,6 +428,7 @@ class VisionInterface:
         self._frame_seq += 1
         frame_seq = self._frame_seq
         detections = detector.detect(frame)
+        detections = [detection for detection in detections if detection.color in self._enabled_colors]
         inference_ms = (time.monotonic() - captured_at) * 1000.0
         return self._track(detections, captured_at, frame_seq,
                            captured_wall_at, inference_ms)
@@ -635,7 +643,7 @@ def validate_allocation(red: int, blue: int, green: int) -> Dict[str, int]:
            for value in counts.values()):
         raise ValueError("red/blue/green counts must be non-negative integers")
     if sum(counts.values()) != FREE_DROP_COUNT:
-        raise ValueError("free-target counts must total 4")
+        raise ValueError("free-target counts must total 3")
     return counts
 
 
@@ -731,12 +739,18 @@ def sample_polyline(start: Point, waypoints: Sequence[Point], altitude: float,
 
 
 class DropLedger:
-    """投掷顺位、继电器映射和任务牌配额；回读不确定也占用顺位。"""
+    """投掷顺位和任务牌配额；发送不确定也占用顺位。"""
 
     def __init__(self, allocation: Dict[str, int]):
         self.remaining = dict(allocation)
         self.mandatory_remaining = MANDATORY_DROP_COUNT
         self.next_drop_number = 1
+        self.skipped = []
+
+    def record_skip(self, color):
+        number = self.record_attempt(color)
+        self.skipped.append((number, color))
+        return number
 
     def has_quota(self, color: str) -> bool:
         if color == MANDATORY_COLOR:
@@ -748,14 +762,13 @@ class DropLedger:
             raise RuntimeError("no remaining quota for {}".format(color))
         drop_number = self.next_drop_number
         if drop_number > TOTAL_DROP_COUNT:
-            raise RuntimeError("planned relay channels exhausted")
-        channel = PAYLOAD_RELAY_CHANNELS[drop_number - 1]
+            raise RuntimeError("planned drop attempts exhausted")
         self.next_drop_number += 1
         if color == MANDATORY_COLOR:
             self.mandatory_remaining -= 1
         else:
             self.remaining[color] -= 1
-        return channel
+        return drop_number
 
 
 def wait_for_lio_basepoint(navi: Navigation, timeout: float = LIO_POSE_READY_TIMEOUT) -> None:
@@ -796,13 +809,13 @@ def wait_for_radar_pose(navi, radar, timeout=15.0, newer_than=0.0):
 
 class Mission:
     def __init__(self, fc: FC_Like, navi: Navigation,
-                 relay: Optional[LCUSRelay], vision: Optional[VisionInterface],
+                 payload: Optional[DronePayloadServos], vision: Optional[VisionInterface],
                  obstacle: Optional[ObstacleInterface], allocation: Dict[str, int],
                  stop_event: threading.Event, vision_diagnostics: bool = True,
                  route_direction: str = "right"):
         self.fc = fc
         self.navi = navi
-        self.relay = relay
+        self.payload = payload
         self.vision = vision
         self.obstacle = obstacle
         self.ledger = DropLedger(allocation)
@@ -845,11 +858,15 @@ class Mission:
         self._vision_error: Optional[Exception] = None
         self._vision_thread: Optional[threading.Thread] = None
 
-    def prepare_navigation(self) -> None:
+    def prepare_navigation(self, *, remap_ready=False) -> None:
         self.navi.set_navigation_speed(CRUISE_SPEED)
         self.navi.set_vertical_speed(VERTICAL_SPEED)
-        self.navi.start()
-        wait_for_lio_basepoint(self.navi)
+        if remap_ready:
+            if not self.navi.running or not self.navi.pose_is_fresh():
+                raise RuntimeError("current run navigation is not ready")
+        else:
+            self.navi.start()
+            wait_for_lio_basepoint(self.navi)
         if not self.navi.height_is_fresh():
             raise RuntimeError("LIO height is not ready after basepoint calibration")
         logger.info("[RESCUE] LIO basepoint calibrated: {}", self.navi.basepoint)
@@ -1890,29 +1907,40 @@ class Mission:
     def _drop(self, color: str, target_id: str,
               position_confirmed: bool) -> None:
         self._check()
-        if self.relay is None:
-            raise RuntimeError("relay missing")
-        # 先记顺位。即使回读失败，下一件也使用下一路，避免可能已释放时重投。
-        drop_number = self.ledger.next_drop_number
-        channel = self.ledger.record_attempt(color)
-        logger.info("[DROP] Attempt {} relay={} target={} color={} "
-                    "position_confirmed={}",
-                    drop_number, channel, target_id, color, position_confirmed)
-        confirmed = self.relay.turn_off(channel, verify=True, retries=1)
-        if confirmed:
-            logger.info("[DROP] Channel {} OFF confirmed; cargo release not sensor-verified",
-                        channel)
-        else:
-            logger.error("[DROP] Channel {} OFF uncertain after one retry; continuing",
-                         channel)
+        if self._skip_unconfigured_drop(color):
+            return
+        if self.payload is None:
+            raise RuntimeError("payload missing")
+        # Unknown/reused mechanisms fail before a cargo attempt is consumed.
+        slot = slot_for_drop_attempt(self.ledger.next_drop_number)
+        drop_number = self.ledger.record_attempt(color)
+        logger.info("[DROP] Attempt {} slot={} target={} color={} position_confirmed={}",
+                    drop_number, slot, target_id, color, position_confirmed)
+        self.payload.open_slot(slot)
+        logger.info("[DROP] OPEN SENT slot={} (release not sensor-verified)", slot)
         # 只在该颜色的指定投掷次数均已尝试后，禁止再次进入自由投掷。
         if color in FREE_COLORS and not self.ledger.has_quota(color):
             self._completed_free_colors.add(color)
+
+    def _skip_unconfigured_drop(self, color):
+        if drop_plan_ready():
+            return False
+        while self.ledger.has_quota(color):
+            self._check()
+            number = self.ledger.record_skip(color)
+            logger.warning('[DROP SKIPPED] number={} color={}; installation/mapping unknown; no release',
+                           number, color)
+        if color in FREE_COLORS:
+            self._completed_free_colors.add(color)
+        return True
 
     def _free_drop(self) -> None:
         target = self.target
         if target is None or target.color not in FREE_COLORS:
             raise RuntimeError("free target missing")
+        if self._skip_unconfigured_drop(target.color):
+            self._resume_route(self.free_origin)
+            return
         if self._approach_target(target, protected=False) is None:
             self._resume_route(self.free_origin)
             return
@@ -1931,6 +1959,9 @@ class Mission:
         target = self.target
         if target is None or target.color != MANDATORY_COLOR:
             raise RuntimeError("mandatory target missing")
+        if self._skip_unconfigured_drop(MANDATORY_COLOR):
+            self._navigate_center_exit()
+            return True
         boundary_result = self._mandatory_boundary_if_needed(target)
         if boundary_result is not None:
             return boundary_result
@@ -2170,7 +2201,7 @@ class Mission:
 
 
 def emergency_land(fc: FC_Like) -> bool:
-    """请求降落；未确认落地前不强制锁桨，也不开断剩余物资。"""
+    """请求降落；未确认落地前不强制锁桨，也不打开剩余载荷。"""
     logger.warning("[RESCUE] Flight interrupted; requesting emergency landing")
     fc.set_flight_mode(fc.PROGRAM_MODE)
     time.sleep(0.1)
@@ -2209,8 +2240,6 @@ def parse_args() -> argparse.Namespace:
                         help="FC_Server TCP 端口，默认 5654")
     parser.add_argument("--fc-port", default=None,
                         help="旧版直连串口参数；FC_Server 运行时不得使用")
-    parser.add_argument("--relay-port", default=None,
-                        help="LCUS 继电器串口；也可用 D_TASK_RELAY_PORT 环境变量")
     parser.add_argument("--vision-diagnostics", dest="vision_diagnostics",
                         action="store_true", default=True,
                         help="记录每次目标观测年龄、指令和跳变相邻帧；默认开启")
@@ -2227,8 +2256,8 @@ def parse_args() -> argparse.Namespace:
                      "use --fc-host and --fc-server-port")
     if not 1 <= args.fc_server_port <= 65535:
         parser.error("--fc-server-port must be between 1 and 65535")
-    if args.car_control and FREE_DROP_COUNT != 4:
-        parser.error("--car-control requires the competition's four free-drop items; "
+    if args.car_control and FREE_DROP_COUNT != 3:
+        parser.error("--car-control requires the competition's three free-drop items; "
                      "it is unavailable in altered-quota test entries")
     if args.car_control and any(count is not None for count in (
             args.red_count, args.blue_count, args.green_count)):
@@ -2237,7 +2266,7 @@ def parse_args() -> argparse.Namespace:
         if any(count is None for count in (
                 args.red_count, args.blue_count, args.green_count)):
             parser.error("--confirm-flight requires --red-count, --blue-count "
-                         "and --green-count; their sum must be 4")
+                         "and --green-count; their sum must be 3")
         try:
             validate_allocation(args.red_count, args.blue_count, args.green_count)
         except ValueError as exc:
@@ -2259,8 +2288,7 @@ def require_flight_interfaces(vision: VisionInterface,
 
 
 def wait_for_start_command() -> None:
-    logger.warning("[RESCUE] Payload channels {} ON; enter start_mission to take off",
-                   PAYLOAD_RELAY_CHANNELS)
+    logger.warning("[RESCUE] Enter start_mission to take off")
     while True:
         command = input("[RESCUE] start_mission> ")
         if command == "start_mission":
@@ -2271,12 +2299,12 @@ def wait_for_start_command() -> None:
 def main() -> int:
     args = parse_args()
     stop_event = threading.Event()
+    previous_sigterm = signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     fc: Optional[FC_Client] = None
     navi: Optional[Navigation] = None
-    relay: Optional[LCUSRelay] = None
+    payload: Optional[DronePayloadServos] = None
     mission: Optional[Mission] = None
     takeoff_attempted = False
-    relay_modified = False
     allocation = {color: 0 for color in FREE_COLORS}
     vision = None
     obstacle = None
@@ -2286,12 +2314,8 @@ def main() -> int:
 
     try:
         if args.confirm_flight:
-            if (len(PAYLOAD_RELAY_CHANNELS) != TOTAL_DROP_COUNT
-                    or len(PAYLOAD_ANGLES_DEG) != TOTAL_DROP_COUNT
-                    or len(set(PAYLOAD_RELAY_CHANNELS)) != TOTAL_DROP_COUNT
-                    or any(channel < 1 or channel > RELAY_CHANNEL_COUNT
-                           for channel in PAYLOAD_RELAY_CHANNELS)):
-                raise RuntimeError("invalid payload relay/angle configuration")
+            if TOTAL_DROP_COUNT != PAYLOAD_COUNT:
+                raise RuntimeError("drop count does not match four servo payload slots")
             if not args.car_control:
                 allocation = validate_allocation(
                     args.red_count, args.blue_count, args.green_count)
@@ -2308,52 +2332,49 @@ def main() -> int:
             raise RuntimeError("FC_Server connection timeout")
         telemetry_deadline = time.monotonic() + 10.0
         while not fc.state.is_fresh(0.5):
-            if not fc.connected or time.monotonic() >= telemetry_deadline:
+            if stop_event.is_set() or not fc.connected or time.monotonic() >= telemetry_deadline:
                 raise RuntimeError("fresh flight-controller telemetry unavailable via FC_Server")
             stop_event.wait(0.05)
         if fc.state.unlock.value:
             raise RuntimeError("flight controller already unlocked; refuse takeover")
 
+        if args.confirm_flight:
+            payload = DronePayloadServos(fc)
+            try:
+                payload.open_all()
+                logger.info("[RESCUE] Startup PAYLOAD OPEN SENT (no mechanical feedback)")
+            except Exception:
+                logger.exception("[RESCUE] Startup payload OPEN failed")
         navi = Navigation(fc=fc, stop_event=stop_event,
                           obstacle_planner=obstacle_planner,
                           height_source="lio")
-        mission = Mission(fc, navi, None, vision, obstacle, allocation, stop_event,
+        mission = Mission(fc, navi, payload, vision, obstacle, allocation, stop_event,
                           vision_diagnostics=getattr(args, "vision_diagnostics", True),
                           route_direction=getattr(args, "route_direction", "right"))
-        mission.prepare_navigation()
-
-        if not args.confirm_flight:
-            if args.car_control:
-                from fleet_bus.rescue_task import attach_rescue_fleet_node
-                fleet_node, task_receiver = attach_rescue_fleet_node(fc, navi, stop_event)
-                logger.info("[RESCUE] Car allocation receiver active; flight/start disabled")
-            mission.monitor_pose()
-            return 0
-
-        relay = LCUSRelay(port=args.relay_port, channel_count=RELAY_CHANNEL_COUNT)
-        relay.open()
-        if relay.detect_channel_count() != RELAY_CHANNEL_COUNT:
-            raise RuntimeError("8-channel LCUS board was not confirmed")
-        states = relay.query_status()
-        if states is None or any(states.get(channel) is not False
-                                 for channel in range(1, RELAY_CHANNEL_COUNT + 1)):
-            raise RuntimeError("all eight relay channels must initially report OFF")
-        for channel in PAYLOAD_RELAY_CHANNELS:
-            relay_modified = True
-            if not relay.turn_on(channel, verify=True, retries=1):
-                raise RuntimeError("failed to confirm payload channel {} ON".format(channel))
-        mission.relay = relay
         if args.car_control:
             from fleet_bus.rescue_task import attach_rescue_fleet_node
             fleet_node, task_receiver = attach_rescue_fleet_node(
-                fc, navi, stop_event, allow_start=True)
-            logger.info("[RESCUE] Ready; waiting for car allocation and matching start")
+                fc, navi, stop_event, allow_start=args.confirm_flight, payload=payload,
+                validate_plan=validate_drop_plan)
+            logger.info("[RESCUE] Listening for CLOSE, REMAP, quota and matching START")
+            if not args.confirm_flight:
+                mission.prepare_navigation()
+                mission.monitor_pose()
+                return 0
             task = task_receiver.wait_for_start()
             allocation = validate_allocation(task.red, task.blue, task.green)
             mission.ledger = DropLedger(allocation)
+            mission.prepare_navigation(remap_ready=task_receiver.remap_state == 'ready')
             logger.info("[RESCUE] Car task {} allocation {}", task.task_id, allocation)
         else:
+            mission.prepare_navigation()
+            if not args.confirm_flight:
+                mission.monitor_pose()
+                return 0
+            validate_drop_plan()
+            payload.close_all()
             wait_for_start_command()
+        vision.set_allocation(allocation)
         mission.deadline = time.monotonic() + MISSION_TIMEOUT
         mission._check()
         takeoff_attempted = True
@@ -2379,6 +2400,21 @@ def main() -> int:
             except Exception:
                 logger.exception("[RESCUE] Emergency landing request failed")
 
+        if payload is not None:
+            try:
+                locked = (fc is not None and fc.connected
+                          and fc.state.is_fresh(0.5)
+                          and not fc.state.unlock.value)
+                if locked:
+                    payload.open_all()
+                    logger.info("[RESCUE] Locked PAYLOAD OPEN SENT (no mechanical feedback)")
+                else:
+                    logger.error("[RESCUE] Lock not confirmed; keep remaining payloads closed")
+            except Exception:
+                logger.exception("[RESCUE] Payload state check or OPEN failed")
+
+        if task_receiver is not None and not task_receiver.join_remap(timeout=35.0):
+            logger.error("[RESCUE] Remap cancellation pending; no navigation reuse")
         if fleet_node is not None:
             try:
                 fleet_node.close()
@@ -2400,20 +2436,6 @@ def main() -> int:
             except Exception:
                 logger.exception("[RESCUE] Failed to close preflight vision")
 
-        if relay is not None:
-            try:
-                locked = (fc is not None and fc.connected
-                          and fc.state.is_fresh(0.5)
-                          and not fc.state.unlock.value)
-                if relay_modified and locked:
-                    if not relay.all_off(verify=True):
-                        logger.error("[RESCUE] Relay all_off was not confirmed")
-                elif relay_modified:
-                    logger.error("[RESCUE] Lock not confirmed; keep remaining payload channels ON")
-            except Exception:
-                logger.exception("[RESCUE] Failed to reset relay after lock check")
-            finally:
-                relay.close()
 
         if navi is not None:
             try:
@@ -2426,6 +2448,7 @@ def main() -> int:
                 fc.close()
             except Exception:
                 logger.exception("[RESCUE] Failed to close flight controller")
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

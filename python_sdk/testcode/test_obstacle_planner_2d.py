@@ -79,7 +79,7 @@ class DirectionalRoutesOfflineTests(unittest.TestCase):
         parse_args = next(node for node in tree.body
                           if isinstance(node, ast.FunctionDef) and node.name == "parse_args")
         namespace = {"argparse": __import__("argparse"),
-                     "FC_SERVER_HOST": "127.0.0.1", "FC_SERVER_PORT": 5654}
+                     "FC_SERVER_HOST": "127.0.0.1", "FC_SERVER_PORT": 5654, "FREE_DROP_COUNT": 3}
         exec(compile(ast.fix_missing_locations(
             ast.Module(body=[parse_args], type_ignores=[])), str(source), "exec"), namespace)
         for argv, expected in ((["rescue"], "right"),
@@ -91,15 +91,15 @@ class DirectionalRoutesOfflineTests(unittest.TestCase):
         build = load_route_builder()
         right_entry, right_center, right_exit = build("right", transition_cm=50.0)
         left_entry, left_center, left_exit = build("left", transition_cm=50.0)
-        self.assertEqual(right_entry, [(0.0, 0.0), (0.0, -160.0), (150.0, -160.0)])
-        self.assertEqual(left_entry, [(0.0, 0.0), (0.0, 157.0), (150.0, 157.0)])
-        self.assertEqual(right_exit, [(200.0, 157.0), (0.0, 157.0), (0.0, 0.0)])
-        self.assertEqual(left_exit, [(200.0, -160.0), (0.0, -160.0), (0.0, 0.0)])
+        self.assertEqual(right_entry, [(100.0, 0.0), (100.0, -360.0), (430.0, -360.0)])
+        self.assertEqual(left_entry, [(100.0, 0.0), (100.0, 355.0), (430.0, 355.0)])
+        self.assertEqual(right_exit, [(480.0, 355.0), (100.0, 355.0), (100.0, 0.0)])
+        self.assertEqual(left_exit, [(480.0, -360.0), (100.0, -360.0), (100.0, 0.0)])
         self.assertEqual(len(right_center), len(left_center))
         self.assertEqual([point[0] for point in right_center],
                          [point[0] for point in left_center])
         for right, left in zip(right_center, left_center):
-            self.assertAlmostEqual(right[1] + left[1], -3.0)
+            self.assertAlmostEqual(right[1] + left[1], -5.0)
         self.assertEqual(build(), build("right", transition_cm=50.0))
         self.assertEqual(build("left"), build("left", transition_cm=50.0))
 
@@ -121,7 +121,7 @@ class DirectionalRoutesOfflineTests(unittest.TestCase):
                 self.assertTrue(all(actual is route for actual, route in zip(
                     (mission.entry_route, mission.center_route, mission.exit_route), expected)))
                 self.assertEqual(mission._entry_path[-1], mission.center_route[0])
-                self.assertEqual(mission.entry_route[-1][0], 150.0)
+                self.assertEqual(mission.entry_route[-1][0], 430.0)
 
 
 class PlannerTests(unittest.TestCase):
@@ -755,15 +755,15 @@ class VisualApproachTests(unittest.TestCase):
         future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
         module = ast.fix_missing_locations(ast.Module(body=[future] + selected, type_ignores=[]))
         self.namespace = {"math": math, "logger": Mock(),
-                          "CRUISE_HEIGHT": 100.0,
+                          "CRUISE_HEIGHT": 150.0,
                           "MANDATORY_COLOR": "yellow",
-                          "MANDATORY_TARGET_GROUND_HEIGHT_CM": 30.0,
+                          "MANDATORY_TARGET_GROUND_HEIGHT_CM": 50.0,
                           "FREE_TARGET_GROUND_HEIGHT_CM": 0.0,
                           "FREE_COLORS": ("red", "blue", "green"),
-                          "FREE_DROP_HEIGHT": 40.0,
-                          "TOTAL_DROP_COUNT": 5,
-                          "PAYLOAD_RADIUS_CM": 7.2,
-                          "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0, 288.0),
+                          "FREE_DROP_HEIGHT": 10.0,
+                          "TOTAL_DROP_COUNT": 4,
+                          "PAYLOAD_RADIUS_CM": 8.7,
+                          "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0),
                           "CAMERA_VIEW_REFERENCE_HEIGHT_CM": 160.0,
                           "CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT": 300.0}
         exec(compile(module, str(source), "exec"), self.namespace)
@@ -777,7 +777,7 @@ class VisualApproachTests(unittest.TestCase):
     def test_two_cargo_cruise_offset_is_their_midpoint(self):
         single = self.namespace["payload_target_offset_px"]
         group = self.namespace["payload_group_target_offset_px"]
-        for numbers, height in (((1, 2), 100.0), ((4, 5), 70.0)):
+        for numbers, height in (((1, 2), 150.0), ((3, 4), 100.0)):
             with self.subTest(numbers=numbers):
                 first = single(numbers[0], height, (640, 480))
                 second = single(numbers[1], height, (640, 480))
@@ -789,6 +789,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_free_drop"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.target = SimpleNamespace(target_id="blue-1", color="blue")
         mission.free_origin = "route-1"
         mission.ledger = SimpleNamespace(remaining={"blue": 2})
@@ -803,7 +804,7 @@ class VisualApproachTests(unittest.TestCase):
         mission._resume_route = Mock()
         mission._free_drop()
         self.assertEqual([call.args[0] for call in mission._set_height.call_args_list],
-                         [40.0, 100.0])
+                         [10.0, 150.0])
         mission._wait_for_drop_position.assert_called_once_with()
         mission._calibrate_low.assert_not_called()
         self.assertEqual(mission._drop.call_args_list,
@@ -820,6 +821,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_wait_for_drop_position"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.navi = Mock(running=True, navigation_flag=True,
                             current_x=3.0, current_y=3.0)
         mission.navi.navi_x_pid.setpoint = 0.0
@@ -848,6 +850,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_observation"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission._vision_lock = threading.Lock()
         observed = SimpleNamespace(target_id="red-1", color="red", captured_at=1.0)
         mission._latest = {observed.target_id: observed}
@@ -879,6 +882,7 @@ class VisualApproachTests(unittest.TestCase):
                          names={"_approach_target", "_position"},
                          namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.navi = Mock(current_x=30.0, current_y=40.0, current_yaw=90.0)
         mission.vision = SimpleNamespace(frame_size=(640, 480))
         mission._pending_drop_numbers = Mock(return_value=(1,))
@@ -912,7 +916,9 @@ class VisualApproachTests(unittest.TestCase):
         self.assertTrue(mission._move_toward.called)
         mission.navi.stop_move.assert_called_once()
         mission.navi.set_yaw.assert_called_once_with(90.0)
-        expected_world_dy = -(35.0 - 10.0) * 300.0 * 70.0 / (640.0 * 160.0)
+        camera_height = (self.namespace["CRUISE_HEIGHT"]
+                         - self.namespace["MANDATORY_TARGET_GROUND_HEIGHT_CM"])
+        expected_world_dy = -(35.0 - 10.0) * 300.0 * camera_height / (640.0 * 160.0)
         self.assertAlmostEqual(mission.navi.navi_x_pid.setpoint, 30.0)
         self.assertAlmostEqual(mission.navi.navi_y_pid.setpoint,
                                40.0 + expected_world_dy)
@@ -928,7 +934,9 @@ class VisualApproachTests(unittest.TestCase):
         self.assertEqual(free_result.target_id, "red-1")
         mission.navi.set_yaw.assert_called_once_with(90.0)
         mission.navi.stop_move.assert_called_once()
-        expected_free_dy = -(35.0 - 10.0) * 300.0 * 100.0 / (640.0 * 160.0)
+        free_camera_height = (self.namespace["CRUISE_HEIGHT"]
+                              - self.namespace["FREE_TARGET_GROUND_HEIGHT_CM"])
+        expected_free_dy = -(35.0 - 10.0) * 300.0 * free_camera_height / (640.0 * 160.0)
         self.assertAlmostEqual(mission.navi.navi_x_pid.setpoint, 30.0)
         self.assertAlmostEqual(mission.navi.navi_y_pid.setpoint,
                                40.0 + expected_free_dy)
@@ -946,7 +954,8 @@ class VisualApproachTests(unittest.TestCase):
         clock = iter((10.0, 10.25, 10.4, 10.7))
         namespace = {"time": SimpleNamespace(monotonic=lambda: next(clock),
                                                 time=lambda: 1234.0),
-                     "TARGET_CAMERA_READ_FAILURES": 10}
+                     "TARGET_CAMERA_READ_FAILURES": 10, "FREE_COLORS": ("red","blue","green"),
+                     "MANDATORY_COLOR": "yellow"}
         cls = load_class("rescue_drop_2026.py", "VisionInterface",
                          names={"__init__", "poll"}, namespace=namespace)
         vision = cls()
@@ -984,6 +993,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_calibrate_low"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.vision = SimpleNamespace(frame_size=(640, 480))
         mission.navi = Mock(current_yaw=0.0)
         mission._check = Mock()
@@ -1011,6 +1021,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_vision_diagnostic"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.vision_diagnostics = True
         mission._vision_diag_recent = []
         mission.navi = Mock(current_yaw=0.0)
@@ -1042,12 +1053,12 @@ class CenterMissionOfflineTests(unittest.TestCase):
         helper_tree = ast.fix_missing_locations(ast.Module(body=[future] + helpers, type_ignores=[]))
         self.namespace = {
             "math": math, "logger": Mock(), "MANDATORY_COLOR": "yellow",
-            "MANDATORY_DROP_HEIGHT": 100.0, "CRUISE_HEIGHT": 150.0,
-            "MANDATORY_TARGET_GROUND_HEIGHT_CM": 30.0,
+            "MANDATORY_DROP_HEIGHT": 60.0, "CRUISE_HEIGHT": 150.0,
+            "MANDATORY_TARGET_GROUND_HEIGHT_CM": 50.0,
             "CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT": 300.0,
             "CAMERA_VIEW_REFERENCE_HEIGHT_CM": 160.0,
-            "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0, 288.0),
-            "PAYLOAD_RADIUS_CM": 7.2, "TOTAL_DROP_COUNT": 5,
+            "PAYLOAD_RADIUS_CM": 8.7,
+            "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0), "TOTAL_DROP_COUNT": 4,
             "VISUAL_PERIOD": 0.1,
             "INFLATION_ESCAPE_TIMEOUT_S": 20.0,
         }
@@ -1064,6 +1075,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
             "_update_center_route_progress",
         }, namespace=self.namespace)
         self.mission = mission_class()
+        self.mission._skip_unconfigured_drop=Mock(return_value=False)
         self.mission.navi = Mock(current_x=200.0, current_y=0.0,
                                  current_yaw=0.0, current_height=150.0)
         self.mission.navi.height_pid.setpoint = 150.0
@@ -1094,7 +1106,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission.obstacle.mandatory_drop_pose_is_clear.return_value = False
         self.assertFalse(mission._mandatory_drop())
         self.assertEqual(mission.obstacle.mandatory_drop_pose_is_clear.call_args.args[0],
-                         (192.8, 0.0))
+                         (191.3, 0.0))
         mission._set_height.assert_not_called()
         mission._calibrate_low.assert_not_called()
         mission._drop.assert_not_called()
@@ -1110,7 +1122,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission.obstacle.mandatory_drop_pose_is_clear.return_value = True
         self.assertTrue(mission._mandatory_drop())
         self.assertEqual([call.args[0] for call in mission._set_height.call_args_list],
-                         [100.0, 150.0])
+                         [60.0, 150.0])
         self.assertEqual(mission._set_height.call_args_list[0].kwargs,
                          {"preserve_horizontal_hold": True})
         self.assertEqual(mission._set_height.call_args_list[1].kwargs,
@@ -1122,19 +1134,19 @@ class CenterMissionOfflineTests(unittest.TestCase):
 
     def test_two_yellow_use_midpoint_clearance_and_drop_without_reposition(self):
         mission = self.mission
-        mission.ledger.next_drop_number = 4
+        mission.ledger.next_drop_number = 3
         mission.ledger.mandatory_remaining = 2
         mission.obstacle.mandatory_drop_pose_is_clear.return_value = True
         self.assertTrue(mission._mandatory_drop())
         offsets = [self.namespace["payload_offset_body_cm"](number)
-                   for number in (4, 5)]
+                   for number in (3, 4)]
         expected = (200.0 - sum(offset[0] for offset in offsets) / 2,
                     -sum(offset[1] for offset in offsets) / 2)
         np.testing.assert_allclose(
             mission.obstacle.mandatory_drop_pose_is_clear.call_args_list[0].args[0],
             expected)
         self.assertEqual([call.args[0] for call in mission._set_height.call_args_list],
-                         [100.0, 150.0])
+                         [60.0, 150.0])
         mission._wait_for_drop_position.assert_called_once_with()
         mission._calibrate_low.assert_not_called()
         self.assertEqual([call.args for call in mission._drop.call_args_list],
@@ -1158,7 +1170,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission._wait_for_drop_position.assert_called_once_with()
         mission._drop.assert_called_once_with("yellow", "yellow-1", False)
         self.assertEqual([call.args[0] for call in mission._set_height.call_args_list],
-                         [100.0, 150.0])
+                         [60.0, 150.0])
 
     def test_center_exit_migration_is_shared_with_route_two(self):
         mission = self.mission
@@ -1321,12 +1333,11 @@ class CenterMissionOfflineTests(unittest.TestCase):
     def test_payload_sequence_and_yaw_change_desired_pose(self):
         mission = self.mission
         mission.navi.current_yaw = 90.0
-        for number, angle in enumerate(self.namespace["PAYLOAD_ANGLES_DEG"], 1):
+        for number in range(1,5):
             with self.subTest(drop_number=number):
                 pose = mission._desired_aircraft_drop_pose((200.0, 0.0), number)
                 expected = self.namespace["body_to_world_velocity"](
-                    7.2 * math.cos(math.radians(angle)),
-                    7.2 * math.sin(math.radians(angle)), 90.0)
+                    *self.namespace["payload_offset_body_cm"](number), 90.0)
                 np.testing.assert_allclose(pose, (200.0 - expected[0], -expected[1]))
 
     def test_spline_rejection_uses_checked_linear_fallback(self):
@@ -1548,14 +1559,12 @@ class WiringTests(unittest.TestCase):
         tree = ast.fix_missing_locations(ast.Module(body=[main], type_ignores=[]))
         for flight in (False, True):
             with self.subTest(flight=flight):
-                fc, relay, mission, vision = Mock(), Mock(), Mock(), Mock()
+                fc, payload, mission, vision = Mock(), Mock(), Mock(), Mock()
                 fc.connect.side_effect = lambda **kwargs: self.assertEqual(
                     vision.prime.call_count, int(flight))
                 fc.connected = True
                 fc.state.is_fresh.return_value = True
                 fc.state.unlock.value = False
-                relay.detect_channel_count.return_value = 8
-                relay.query_status.return_value = dict.fromkeys(range(1, 9), False)
                 planner = Mock()
                 namespace = {"parse_args": lambda: SimpleNamespace(confirm_flight=flight, car_control=False,
                              red_count=2, blue_count=1, green_count=1,
@@ -1566,11 +1575,11 @@ class WiringTests(unittest.TestCase):
                              "ObstaclePlanner2D": Mock(return_value=planner),
                              "ObstacleInterface": Mock(), "require_flight_interfaces": Mock(),
                              "FC_Client": Mock(return_value=fc), "Navigation": Mock(),
-                             "Mission": Mock(return_value=mission), "LCUSRelay": Mock(return_value=relay),
-                             "RELAY_CHANNEL_COUNT": 8, "TOTAL_DROP_COUNT": 5, "MISSION_TIMEOUT": 1200,
-                             "PAYLOAD_RELAY_CHANNELS": (8, 6, 4, 1, 5),
-                             "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0, 288.0),
-                             "wait_for_start_command": Mock(), "time": module.time, "logger": Mock(),
+                             "Mission": Mock(return_value=mission), "DronePayloadServos": Mock(return_value=payload),
+                             "validate_drop_plan": Mock(), "signal": Mock(),
+                             "TOTAL_DROP_COUNT": 4, "PAYLOAD_COUNT": 4,
+                             "MISSION_TIMEOUT": 1200,
+                                "wait_for_start_command": Mock(), "time": module.time, "logger": Mock(),
                              "stop_navigation_ros": Mock()}
                 exec(compile(tree, str(source), "exec"), namespace)
                 self.assertEqual(namespace["main"](), 0)
@@ -1588,7 +1597,9 @@ class WiringTests(unittest.TestCase):
                     mission.run.assert_called_once()
                 else:
                     mission.monitor_pose.assert_called_once()
-                    namespace["LCUSRelay"].assert_not_called()
+                    payload.close_all.assert_not_called()
+                    namespace["DronePayloadServos"].assert_not_called()
+                self.assertEqual(payload.open_all.call_count,2 if flight else 0)
 
 
 if __name__ == "__main__":
