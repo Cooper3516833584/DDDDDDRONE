@@ -680,8 +680,7 @@ class VisualApproachTests(unittest.TestCase):
                           "FREE_COLORS": ("red", "blue", "green"),
                           "FREE_DROP_HEIGHT": 40.0,
                           "TOTAL_DROP_COUNT": 5,
-                          "PAYLOAD_RADIUS_CM": 7.2,
-                          "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0, 288.0),
+                          "payload_offset_body_cm": lambda number: ((7.,1.),(-3.,6.),(-5.,-2.),(2.,-4.),(4.,3.))[number-1],
                           "CAMERA_VIEW_REFERENCE_HEIGHT_CM": 160.0,
                           "CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT": 300.0}
         exec(compile(module, str(source), "exec"), self.namespace)
@@ -707,6 +706,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_free_drop"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.target = SimpleNamespace(target_id="blue-1", color="blue")
         mission.free_origin = "route-1"
         mission.ledger = SimpleNamespace(remaining={"blue": 2})
@@ -738,6 +738,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_wait_for_drop_position"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.navi = Mock(running=True, navigation_flag=True,
                             current_x=3.0, current_y=3.0)
         mission.navi.navi_x_pid.setpoint = 0.0
@@ -766,6 +767,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_observation"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission._vision_lock = threading.Lock()
         observed = SimpleNamespace(target_id="red-1", color="red", captured_at=1.0)
         mission._latest = {observed.target_id: observed}
@@ -797,6 +799,7 @@ class VisualApproachTests(unittest.TestCase):
                          names={"_approach_target", "_position"},
                          namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.navi = Mock(current_x=30.0, current_y=40.0, current_yaw=90.0)
         mission.vision = SimpleNamespace(frame_size=(640, 480))
         mission._pending_drop_numbers = Mock(return_value=(1,))
@@ -864,7 +867,8 @@ class VisualApproachTests(unittest.TestCase):
         clock = iter((10.0, 10.25, 10.4, 10.7))
         namespace = {"time": SimpleNamespace(monotonic=lambda: next(clock),
                                                 time=lambda: 1234.0),
-                     "TARGET_CAMERA_READ_FAILURES": 10}
+                     "TARGET_CAMERA_READ_FAILURES": 10, "FREE_COLORS": ("red","blue","green"),
+                     "MANDATORY_COLOR": "yellow"}
         cls = load_class("rescue_drop_2026.py", "VisionInterface",
                          names={"__init__", "poll"}, namespace=namespace)
         vision = cls()
@@ -902,6 +906,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_calibrate_low"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.vision = SimpleNamespace(frame_size=(640, 480))
         mission.navi = Mock(current_yaw=0.0)
         mission._check = Mock()
@@ -929,6 +934,7 @@ class VisualApproachTests(unittest.TestCase):
         cls = load_class("rescue_drop_2026.py", "Mission",
                          names={"_vision_diagnostic"}, namespace=self.namespace)
         mission = cls()
+        mission._skip_unconfigured_drop=Mock(return_value=False)
         mission.vision_diagnostics = True
         mission._vision_diag_recent = []
         mission.navi = Mock(current_yaw=0.0)
@@ -964,8 +970,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
             "MANDATORY_TARGET_GROUND_HEIGHT_CM": 30.0,
             "CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT": 300.0,
             "CAMERA_VIEW_REFERENCE_HEIGHT_CM": 160.0,
-            "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0, 288.0),
-            "PAYLOAD_RADIUS_CM": 7.2, "TOTAL_DROP_COUNT": 5,
+            "payload_offset_body_cm": lambda number: ((7.,1.),(-3.,6.),(-5.,-2.),(2.,-4.),(4.,3.))[number-1], "TOTAL_DROP_COUNT": 5,
             "VISUAL_PERIOD": 0.1,
             "INFLATION_ESCAPE_TIMEOUT_S": 20.0,
         }
@@ -981,6 +986,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
             "_update_center_route_progress",
         }, namespace=self.namespace)
         self.mission = mission_class()
+        self.mission._skip_unconfigured_drop=Mock(return_value=False)
         self.mission.navi = Mock(current_x=200.0, current_y=0.0,
                                  current_yaw=0.0, current_height=150.0)
         self.mission.navi.height_pid.setpoint = 150.0
@@ -1011,7 +1017,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission.obstacle.mandatory_drop_pose_is_clear.return_value = False
         self.assertFalse(mission._mandatory_drop())
         self.assertEqual(mission.obstacle.mandatory_drop_pose_is_clear.call_args.args[0],
-                         (192.8, 0.0))
+                         (193.0, -1.0))
         mission._set_height.assert_not_called()
         mission._calibrate_low.assert_not_called()
         mission._drop.assert_not_called()
@@ -1144,12 +1150,11 @@ class CenterMissionOfflineTests(unittest.TestCase):
     def test_payload_sequence_and_yaw_change_desired_pose(self):
         mission = self.mission
         mission.navi.current_yaw = 90.0
-        for number, angle in enumerate(self.namespace["PAYLOAD_ANGLES_DEG"], 1):
+        for number in range(1,6):
             with self.subTest(drop_number=number):
                 pose = mission._desired_aircraft_drop_pose((200.0, 0.0), number)
                 expected = self.namespace["body_to_world_velocity"](
-                    7.2 * math.cos(math.radians(angle)),
-                    7.2 * math.sin(math.radians(angle)), 90.0)
+                    *self.namespace["payload_offset_body_cm"](number), 90.0)
                 np.testing.assert_allclose(pose, (200.0 - expected[0], -expected[1]))
 
     def test_spline_rejection_uses_checked_linear_fallback(self):
@@ -1331,14 +1336,12 @@ class WiringTests(unittest.TestCase):
         tree = ast.fix_missing_locations(ast.Module(body=[main], type_ignores=[]))
         for flight in (False, True):
             with self.subTest(flight=flight):
-                fc, relay, mission, vision = Mock(), Mock(), Mock(), Mock()
+                fc, payload, mission, vision = Mock(), Mock(), Mock(), Mock()
                 fc.connect.side_effect = lambda **kwargs: self.assertEqual(
-                    vision.prime.call_count, int(flight))
+                    vision.prime.call_count, 0)
                 fc.connected = True
                 fc.state.is_fresh.return_value = True
                 fc.state.unlock.value = False
-                relay.detect_channel_count.return_value = 8
-                relay.query_status.return_value = dict.fromkeys(range(1, 9), False)
                 planner = Mock()
                 namespace = {"parse_args": lambda: SimpleNamespace(confirm_flight=flight, car_control=False,
                              red_count=2, blue_count=1, green_count=1,
@@ -1349,11 +1352,10 @@ class WiringTests(unittest.TestCase):
                              "ObstaclePlanner2D": Mock(return_value=planner),
                              "ObstacleInterface": Mock(), "require_flight_interfaces": Mock(),
                              "FC_Client": Mock(return_value=fc), "Navigation": Mock(),
-                             "Mission": Mock(return_value=mission), "LCUSRelay": Mock(return_value=relay),
-                             "RELAY_CHANNEL_COUNT": 8, "TOTAL_DROP_COUNT": 5, "MISSION_TIMEOUT": 1200,
-                             "PAYLOAD_RELAY_CHANNELS": (8, 6, 4, 1, 5),
-                             "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0, 288.0),
-                             "wait_for_start_command": Mock(), "time": module.time, "logger": Mock(),
+                             "Mission": Mock(return_value=mission), "DronePayloadServos": Mock(return_value=payload),
+                             "validate_drop_plan": Mock(), "signal": Mock(),
+                             "TOTAL_DROP_COUNT": 5, "MISSION_TIMEOUT": 1200,
+                                "wait_for_start_command": Mock(), "time": module.time, "logger": Mock(),
                              "stop_navigation_ros": Mock()}
                 exec(compile(tree, str(source), "exec"), namespace)
                 self.assertEqual(namespace["main"](), 0)
@@ -1371,7 +1373,8 @@ class WiringTests(unittest.TestCase):
                     mission.run.assert_called_once()
                 else:
                     mission.monitor_pose.assert_called_once()
-                    namespace["LCUSRelay"].assert_not_called()
+                    payload.close_all.assert_not_called()
+                self.assertEqual(payload.open_all.call_count,2)
 
 
 if __name__ == "__main__":
