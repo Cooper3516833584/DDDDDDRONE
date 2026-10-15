@@ -2416,6 +2416,8 @@ def main() -> int:
             if payload.get_states() != {channel: False for channel in range(1, 5)}:
                 raise RuntimeError("STM32 did not report all four payload targets closed")
             logger.info("[RESCUE] All four STM32 payload targets CLOSED (no mechanical feedback)")
+            # 首次模型加载可能阻塞 LIO 回调；在重建地图和标定之前完成。
+            vision.prime()
             wait_for_operator_command("position_ok", stop_event)
         navi = Navigation(fc=fc, stop_event=stop_event,
                           obstacle_planner=obstacle_planner,
@@ -2435,7 +2437,6 @@ def main() -> int:
                           route_direction=getattr(args, "route_direction", "right"))
         if args.confirm_flight:
             mission.prepare_navigation(remap_ready=True)
-            vision.prime()
             if not args.car_control:
                 logger.warning("[RESCUE] FAST-LIO 位姿重建成功")
         if args.car_control:

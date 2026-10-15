@@ -137,7 +137,14 @@ class CarEntryTests(unittest.TestCase):
         payload.open_all.side_effect = lambda: events.append("open_all")
         payload.close_all.side_effect = lambda: events.append("close_all")
         navi.start.side_effect = lambda: events.append("navigation_start")
-        vision.prime.side_effect = lambda: events.append("vision_prime")
+        navi.pose_is_fresh.return_value = True
+        def prime():
+            events.append("vision_prime")
+            navi.pose_is_fresh.return_value = False
+        vision.prime.side_effect = prime
+        def prepare_navigation(**_kwargs):
+            self.assertTrue(navi.pose_is_fresh(), "LIO must be restored after model loading")
+        mission.prepare_navigation.side_effect = prepare_navigation
         receiver.wait_for_start.return_value = SimpleNamespace(task_id=42, red=0, blue=2, green=1)
         receiver.remap_state = "ready"
         allocation = dict(red=0, blue=2, green=1)
@@ -163,7 +170,9 @@ class CarEntryTests(unittest.TestCase):
             emergency_land=Mock(), logger=Mock())
         exec(compile(tree, str(source), "exec"), namespace)
         def preflight(*_args, **_kwargs):
+            self.assertFalse(navi.pose_is_fresh(), "model loading should precede LIO rebuild")
             events.append("fastlio_rebuild")
+            navi.pose_is_fresh.return_value = True
             return preflight_result
         with patch("fastlio_control.restart_and_calibrate_fastlio",
                    side_effect=preflight) as rebuild, patch(
@@ -176,8 +185,8 @@ class CarEntryTests(unittest.TestCase):
                 payload.close_all.assert_called_once_with()
                 rebuild.assert_called_once_with(fc, navi, timeout=45)
                 self.assertEqual(events[:7], ["open_all", "loaded", "close_all",
-                                              "position_ok", "navigation_start",
-                                              "fastlio_rebuild", "vision_prime"])
+                                              "vision_prime", "position_ok",
+                                              "navigation_start", "fastlio_rebuild"])
                 namespace["logger"].warning.assert_not_called()
                 return node, receiver
             attach.side_effect = attach_after_servo_ready
@@ -208,7 +217,7 @@ class CarEntryTests(unittest.TestCase):
             item.reset_mock()
         payload.get_states.return_value = {channel: False for channel in range(1, 5)}
         receiver.wait_for_start.side_effect=RuntimeError('STOP while waiting')
-        with patch('fastlio_control.restart_and_calibrate_fastlio',return_value=preflight_result), patch(
+        with patch('fastlio_control.restart_and_calibrate_fastlio',side_effect=preflight), patch(
                 'fleet_bus.rescue_task.attach_rescue_fleet_node',return_value=(node,receiver)):
             self.assertEqual(namespace['main'](),1)
         self.assertEqual(payload.open_all.call_count,1)
