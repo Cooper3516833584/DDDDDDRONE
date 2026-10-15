@@ -221,10 +221,14 @@ class CarEntryTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1]/"rescue_drop_2026.py"
         tree = ast.parse(source.read_text(encoding="utf8"))
         parse = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "parse_args")
+        validate = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "validate_allocation")
+        future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
         import argparse
-        namespace = dict(argparse=argparse, FC_SERVER_HOST="127.0.0.1", FC_SERVER_PORT=5654, FREE_DROP_COUNT=3,
-                         validate_allocation=Mock())
-        exec(compile(ast.fix_missing_locations(ast.Module(body=[parse], type_ignores=[])), str(source), "exec"), namespace)
+        namespace = dict(argparse=argparse, FC_SERVER_HOST="127.0.0.1",
+                         FC_SERVER_PORT=5654, FREE_DROP_COUNT=3)
+        module = ast.fix_missing_locations(ast.Module(body=[future, validate, parse], type_ignores=[]))
+        exec(compile(module, str(source), "exec"), namespace)
         with patch.object(sys, "argv", ["rescue", "--confirm-flight", "--route-direction", "left"]):
             args = namespace["parse_args"]()
             self.assertTrue(args.car_control)
@@ -237,6 +241,24 @@ class CarEntryTests(unittest.TestCase):
         with patch.object(sys, "argv", ["rescue", "--car-control"]):
             self.assertFalse(namespace["parse_args"]().confirm_flight)
         with patch.object(sys, "argv", ["rescue", "--car-control", "--red-count", "2"]):
+            with self.assertRaises(SystemExit):
+                namespace["parse_args"]()
+        with patch.object(sys, "argv", ["rescue", "--manual-control", "--confirm-flight",
+                                        "--red-count", "1", "--blue-count", "1",
+                                        "--green-count", "1"]):
+            args = namespace["parse_args"]()
+            self.assertFalse(args.car_control)
+            self.assertEqual((args.red_count, args.blue_count, args.green_count), (1, 1, 1))
+        with patch.object(sys, "argv", ["rescue", "--manual-control", "--confirm-flight",
+                                        "--red-count", "1", "--blue-count", "1",
+                                        "--green-count", "0"]):
+            with self.assertRaises(SystemExit):
+                namespace["parse_args"]()
+        with patch.object(sys, "argv", ["rescue", "--manual-control", "--confirm-flight",
+                                        "--red-count", "3"]):
+            with self.assertRaises(SystemExit):
+                namespace["parse_args"]()
+        with patch.object(sys, "argv", ["rescue", "--car-control", "--manual-control"]):
             with self.assertRaises(SystemExit):
                 namespace["parse_args"]()
         namespace["FREE_DROP_COUNT"] = 4

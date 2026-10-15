@@ -2271,8 +2271,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--red-count", type=int)
     parser.add_argument("--blue-count", type=int)
     parser.add_argument("--green-count", type=int)
-    parser.add_argument("--car-control", action="store_true", default=True,
-                        help="默认使用小车 FleetBus 实际配额及启动请求，经 FC_Server/飞控 UART2")
+    control = parser.add_mutually_exclusive_group()
+    control.add_argument("--car-control", action="store_true", default=True,
+                         help="默认使用小车 FleetBus 实际配额及启动请求，经 FC_Server/飞控 UART2")
+    control.add_argument("--manual-control", dest="car_control", action="store_false",
+                         help="从命令行读取红蓝绿数量，并等待终端 start_mission")
     args = parser.parse_args()
     if args.fc_port is not None:
         parser.error("--fc-port cannot be used while FC_Server owns the serial port; "

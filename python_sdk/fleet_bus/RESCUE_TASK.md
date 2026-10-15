@@ -28,7 +28,13 @@ python3 python_sdk/rescue_drop_2026.py --car-control
 7. 已尝试起飞的任务正常结束或中止后，只有锁桨及新鲜遥测确认且 STM32 仍连接，才发送 `ALL OPEN` 打开剩余舵机，然后释放串口；起飞前退出时保留四路最后目标状态，避免装填后意外打开。
 
 手动实飞模式不接收小车 `CLOSE/REMAP/START`：同样经过终端 `loaded`、`position_ok` 和 FAST-LIO 新位姿重建，再等待终端 `start_mission`。连续投放只等待每条 STM32 命令回执，当前没有机械动作完成反馈或额外间隔，带载前需核验。
-手动模式仍使用 `--red-count/--blue-count/--green-count` 和终端 `start_mission`。
+手动模式使用 `--manual-control` 关闭默认的小车配额接收，并在启动命令中填写红、蓝、绿数量（合计 3 件；黄色固定 1 件），例如从仓库根目录运行：
+
+```bash
+python3 -u python_sdk/rescue_drop_2026.py --manual-control --confirm-flight --red-count 1 --blue-count 1 --green-count 1
+```
+
+随后按终端提示依次输入 `loaded`、`position_ok`、`start_mission`；只有最后一步才开始飞行任务。手动模式不等待小车任务信息。
 `rescue_drop_2026_clear_area.py` 共用上述参数和通信入口，仅适用于人工确认全航段净空的场地。
 超过四件的测试入口（例如三件自由物资、两件黄色物资的 two-yellow 测试）拒绝 `--confirm-flight`，避免超出舵机槽位；改变自由投放总数的入口也拒绝 `--car-control`。
 
