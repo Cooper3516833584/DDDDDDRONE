@@ -764,6 +764,7 @@ class VisualApproachTests(unittest.TestCase):
                           "TOTAL_DROP_COUNT": 4,
                           "PAYLOAD_RADIUS_CM": 8.7,
                           "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0),
+                          "slot_for_drop_attempt": lambda number: number - 1,
                           "CAMERA_VIEW_REFERENCE_HEIGHT_CM": 160.0,
                           "CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT": 300.0}
         exec(compile(module, str(source), "exec"), self.namespace)
@@ -1059,6 +1060,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
             "CAMERA_VIEW_REFERENCE_HEIGHT_CM": 160.0,
             "PAYLOAD_RADIUS_CM": 8.7,
             "PAYLOAD_ANGLES_DEG": (0.0, 72.0, 144.0, 216.0), "TOTAL_DROP_COUNT": 4,
+            "slot_for_drop_attempt": lambda number: number - 1,
             "VISUAL_PERIOD": 0.1,
             "INFLATION_ESCAPE_TIMEOUT_S": 20.0,
         }

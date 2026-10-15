@@ -68,7 +68,7 @@ class CarEntryTests(unittest.TestCase):
             namespace["connect_stm32_until_ready"](payload, fc, stopped)
         self.assertEqual(payload.connect.call_count, 1)
 
-    def test_five_drop_entry_refuses_flight_before_hardware_setup(self):
+    def test_three_drop_entry_refuses_flight_before_hardware_setup(self):
         source = Path(__file__).resolve().parents[1]/"rescue_drop_2026.py"
         tree = ast.parse(source.read_text(encoding="utf8"))
         main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
@@ -76,7 +76,7 @@ class CarEntryTests(unittest.TestCase):
         namespace = dict(
             parse_args=lambda: SimpleNamespace(confirm_flight=True, car_control=True),
             threading=threading, signal=Mock(), FREE_COLORS=("red", "blue", "green"),
-            TOTAL_DROP_COUNT=5, PAYLOAD_COUNT=4, FC_Client=Mock(), VisionInterface=Mock(),
+            TOTAL_DROP_COUNT=3, PAYLOAD_COUNT=2, FC_Client=Mock(), VisionInterface=Mock(),
             logger=Mock())
         exec(compile(module, str(source), "exec"), namespace)
         self.assertEqual(namespace["main"](), 1)
@@ -112,7 +112,7 @@ class CarEntryTests(unittest.TestCase):
         module = ast.fix_missing_locations(ast.Module(body=[main], type_ignores=[]))
         namespace = dict(parse_args=lambda: SimpleNamespace(confirm_flight=True, car_control=True),
             threading=threading, signal=Mock(), FREE_COLORS=("red", "blue", "green"),
-            TOTAL_DROP_COUNT=2, PAYLOAD_COUNT=4,
+            TOTAL_DROP_COUNT=2, PAYLOAD_COUNT=2,
             sys=SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: False)),
             FC_Client=Mock(), STM32Servos=Mock(), VisionInterface=Mock(), logger=Mock())
         exec(compile(module, str(source), "exec"), namespace)
@@ -162,7 +162,7 @@ class CarEntryTests(unittest.TestCase):
             require_flight_interfaces=Mock(), FC_Client=Mock(return_value=fc), Navigation=Mock(return_value=navi),
             Mission=Mock(return_value=mission), STM32Servos=Mock(return_value=payload),
             validate_drop_plan=Mock(),
-            TOTAL_DROP_COUNT=2, PAYLOAD_COUNT=4,
+            TOTAL_DROP_COUNT=2, PAYLOAD_COUNT=2,
             MISSION_TIMEOUT=1200,
             wait_for_operator_command=Mock(side_effect=lambda word, *_: events.append(word)),
             connect_stm32_until_ready=Mock(side_effect=lambda p, *_: p.connect()),
@@ -304,7 +304,7 @@ class CarEntryTests(unittest.TestCase):
             DropLedger=Mock(), VisionInterface=Mock(), ObstaclePlanner2D=Mock(), ObstacleInterface=Mock(),
             require_flight_interfaces=Mock(), FC_Client=Mock(return_value=fc), Navigation=Mock(return_value=navi),
             Mission=Mock(return_value=mission), STM32Servos=Mock(return_value=payload), validate_drop_plan=Mock(),
-            TOTAL_DROP_COUNT=2, PAYLOAD_COUNT=4,
+            TOTAL_DROP_COUNT=2, PAYLOAD_COUNT=2,
             wait_for_operator_command=Mock(),
             connect_stm32_until_ready=Mock(side_effect=lambda p, *_: p.connect()),
             MISSION_TIMEOUT=1200, stop_navigation_ros=Mock(),

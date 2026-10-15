@@ -1,9 +1,12 @@
 """Extract only ledger/release logic; no FlightController import or hardware."""
 import ast
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import Mock
 from types import SimpleNamespace
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from payload_servos import slot_for_drop_attempt
 
 
 class ReleaseTests(unittest.TestCase):
@@ -18,7 +21,7 @@ class ReleaseTests(unittest.TestCase):
         future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
         tree=ast.fix_missing_locations(ast.Module(body=[future,mapping,ledger,mission],type_ignores=[]))
         self.names=dict(TOTAL_DROP_COUNT=2,MANDATORY_DROP_COUNT=1,MANDATORY_COLOR='yellow',
-            FREE_COLORS=('red','blue','green'),logger=Mock(),slot_for_drop_attempt=Mock(return_value=2),drop_plan_ready=Mock(return_value=True),
+            FREE_COLORS=('red','blue','green'),logger=Mock(),slot_for_drop_attempt=slot_for_drop_attempt,drop_plan_ready=Mock(return_value=True),
             validate_drop_plan=Mock(return_value=True),
             time=SimpleNamespace(strftime=lambda *args:'2026-10-15 15:00:00',localtime=lambda:None))
         exec(compile(tree,str(source),'exec'),self.names)
@@ -57,7 +60,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_release_writes_only_mapped_slot(self):
         self.mission._drop('blue','target',True)
-        self.mission.payload.open_servo.assert_called_once_with(3)
+        self.mission.payload.open_servo.assert_called_once_with(2)
         self.mission.payload.open_all.assert_not_called()
         self.assertEqual(self.ledger.remaining['blue'],0)
         self.assertEqual(self.ledger.sent['blue'],1)
@@ -67,11 +70,10 @@ class ReleaseTests(unittest.TestCase):
 
     def test_two_production_slots_map_to_measured_stm32_channels(self):
         self.assertEqual(self.names['STM32_CHANNEL_BY_SLOT'], (2,1,3,4))
-        self.names['slot_for_drop_attempt'].side_effect=(0,1)
         for color in ('blue','yellow'):
             self.mission._drop(color,'target',True)
         self.assertEqual([call.args[0] for call in self.mission.payload.open_servo.call_args_list],
-                         [2,1])
+                         [2,3])
 
     def test_end_summary_has_only_four_color_counts_in_order(self):
         self.mission._drop('blue','target',True)

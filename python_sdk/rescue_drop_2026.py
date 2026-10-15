@@ -166,7 +166,7 @@ def payload_target_offset_px(drop_number: int, height_cm: float,
         raise ValueError("invalid camera frame size")
     radius_px = (PAYLOAD_RADIUS_CM * long_edge_px * CAMERA_VIEW_REFERENCE_HEIGHT_CM
                  / (CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT * height_cm))
-    angle = math.radians(PAYLOAD_ANGLES_DEG[drop_number - 1])
+    angle = math.radians(PAYLOAD_ANGLES_DEG[slot_for_drop_attempt(drop_number)])
     return radius_px * math.cos(angle), radius_px * math.sin(angle)
 
 
@@ -195,7 +195,7 @@ def pixel_offset_to_ground_cm(offset_px: Point, camera_height_cm: float,
 def payload_offset_body_cm(drop_number: int) -> Point:
     if drop_number < 1 or drop_number > TOTAL_DROP_COUNT:
         raise ValueError("drop number out of range")
-    angle = math.radians(PAYLOAD_ANGLES_DEG[drop_number - 1])
+    angle = math.radians(PAYLOAD_ANGLES_DEG[slot_for_drop_attempt(drop_number)])
     return PAYLOAD_RADIUS_CM * math.cos(angle), PAYLOAD_RADIUS_CM * math.sin(angle)
 
 
