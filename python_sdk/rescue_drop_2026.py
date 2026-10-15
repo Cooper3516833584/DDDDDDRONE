@@ -29,16 +29,16 @@ from FlightController.Solutions.Navigation import Navigation
 
 
 # 用户给定的航迹参数：x_1、x_2、y_l、y_r（cm）。
-TRACK_START_OFFSET_X_CM = 0.0  # x_1：起飞点前方的航迹起点
-TRACK_LENGTH_X_CM = 200.0       # x_2：航迹前后方向长度
-LEFT_SPAN_Y_CM = 157.0          # y_l：航迹起点左侧范围
-RIGHT_SPAN_Y_CM = 160.0         # y_r：航迹起点右侧范围
+TRACK_START_OFFSET_X_CM = 100.0  # x_1：起飞点前方的航迹起点
+TRACK_LENGTH_X_CM = 380.0       # x_2：航迹前后方向长度
+LEFT_SPAN_Y_CM = 355.0          # y_l：航迹起点左侧范围
+RIGHT_SPAN_Y_CM = 360.0         # y_r：航迹起点右侧范围
 CENTER_INSET_X_CM = 80.0        # 航迹 3 折返到距航迹起点前方 80 cm
 # 航迹 1/4 在名义中心起点前 50 cm 进入避障预检测交接段。
 CENTER_ENTRY_TRANSITION_CM = 50.0  # 航迹 1/4 末段交给中心避障预检测的距离
 # 目标地面高度相对起飞前 LIO 标定平面；更换场地时须重新测量这两项。
 FREE_TARGET_GROUND_HEIGHT_CM = 0.0
-MANDATORY_TARGET_GROUND_HEIGHT_CM = 30.0
+MANDATORY_TARGET_GROUND_HEIGHT_CM = 50.0
 
 FC_SERVER_HOST = "127.0.0.1"
 FC_SERVER_PORT = 5654
@@ -46,10 +46,10 @@ CRUISE_SPEED = 30.0
 INFLATION_ESCAPE_SPEED_CM_S = 5.0
 INFLATION_ESCAPE_TIMEOUT_S = 20.0  # 60 cm 短退出段以 5 cm/s 飞行，留有制动余量。
 # 以下三个高度均为 FAST-LIO startup-local Z 定高目标（cm），不是激光 AGL。
-CRUISE_HEIGHT = 100.0
+CRUISE_HEIGHT = 150.0
 LANDING_APPROACH_HEIGHT = 20.0
 VERTICAL_SPEED = 22.0
-FREE_DROP_HEIGHT = 40.0
+FREE_DROP_HEIGHT = 10.0
 MANDATORY_DROP_HEIGHT = 60.0
 TAKEOFF_POINT = (0.0, 0.0)
 LANDING_HEIGHT_TIMEOUT = 8.0
@@ -110,7 +110,7 @@ TOTAL_DROP_COUNT = FREE_DROP_COUNT + MANDATORY_DROP_COUNT
 RELAY_CHANNEL_COUNT = 8
 PAYLOAD_RELAY_CHANNELS = (8, 6, 4, 1, 5)  # 第 n 次投掷对应的继电器路号
 PAYLOAD_ANGLES_DEG = (0.0, 72.0, 144.0, 216.0, 288.0)  # 机头 0°，逆时针为正
-PAYLOAD_RADIUS_CM = 7.2
+PAYLOAD_RADIUS_CM = 8.7
 CAMERA_VIEW_REFERENCE_HEIGHT_CM = 160.0  # 高度 160cm 时长边视野 300cm
 CAMERA_VIEW_LONG_EDGE_CM_AT_REFERENCE_HEIGHT = 300.0
 FREE_COLORS = ("red", "blue", "green")
