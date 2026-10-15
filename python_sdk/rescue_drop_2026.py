@@ -746,6 +746,7 @@ class DropLedger:
         self.mandatory_remaining = MANDATORY_DROP_COUNT
         self.next_drop_number = 1
         self.skipped = []
+        self.sent = {color: 0 for color in ("red", "yellow", "blue", "green")}
 
     def record_skip(self, color):
         number = self.record_attempt(color)
@@ -1917,6 +1918,7 @@ class Mission:
         logger.info("[DROP] Attempt {} slot={} target={} color={} position_confirmed={}",
                     drop_number, slot, target_id, color, position_confirmed)
         self.payload.open_slot(slot)
+        self.ledger.sent[color] += 1
         logger.info("[DROP] OPEN SENT slot={} (release not sensor-verified)", slot)
         # 只在该颜色的指定投掷次数均已尝试后，禁止再次进入自由投掷。
         if color in FREE_COLORS and not self.ledger.has_quota(color):
@@ -2199,6 +2201,13 @@ class Mission:
             if self.navi.running:
                 self.navi.stop()
 
+    def log_drop_summary(self) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        for color, name in (("red", "红"), ("yellow", "黄"),
+                            ("blue", "蓝"), ("green", "绿")):
+            logger.opt(raw=True).info("{} 无人机 {}目标区 投放{}个货物\n".format(
+                timestamp, name, self.ledger.sent[color]))
+
 
 def emergency_land(fc: FC_Like) -> bool:
     """请求降落；未确认落地前不强制锁桨，也不打开剩余载荷。"""
@@ -2449,6 +2458,8 @@ def main() -> int:
             except Exception:
                 logger.exception("[RESCUE] Failed to close flight controller")
         signal.signal(signal.SIGTERM, previous_sigterm)
+        if takeoff_attempted and mission is not None:
+            mission.log_drop_summary()
 
 
 if __name__ == "__main__":

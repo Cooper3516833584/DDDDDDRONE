@@ -12,11 +12,12 @@ class ReleaseTests(unittest.TestCase):
         tree=ast.parse(source.read_text(encoding='utf8'))
         ledger=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='DropLedger')
         mission=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Mission')
-        mission.body=[n for n in mission.body if isinstance(n,ast.FunctionDef) and n.name in ('_drop','_skip_unconfigured_drop','_free_drop','_mandatory_drop')]
+        mission.body=[n for n in mission.body if isinstance(n,ast.FunctionDef) and n.name in ('_drop','_skip_unconfigured_drop','_free_drop','_mandatory_drop','log_drop_summary')]
         future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
         tree=ast.fix_missing_locations(ast.Module(body=[future,ledger,mission],type_ignores=[]))
         self.names=dict(TOTAL_DROP_COUNT=4,MANDATORY_DROP_COUNT=1,MANDATORY_COLOR='yellow',
-            FREE_COLORS=('red','blue','green'),logger=Mock(),slot_for_drop_attempt=Mock(return_value=2),drop_plan_ready=Mock(return_value=True))
+            FREE_COLORS=('red','blue','green'),logger=Mock(),slot_for_drop_attempt=Mock(return_value=2),drop_plan_ready=Mock(return_value=True),
+            time=SimpleNamespace(strftime=lambda *args:'2026-10-15 15:00:00',localtime=lambda:None))
         exec(compile(tree,str(source),'exec'),self.names)
         self.ledger=self.names['DropLedger'](dict(red=1,blue=1,green=1))
         self.mission=self.names['Mission']()
@@ -36,9 +37,21 @@ class ReleaseTests(unittest.TestCase):
         self.mission.payload.open_slot.assert_called_once_with(2)
         self.mission.payload.open_all.assert_not_called()
         self.assertEqual(self.ledger.remaining['blue'],0)
+        self.assertEqual(self.ledger.sent['blue'],1)
         with self.assertRaisesRegex(RuntimeError,'quota'):
             self.mission._drop('blue','target',True)
         self.mission.payload.open_slot.assert_called_once()
+
+    def test_end_summary_has_only_four_color_counts_in_order(self):
+        self.mission._drop('blue','target',True)
+        self.mission.log_drop_summary()
+        self.assertEqual([call.args[0] for call in self.names['logger'].opt.return_value.info.call_args_list], [
+            '2026-10-15 15:00:00 无人机 红目标区 投放0个货物\n',
+            '2026-10-15 15:00:00 无人机 黄目标区 投放0个货物\n',
+            '2026-10-15 15:00:00 无人机 蓝目标区 投放1个货物\n',
+            '2026-10-15 15:00:00 无人机 绿目标区 投放0个货物\n'])
+        self.assertEqual(self.names['logger'].opt.call_count,4)
+        self.assertTrue(all(call.kwargs=={'raw':True} for call in self.names['logger'].opt.call_args_list))
 
     def test_unknown_mapping_does_not_claim_a_drop(self):
         self.names['drop_plan_ready'].return_value=False
@@ -46,6 +59,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.ledger.next_drop_number,2)
         self.assertEqual(self.ledger.remaining['blue'],0)
         self.assertEqual(self.ledger.skipped,[(1,'blue')])
+        self.assertEqual(self.ledger.sent['blue'],0)
         self.mission.payload.open_slot.assert_not_called()
 
     def test_failed_ipc_consumes_attempt_instead_of_claiming_retry_cargo(self):
@@ -54,6 +68,7 @@ class ReleaseTests(unittest.TestCase):
             self.mission._drop('blue','target',True)
         self.assertEqual(self.ledger.next_drop_number,2)
         self.assertEqual(self.ledger.remaining['blue'],0)
+        self.assertEqual(self.ledger.sent['blue'],0)
 
     def test_unknown_free_target_skips_approach_descent_and_release(self):
         self.names['drop_plan_ready'].return_value=False

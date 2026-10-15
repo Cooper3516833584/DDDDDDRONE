@@ -37,6 +37,7 @@ class CarEntryTests(unittest.TestCase):
         self.assertIsNone(attach.call_args.kwargs["payload"])
         mission.prepare_navigation.assert_called_once_with()
         mission.monitor_pose.assert_called_once_with()
+        mission.log_drop_summary.assert_not_called()
 
     def test_five_drop_entry_refuses_flight_before_hardware_setup(self):
         source = Path(__file__).resolve().parents[1]/"rescue_drop_2026.py"
@@ -92,6 +93,7 @@ class CarEntryTests(unittest.TestCase):
         mission.prepare_navigation.assert_called_once_with(remap_ready=True)
         ledger.assert_called_once_with(allocation)
         mission.run.assert_called_once()
+        mission.log_drop_summary.assert_called_once()
         namespace["wait_for_start_command"].assert_not_called()
         node.close.assert_called_once()
         fc.close.assert_called_once()
@@ -105,6 +107,7 @@ class CarEntryTests(unittest.TestCase):
             self.assertEqual(namespace['main'](),1)
         self.assertEqual(payload.open_all.call_count,2)
         mission.run.assert_not_called()
+        mission.log_drop_summary.assert_not_called()
         vision.prime.assert_called_once()
 
     def test_cli_network_counts_and_flight_confirmation(self):
@@ -168,6 +171,7 @@ class CarEntryTests(unittest.TestCase):
         self.assertEqual(events[:4], ["navigation_stop", "landing_request",
                                      "receiver_close", "mission_stop"])
         namespace["emergency_land"].assert_called_once_with(fc)
+        mission.log_drop_summary.assert_called_once()
         # Landing was requested but lock remained unconfirmed: no midair OPEN.
         self.assertEqual(payload.open_all.call_count,1)
 
