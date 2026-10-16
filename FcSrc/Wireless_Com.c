@@ -48,13 +48,14 @@ void Uart_Wireless_GetOneByte(u8 data) {
     _wl_state = 2;
   } else if (_wl_state == 2)  // 长度
   {
-    _wl_state = 3;
+    _wl_state = data > 0 ? 3 : 0;
     _wl_data_len = data;  // 数据长度
     _wl_data_cnt = 0;
   } else if (_wl_state == 3 && _wl_data_len > 0) {
     _wl_data_len--;
     wl_data_temp[_wl_data_cnt++] = data;  // 数据
     if (_wl_data_len == 0) {
+      _wl_state = 0;  // Complete this frame before consuming the next header.
       Wireless_DataAnl(wl_data_temp, _wl_data_cnt);
     }
   } else
