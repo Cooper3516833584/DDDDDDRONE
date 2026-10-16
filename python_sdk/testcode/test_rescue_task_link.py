@@ -45,16 +45,16 @@ class RescueLinkTests(unittest.TestCase):
 
     def test_counts_saved_before_start_no_localization_required(self):
         self.ready()
-        task = DropTask(42, 0, 0, 1)
+        task = DropTask(42, 0, 0, 0)
         self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(task)).status, AckStatus.COMPLETED)
         self.assertEqual(self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42)).status, AckStatus.ACCEPTED)
-        self.assertEqual(self.receiver.wait_for_start(.01).allocation(), dict(red=0, blue=0, green=1))
+        self.assertEqual(self.receiver.wait_for_start(.01).allocation(), dict(red=0, blue=0, green=0))
 
     def test_missing_mismatched_task_or_controller_session_never_starts(self):
         for session, task_id in ((123, 42), (124, 41)):
             ack = self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(task_id), session=session)
             self.assertEqual((ack.status, ack.reason), (AckStatus.REJECTED, AckReason.NOT_READY))
-        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(41, 1, 0, 0)))
+        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(41, 0, 0, 0)))
         self.assertEqual(self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42)).status, AckStatus.REJECTED)
         self.assertEqual(self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(41), session=124).status, AckStatus.REJECTED)
         with self.assertRaises(TimeoutError):
@@ -62,11 +62,11 @@ class RescueLinkTests(unittest.TestCase):
 
     def test_ground_station_cannot_directly_supply_tasks(self):
         self.assertIsNone(self.request(CommandId.DRONE_SET_DROP_TASK,
-                         encode_drop_task(DropTask(42, 0, 1, 0)), source=NodeId.GROUND))
+                         encode_drop_task(DropTask(42, 0, 0, 0)), source=NodeId.GROUND))
 
     def test_duplicate_task_and_start_do_not_reinitialize_active_task(self):
         self.ready()
-        body = encode_drop_task(DropTask(42, 0, 1, 0))
+        body = encode_drop_task(DropTask(42, 0, 0, 0))
         ack1 = self.request(CommandId.DRONE_SET_DROP_TASK, body, seq=10)
         self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK, body, seq=10), ack1)
         self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42))
@@ -74,24 +74,24 @@ class RescueLinkTests(unittest.TestCase):
         self.assertEqual(self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42)).status, AckStatus.ACCEPTED)
         self.assertIs(self.receiver.wait_for_start(.01), task)
         self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK,
-                         encode_drop_task(DropTask(43, 1, 0, 0))).reason, AckReason.BUSY)
+                         encode_drop_task(DropTask(43, 0, 0, 0))).reason, AckReason.BUSY)
 
     def test_bad_data_and_same_id_changed_quota_rejected(self):
         for data in (b"", struct.pack("<BI3B",1,42,0,0,1),
-                     struct.pack("<BI3B",2,42,2,0,1), struct.pack("<BI3B",2,42,0,0,0)):
+                     struct.pack("<BI3B",3,42,2,0,1), struct.pack("<BI3B",2,42,0,0,0)):
             self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK, data).reason, AckReason.BAD_PAYLOAD)
-        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(42, 1, 0, 0)))
+        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(42, 0, 0, 0)))
         self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK,
-                         encode_drop_task(DropTask(42, 0, 1, 0))).reason, AckReason.BAD_PAYLOAD)
+                         struct.pack("<BI3B",3,42,0,1,0)).reason, AckReason.BAD_PAYLOAD)
 
     def test_stop_before_launch_cancels_and_monitor_mode_refuses_start(self):
-        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(42, 1, 0, 0)))
+        self.request(CommandId.DRONE_SET_DROP_TASK, encode_drop_task(DropTask(42, 0, 0, 0)))
         self.request(CommandId.DRONE_START_DROP_TASK, encode_drop_start(42))
         self.assertEqual(self.request(CommandId.TARGETED_STOP).status, AckStatus.ACCEPTED)
         with self.assertRaises(RuntimeError):
             self.receiver.wait_for_start(.01)
         receiver = RescueTaskReceiver(threading.Event())
-        receiver.set_task(1, DropTask(1, 0, 1, 0))
+        receiver.set_task(1, DropTask(1, 0, 0, 0))
         self.assertEqual(receiver.request_start(1, 1), (AckStatus.REJECTED, AckReason.NOT_READY))
 
     def test_run_body_authorization_and_late_close_after_stop(self):
@@ -140,7 +140,7 @@ class RescueLinkTests(unittest.TestCase):
         self.node.receiver = self.receiver
         body = struct.pack('<BI', 1, 7)
         self.assertEqual(self.request(CommandId.DRONE_SET_DROP_TASK,
-                         encode_drop_task(DropTask(42, 1, 0, 0))).status, AckStatus.COMPLETED)
+                         encode_drop_task(DropTask(42, 0, 0, 0))).status, AckStatus.COMPLETED)
         with patch('fastlio_control.restart_and_calibrate_fastlio') as restart:
             self.assertEqual(self.request(CommandId.DRONE_PAYLOAD_CLOSE, body).status,
                              AckStatus.COMPLETED)
@@ -166,7 +166,7 @@ class RescueLinkTests(unittest.TestCase):
             validate_plan=lambda: None,
             preflight_result=dict(needs_calibration=False, pose={'stamp_ns': 123}))
         self.node.receiver = self.receiver
-        self.receiver.set_task(123, DropTask(42, 1, 0, 0))
+        self.receiver.set_task(123, DropTask(42, 0, 0, 0))
         self.assertEqual(self.receiver.close_payload(123, 7)[0], AckStatus.FAILED)
         self.assertEqual(self.receiver.request_start(123, 42)[0], AckStatus.REJECTED)
         self.payload.get_states.return_value = {channel: False for channel in range(1, 5)}
@@ -174,7 +174,7 @@ class RescueLinkTests(unittest.TestCase):
             payload=self.payload, fc=self.fc, navigation=self.navi,
             validate_plan=lambda: None,
             preflight_result=dict(needs_calibration=False, pose={'stamp_ns': 123}))
-        self.receiver.set_task(123, DropTask(42, 1, 0, 0))
+        self.receiver.set_task(123, DropTask(42, 0, 0, 0))
         self.assertEqual(self.receiver.close_payload(123, 7)[0], AckStatus.COMPLETED)
         self.navi.pose_is_fresh.return_value = False
         self.assertEqual(self.receiver.rebuild_map(123, 7),
@@ -212,7 +212,7 @@ class RescueLinkTests(unittest.TestCase):
                     payload=self.payload, fc=self.fc, navigation=self.navi,
                     validate_plan=lambda: None)
                 self.assertEqual(receiver.close_payload(123, 7)[0], AckStatus.COMPLETED)
-                receiver.set_task(123, DropTask(42, 1, 0, 0))
+                receiver.set_task(123, DropTask(42, 0, 0, 0))
                 with patch('fastlio_control.restart_and_calibrate_fastlio',
                            side_effect=failure):
                     self.assertEqual(receiver.rebuild_map(123, 7)[0], AckStatus.ACCEPTED)
@@ -222,7 +222,7 @@ class RescueLinkTests(unittest.TestCase):
                                  (AckStatus.REJECTED, AckReason.NOT_READY))
 
     def test_start_requires_current_run_ready_and_physical_mapping(self):
-        self.receiver.set_task(123,DropTask(42,1,0,0))
+        self.receiver.set_task(123,DropTask(42, 0, 0, 0))
         self.assertEqual(self.receiver.request_start(123,42)[0],AckStatus.REJECTED)
         self.ready()
         self.receiver._validate_plan=Mock(side_effect=RuntimeError('mapping unknown'))
@@ -232,7 +232,7 @@ class RescueLinkTests(unittest.TestCase):
 
     def test_unknown_installation_allows_start_with_release_skipped(self):
         self.ready()
-        self.receiver.set_task(123,DropTask(42,1,0,0))
+        self.receiver.set_task(123,DropTask(42, 0, 0, 0))
         self.receiver._validate_plan=lambda:False
         self.assertEqual(self.receiver.request_start(123,42)[0],AckStatus.ACCEPTED)
 

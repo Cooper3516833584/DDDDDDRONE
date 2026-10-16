@@ -24,6 +24,7 @@ htmlcov/
 
 /fc_log/
 /python_sdk/fc_log/
+/python_sdk/testcode/fc_log/
 /python_sdk/visual/
 /python_sdk/temp/
 /python_sdk/vision_for_simulation/ring_detection_*.log

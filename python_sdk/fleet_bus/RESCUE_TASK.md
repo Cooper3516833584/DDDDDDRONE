@@ -1,11 +1,11 @@
 # 小车控制的救援投放配额
 
-任务板是红、蓝、绿地块三行数量，必须为 2/1/1 排列。小车自主取双件颜色及按红、蓝、绿顺序的首个单件颜色，另一个单件颜色发给无人机。小车加黄色共四件，无人机仅投黄色一件和选投一件，共两件。
+任务板是红、蓝、绿地块三行数量，必须为 2/1/1 排列。小车取红蓝绿全部四件及黄色一件，共五件；无人机仅投隐含黄色一件，RGB 配额必须全零。
 `rescue_drop_2026.py` 通过现有 FC_Server/飞控 UART2 FleetBus 接收小车实际配额及匹配的启动请求；投放通过独立 STM32 串口组件控制 4 路舵机，不调用飞控 PWM，也不打开机载继电器串口。
 
-`0x26 DRONE_SET_DROP_TASK` body 为 `<BI3B`：版本 2、非零 task_id、红/蓝/绿数量。校验并保存成功才回复 `COMPLETED`。
-`0x27 DRONE_START_DROP_TASK` body 为 `<BI`：版本 2、相同 task_id。只接受与已保存数据相同的小车 session/任务编号，且终端装填确认、四路关闭和新位姿重建均已完成，并收到同一轮的 `CLOSE/REMAP` 确认请求，回复 `ACCEPTED`。
-源必须为小车 `0x20`，目标必须为无人机 `0x10`。地面站直接命令不会触发此接收器。合法配额每色 0～1、合计 1，黄色必投固定 1 件。
+`0x26 DRONE_SET_DROP_TASK` body 为 `<BI3B`：版本 3、非零 task_id、红/蓝/绿数量。校验并保存成功才回复 `COMPLETED`。
+`0x27 DRONE_START_DROP_TASK` body 为 `<BI`：版本 3、相同 task_id。只接受与已保存数据相同的小车 session/任务编号，且终端装填确认、四路关闭和新位姿重建均已完成，并收到同一轮的 `CLOSE/REMAP` 确认请求，回复 `ACCEPTED`。
+源必须为小车 `0x20`，目标必须为无人机 `0x10`。地面站直接命令不会触发此接收器。合法配额每色均为整数 0、合计 0，黄色必投固定 1 件。
 
 `rescue_task.py` 的无线回调只进入 FleetBus 队列，工作线程保存配额/启动标记，不控制导航或执行器。主入口等待匹配开始后，将实际数量传入 `DropLedger`，随后执行原任务。重复帧复用 ACK 缓存，重复开始不会重置账本。
 收到 `TARGETED_STOP` 后设置任务 stop_event，仅回复已接受；实际着陆依赖主程序清理路径，ACK 不代表已经落地。剩余载荷只在遥测确认锁桨后发送打开命令；锁桨未确认时不打开。
@@ -15,7 +15,7 @@
 python3 python_sdk/rescue_drop_2026.py --car-control
 ```
 
-实际比赛需在人工确认环境、定位、视觉、舵机安装和释放动作后，使用 `--car-control --confirm-flight`。正式任务仅使用前两个投放顺位（STM32 通道 2、1），按先遇到的目标顺序投放，装填这两路共两件；其余两路保持空载。视觉投放槽位 0～3 为机头前方起算、逆时针为正的 0°、72°、144°、216° 位置，半径 8.7 cm；用户实测它们依次对应 STM32 通道 2、1、3、4。此模式不得同时传命令行颜色数量，正式配额仅来自小车。
+实际比赛需在人工确认环境、定位、视觉、舵机安装和释放动作后，使用 `--car-control --confirm-flight`。正式任务仅使用一个投放顺位，`DROP_SERVO_SEQUENCE=(2,)`，对应144°位置/STM32通道3。这是本轮暂定黄色装载位置，尚未实机核验；飞行前必须按实际装填确认。若黄色实际装在原第一位置，应在本地改为 `(0,)`（STM32通道2），重新验证并经GitHub部署，不能两路同时选择。四路 open_all/close_all 与四路关闭检查完整保留，其余三路空载。视觉投放槽位 0～3 为机头前方起算、逆时针为正的 0°、72°、144°、216° 位置，半径 8.7 cm；用户实测它们依次对应 STM32 通道 2、1、3、4。此模式不得同时传命令行颜色数量，正式配额仅来自小车。
 
 主任务时序（通过 SSH 交互式终端启动、小车控制且允许实飞时）：
 
@@ -24,19 +24,19 @@ python3 python_sdk/rescue_drop_2026.py --car-control
 3. `position_ok` 后才启动导航 ROS 监听、废止旧基点、重启 FAST-LIO 服务，并等待新实例的位姿与静止校准。定位、相机和无线接收器准备完成后终端显示 `FAST-LIO 位姿重建成功；无线接收已就绪，现在可启动小车`，此时再启动小车。
 4. 无人机通过既有无线链路接收小车任务。小车本轮 `CLOSE` 只核对 STM32 四路目标仍为关闭并回复，不再发送舵机动作；`REMAP` 只复核已重建的新位姿仍新鲜并回复，不再重启 FAST-LIO。两条命令仍与小车的 run_id/session 绑定，协议格式不变。
 5. 新位姿仍新鲜且本轮任务、释放映射、STM32 连接均有效，才接受 `START`。主线程再次复核定位后预热视觉、起飞。
-6. 到目标并完成低空位置检查时，按投放顺位把槽位 0～3 映射到通道 2、1、3、4，逐路发送 `OPEN`。自由目标高度为 startup-local Z 10 cm，黄色目标为 60 cm；命令回执不是机械释放反馈。
+6. 到目标并完成低空位置检查时，唯一黄色投放按 slot2 映射到 STM32 通道3，只发送一次 `OPEN`。自由目标高度为 startup-local Z 10 cm，黄色目标为 60 cm；命令回执不是机械释放反馈。
 7. 已尝试起飞的任务正常结束或中止后，只有锁桨及新鲜遥测确认且 STM32 仍连接，才发送 `ALL OPEN` 打开剩余舵机，然后释放串口；起飞前退出时保留四路最后目标状态，避免装填后意外打开。
 
 手动实飞模式不接收小车 `CLOSE/REMAP/START`：同样经过终端 `loaded`、`position_ok` 和 FAST-LIO 新位姿重建，再等待终端 `start_mission`。连续投放只等待每条 STM32 命令回执，当前没有机械动作完成反馈或额外间隔，带载前需核验。
-手动模式使用 `--manual-control` 关闭默认的小车配额接收，并在启动命令中填写红、蓝、绿数量（合计 1 件；黄色固定 1 件），例如从仓库根目录运行：
+手动模式使用 `--manual-control` 关闭默认的小车配额接收，并在启动命令中填写红、蓝、绿数量（全部为 0；黄色固定 1 件），例如从仓库根目录运行：
 
 ```bash
-python3 -u python_sdk/rescue_drop_2026.py --manual-control --confirm-flight --red-count 0 --blue-count 0 --green-count 1
+python3 -u python_sdk/rescue_drop_2026.py --manual-control --confirm-flight --red-count 0 --blue-count 0 --green-count 0
 ```
 
 随后按终端提示依次输入 `loaded`、`position_ok`、`start_mission`；只有最后一步才开始飞行任务。手动模式不等待小车任务信息。
 `rescue_drop_2026_clear_area.py` 共用上述参数和通信入口，仅适用于人工确认全航段净空的场地。
-超过四件的测试入口（例如三件自由物资、两件黄色物资的 two-yellow 测试）拒绝 `--confirm-flight`，避免超出舵机槽位；自由投放数量不是一件的入口也拒绝 `--car-control`。
+超过四件的测试入口（例如三件自由物资、两件黄色物资的 two-yellow 测试）拒绝 `--confirm-flight`，避免超出舵机槽位；自由投放数量不为零的入口也拒绝 `--car-control`。
 
 `--confirm-flight` 要求交互式终端输入；仓库现有的 `rescue-drop-listener.service.in` 不提供该输入，不能用它直接运行此人工确认流程。通信接收不会自动安装服务或重启任务。双方结束后重启待命、地面站到小车常驻接收和整个任务自启动仍待接入。本次测试不进行真实起飞、落地或投放。
 
@@ -47,7 +47,9 @@ PYTHONPATH=python_sdk python3 -m unittest discover -s python_sdk/testcode -p 'te
 PYTHONPATH=python_sdk python3 -m unittest discover -s python_sdk/testcode -p 'test_air_fleet_node.py'
 ```
 
-任务/START 消息使用版本 2，拒绝旧版任务，车机两端须一起更新。CLOSE/REMAP 的运行编号消息仍用版本 1。
+任务/START 消息使用版本 3，拒绝旧版任务，车机两端须一起更新。CLOSE/REMAP 的运行编号消息仍用版本 1。
+
+当前v3/黄色一件验证结果与限制见 [PAYLOAD_V3_ACCEPTANCE_20261016.md](PAYLOAD_V3_ACCEPTANCE_20261016.md)。
 
 ## 历史修改与验证（2026-10-11）
 
@@ -58,7 +60,7 @@ PYTHONPATH=python_sdk python3 -m unittest discover -s python_sdk/testcode -p 'te
 合入远端已有的任务更新后，避障和主入口扩展回归执行 67 项，其中 66 项通过；既有 `test_real_spline_can_leave_a_clear_polyline` 被本机 NumPy 2.5.1 / SciPy 1.15.3 的加载错误 `cannot load module more than once per process` 阻断。单独执行该测试也失败；该测试方法及其被调用的底层文件未被本次通信提交修改。未更改本机或设备的依赖版本。
 按用户要求仅推送 GitHub，本次不拉取设备、不启动飞行程序。真实无线链路、距离/干扰、起飞、落地、投放和双方重启待命未做验证。
 
-## 2026-10-16 本次变更与离线验证
+## 历史阶段记录：2026-10-16 optional=1 版本（已被v3取代）
 
 - 主入口仅接受一件自由投放配额；固定黄色一件，总投放尝试上限两次。保留四路物理容量及原安全清理，不修改底层飞控代码。
 - 修改 Python 文件的 `py_compile` 与 `git diff --check`：通过。

@@ -11,6 +11,27 @@ DATA = json.loads((Path(__file__).parent / "data" / "fleetbus_v1_golden.json").r
 
 
 class FleetProtocolTests(unittest.TestCase):
+    def test_drop_v3_zero_rgb_and_start_id_contract_inside_v1(self):
+        import struct
+        from fleet_bus.drop_task_protocol import (
+            DropTask, encode_drop_task, decode_drop_task, encode_drop_start, decode_drop_start)
+        for task_id in (1,42,0xffffffff):
+            task = DropTask(task_id,0,0,0)
+            self.assertEqual(encode_drop_task(task), struct.pack('<BI3B',3,task_id,0,0,0))
+            self.assertEqual(decode_drop_task(encode_drop_task(task)), task)
+            self.assertEqual(decode_drop_start(encode_drop_start(task_id)), task_id)
+        for quota in ((1,0,0),(0,1,0),(0,0,1),(True,0,0),(0.,0,0)):
+            with self.subTest(quota=quota), self.assertRaises(ValueError):
+                DropTask(42,*quota)
+        for task_id in (True,0,-1,0x100000000,'1',1.):
+            with self.subTest(task_id=task_id), self.assertRaises(ValueError):
+                encode_drop_start(task_id)
+        for version in (1,2):
+            with self.assertRaises(ValueError):
+                decode_drop_task(struct.pack('<BI3B',version,42,0,0,0))
+            with self.assertRaises(ValueError):
+                decode_drop_start(struct.pack('<BI',version,42))
+
     def test_v1_wire_contract_constants(self):
         self.assertEqual(MAGIC, b"\xd3\x91")
         self.assertEqual(TAIL, b"\x1d\x0f")
