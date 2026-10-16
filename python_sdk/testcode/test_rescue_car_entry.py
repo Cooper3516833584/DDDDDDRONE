@@ -70,7 +70,6 @@ class MandatoryEntryTests(unittest.TestCase):
         payload.open_all.side_effect = lambda: events.append("open")
         payload.close_all.side_effect = lambda: events.append("close")
         vision.prime.side_effect = lambda: events.append("prime")
-        navi.start.side_effect = lambda: events.append("navi_start")
         mission.prepare_navigation.side_effect = lambda **_: events.append("prepare")
         mission.validate_payload_ready.side_effect = lambda: (events.append("validate") or True)
         mission.run.side_effect = lambda: events.append("run")
@@ -88,39 +87,56 @@ class MandatoryEntryTests(unittest.TestCase):
             wait_for_operator_command=Mock(side_effect=lambda word, *_: events.append(word)),
             stop_navigation_ros=Mock(), emergency_land=Mock(), logger=Mock())
         main = load_function("main", namespace)
-        def preflight(*_args, **_kwargs):
-            events.append("fastlio_rebuild")
-            return {"needs_calibration": False, "pose": {"stamp_ns": 123}}
-        return main, namespace, (fc, payload, mission, navi, vision), events, preflight
+        return main, namespace, (fc, payload, mission, navi, vision), events
 
-    def test_position_ok_and_checks_start_without_car_or_second_command(self):
-        main, namespace, (fc, payload, mission, navi, vision), events, preflight = self._flight_fakes()
-        with patch.dict(sys.modules, {"fastlio_control": SimpleNamespace(
-                restart_and_calibrate_fastlio=preflight)}):
-            self.assertEqual(main(), 0)
-        self.assertEqual(events[:10], ["open", "loaded", "close", "prime",
-                                       "position_ok", "navi_start", "fastlio_rebuild",
-                                       "prepare", "validate", "run"])
+    def test_start_command_precedes_navigation_checks_and_flight(self):
+        main, namespace, (fc, payload, mission, navi, vision), events = self._flight_fakes()
+        self.assertEqual(main(), 0)
+        self.assertEqual(events[:8], ["open", "loaded", "close", "prime",
+                                      "start_mission", "prepare", "validate", "run"])
+        self.assertEqual([call.args[0] for call in
+                          namespace["wait_for_operator_command"].call_args_list],
+                         ["loaded", "start_mission"])
         vision.set_allocation.assert_called_once_with(
             {"red": 0, "blue": 0, "green": 0})
-        mission.prepare_navigation.assert_called_once_with(remap_ready=True)
+        mission.prepare_navigation.assert_called_once_with()
         mission.run.assert_called_once_with()
         mission.log_drop_summary.assert_called_once_with()
         self.assertEqual(payload.open_all.call_count, 2)
         fc.close.assert_called_once_with()
 
     def test_failed_preflight_blocks_takeoff_and_summary(self):
-        main, namespace, (_, payload, mission, _, _), events, preflight = self._flight_fakes()
+        main, namespace, (_, payload, mission, _, _), events = self._flight_fakes()
         mission.validate_payload_ready.side_effect = lambda: False
-        with patch.dict(sys.modules, {"fastlio_control": SimpleNamespace(
-                restart_and_calibrate_fastlio=preflight)}):
-            self.assertEqual(main(), 1)
+        self.assertEqual(main(), 1)
         mission.run.assert_not_called()
         mission.log_drop_summary.assert_not_called()
         self.assertEqual(payload.open_all.call_count, 1)
 
+    def test_missing_fresh_lio_pose_after_start_blocks_takeoff(self):
+        main, namespace, (_, payload, mission, _, _), events = self._flight_fakes()
+        mission.prepare_navigation.side_effect = RuntimeError("fresh LIO pose unavailable")
+        self.assertEqual(main(), 1)
+        mission.validate_payload_ready.assert_not_called()
+        mission.run.assert_not_called()
+        self.assertEqual(payload.open_all.call_count, 1)
+
+    def test_no_start_command_keeps_navigation_and_flight_stopped(self):
+        main, namespace, (_, payload, mission, _, _), events = self._flight_fakes()
+        def wait_or_fail(word, *_):
+            if word == "start_mission":
+                raise RuntimeError("terminal closed")
+            events.append(word)
+        namespace["wait_for_operator_command"].side_effect = wait_or_fail
+        self.assertEqual(main(), 1)
+        self.assertEqual(events, ["open", "loaded", "close", "prime"])
+        namespace["Navigation"].assert_not_called()
+        mission.prepare_navigation.assert_not_called()
+        mission.run.assert_not_called()
+        self.assertEqual(payload.open_all.call_count, 1)
+
     def test_failed_mission_requests_landing_before_cleanup(self):
-        main, namespace, (fc, payload, mission, navi, _), events, preflight = self._flight_fakes()
+        main, namespace, (fc, payload, mission, navi, _), events = self._flight_fakes()
         def fail_in_flight():
             fc.state.unlock.value = True
             events.append("flight_failed")
@@ -129,9 +145,7 @@ class MandatoryEntryTests(unittest.TestCase):
         navi.stop.side_effect = lambda: events.append("navigation_stop")
         namespace["emergency_land"].side_effect = lambda _: events.append("landing_request")
         mission.stop.side_effect = lambda: events.append("mission_stop")
-        with patch.dict(sys.modules, {"fastlio_control": SimpleNamespace(
-                restart_and_calibrate_fastlio=preflight)}):
-            self.assertEqual(main(), 1)
+        self.assertEqual(main(), 1)
         self.assertLess(events.index("navigation_stop"), events.index("landing_request"))
         self.assertLess(events.index("landing_request"), events.index("mission_stop"))
         namespace["emergency_land"].assert_called_once_with(fc)
@@ -140,7 +154,7 @@ class MandatoryEntryTests(unittest.TestCase):
 
     def test_operator_confirmations_ignore_other_input_and_stop(self):
         terminal = Mock()
-        terminal.readline.side_effect = ["load\n", "loaded\n", "position_ok\n", ""]
+        terminal.readline.side_effect = ["load\n", "loaded\n", "start_mission\n", ""]
         namespace = dict(threading=threading,
                          sys=SimpleNamespace(stdin=terminal),
                          select=SimpleNamespace(select=lambda *_: ([terminal], [], [])),
@@ -148,7 +162,7 @@ class MandatoryEntryTests(unittest.TestCase):
         wait = load_function("wait_for_operator_command", namespace)
         stopped = threading.Event()
         wait("loaded", stopped)
-        wait("position_ok", stopped)
+        wait("start_mission", stopped)
         self.assertEqual(terminal.readline.call_count, 3)
         with self.assertRaisesRegex(RuntimeError, "closed"):
             wait("loaded", stopped)

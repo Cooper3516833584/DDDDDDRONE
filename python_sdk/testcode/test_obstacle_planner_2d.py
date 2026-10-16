@@ -1567,10 +1567,7 @@ class WiringTests(unittest.TestCase):
                              "time": module.time, "logger": Mock(),
                              "stop_navigation_ros": Mock()}
                 exec(compile(tree, str(source), "exec"), namespace)
-                fake_fastlio = SimpleNamespace(restart_and_calibrate_fastlio=Mock(
-                    return_value=dict(needs_calibration=False, pose={"stamp_ns": 123})))
-                with patch.dict(sys.modules, {"fastlio_control": fake_fastlio}):
-                    self.assertEqual(namespace["main"](), 0)
+                self.assertEqual(namespace["main"](), 0)
                 fc.connect.assert_called_once_with(
                     host="127.0.0.1", port=5654, authkey=b"fc",
                     print_state=False, block=True, timeout=10)

@@ -2,7 +2,7 @@
 
 默认通过 FC_Server 连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
 避障接口实现和已确认的释放映射。实飞通过交互式终端依次输入
-``loaded``、``position_ok``，随后重建并校准 FAST-LIO 位姿，通过飞前检查后起飞。
+``loaded``、``start_mission``，随后校准当前 FAST-LIO 位姿，通过飞前检查后起飞。
 机上自启动的 server_ros.py / FC_Server 独占飞控串口，本任务不直连串口。
 
 导航坐标单位为 cm，x 向前、y 向左；高度单位为 cm。
@@ -2257,7 +2257,7 @@ def main() -> int:
             if not 1 <= TOTAL_DROP_COUNT <= PAYLOAD_COUNT:
                 raise RuntimeError("drop count exceeds available servo payload slots")
             if not sys.stdin.isatty():
-                raise RuntimeError("loaded/position_ok require an interactive terminal")
+                raise RuntimeError("loaded/start_mission require an interactive terminal")
             vision = VisionInterface()
             vision.set_allocation(allocation)
             obstacle_planner = ObstaclePlanner2D()
@@ -2291,32 +2291,22 @@ def main() -> int:
             if payload.get_states() != {channel: False for channel in range(1, 5)}:
                 raise RuntimeError("STM32 did not report all four payload targets closed")
             logger.info("[RESCUE] All four STM32 payload targets CLOSED (no mechanical feedback)")
-            # 首次模型加载可能阻塞 LIO 回调；在重建地图和标定之前完成。
+            # 首次模型加载可能阻塞 LIO 回调；在启动导航和标定之前完成。
             vision.prime()
-            wait_for_operator_command("position_ok", stop_event)
+            wait_for_operator_command("start_mission", stop_event)
         navi = Navigation(fc=fc, stop_event=stop_event,
                           obstacle_planner=obstacle_planner,
                           height_source="lio")
-        if args.confirm_flight:
-            from fastlio_control import restart_and_calibrate_fastlio
-
-            if stop_event.is_set():
-                raise RuntimeError("task stopped before FAST-LIO rebuild")
-            navi.start()
-            preflight_result = restart_and_calibrate_fastlio(fc, navi, timeout=45)
-            if (preflight_result.get("needs_calibration") is not False
-                    or not preflight_result.get("pose")):
-                raise RuntimeError("new FAST-LIO pose/calibration is not ready")
         mission = Mission(fc, navi, payload, vision, obstacle, allocation, stop_event,
                           vision_diagnostics=getattr(args, "vision_diagnostics", True),
                           route_direction=getattr(args, "route_direction", "right"))
         if args.confirm_flight:
-            mission.prepare_navigation(remap_ready=True)
+            mission.prepare_navigation()
             if not mission.validate_payload_ready():
                 raise RuntimeError("mandatory cargo release plan is not ready")
             if not fc.state.is_fresh(0.5) or fc.state.unlock.value:
                 raise RuntimeError("FC lock/telemetry lost before takeoff")
-            logger.warning("[RESCUE] FAST-LIO 位姿重建及飞前检查成功，开始黄色必投任务")
+            logger.warning("[RESCUE] FAST-LIO 位姿标定及飞前检查成功，开始黄色必投任务")
         else:
             mission.prepare_navigation()
             mission.monitor_pose()
