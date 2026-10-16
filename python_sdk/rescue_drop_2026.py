@@ -1,9 +1,8 @@
-"""2026 空地协同救援物资投放赛无人机主入口。
+"""2026 救援物资黄色必投无人机主入口。
 
 默认通过 FC_Server 连接飞控并监视 LIO 位姿；真实飞行还需 ``--confirm-flight``、
-避障接口实现、已确认的释放映射和开始指令。默认从小车接收实际投放配额
-及匹配的启动请求；手动模式使用命令行配额和终端 ``start_mission``。
-实飞通过交互式终端依次输入 ``loaded``、``position_ok``，随后重建 FAST-LIO 位姿。
+避障接口实现和已确认的释放映射。实飞通过交互式终端依次输入
+``loaded``、``position_ok``，随后重建并校准 FAST-LIO 位姿，通过飞前检查后起飞。
 机上自启动的 server_ros.py / FC_Server 独占飞控串口，本任务不直连串口。
 
 导航坐标单位为 cm，x 向前、y 向左；高度单位为 cm。
@@ -111,7 +110,7 @@ MANDATORY_REBIND_MAX_DISTANCE_CM = 30.0  # 只接续原目标附近的新黄色�
 MANDATORY_REBIND_MIN_FRAMES = 2
 TARGET_CAMERA_READ_FAILURES = 10  # 连续读帧失败达到该次数即判定相机失效
 
-FREE_DROP_COUNT = 1  # 小车分配的单件选投目标，另有黄色必投1件，共2件
+FREE_DROP_COUNT = 0
 MANDATORY_DROP_COUNT = 1
 TOTAL_DROP_COUNT = FREE_DROP_COUNT + MANDATORY_DROP_COUNT
 # 投放槽位按 0°、72°、144°、216° 逆时针排列；对应实测 STM32 通道。
@@ -221,10 +220,9 @@ class MissionDeadline(RuntimeError):
 
 class MissionState(Enum):
     ROUTE_1 = "沿线飞行（右飞、前飞）"
-    FREE_DROP = "自由投掷"
     CENTER = "中心避障"
     MANDATORY_DROP = "必投投掷"
-    ROUTE_2 = "沿线飞行（后飞、右飞）"
+    RETURN_TO_A = "避障返回 A 点"
     DONE = "完成"
 
 
@@ -323,8 +321,8 @@ def _is_consecutive_visual_frame(observation: TargetObservation,
 class VisionInterface:
     """下视相机 + robocup_target 检测 + 目标身份跟踪。
 
-    poll() 抓一帧、识别四色同心目标，并把同一物理目标在连续帧之间关联到稳定的
-    target_id（形如 "red-3"），使 Mission._observation(target_id=...) 能持续锁定同一目标。
+    poll() 抓一帧、筛选黄色同心目标，并把同一物理目标在连续帧之间关联到稳定的
+    target_id（形如 "yellow-3"），使 Mission._observation(target_id=...) 能持续锁定同一目标。
     偏移定义与 TargetObservation 一致：+x 向前（画面正上）、+y 向左（画面正左）。
 
     约束：open() 之前不打开相机；poll() 只抓帧和推理，不阻塞等待、不发飞控命令；
@@ -341,12 +339,13 @@ class VisionInterface:
         self._next_track_id = 1
         self._frame_seq = 0
         self._read_failures = 0
-        self._enabled_colors = frozenset(FREE_COLORS + (MANDATORY_COLOR,))
+        self._enabled_colors = frozenset((MANDATORY_COLOR,))
 
     def set_allocation(self, allocation):
-        """Exclude zero-quota colors before tracking or publishing targets."""
-        self._enabled_colors = frozenset(
-            [MANDATORY_COLOR] + [color for color in FREE_COLORS if allocation[color] > 0])
+        """Only yellow may be tracked in the mandatory-only mission."""
+        if any(allocation[color] != 0 for color in FREE_COLORS):
+            raise ValueError("red/blue/green counts must all be zero")
+        self._enabled_colors = frozenset((MANDATORY_COLOR,))
         self._tracks.clear()
         logger.info('[RESCUE] Drone recognition colors={}', sorted(self._enabled_colors))
 
@@ -649,13 +648,13 @@ def validate_allocation(red: int, blue: int, green: int) -> Dict[str, int]:
            for value in counts.values()):
         raise ValueError("red/blue/green counts must be non-negative integers")
     if sum(counts.values()) != FREE_DROP_COUNT:
-        raise ValueError("free-target counts must total 1")
+        raise ValueError("red/blue/green counts must all be zero")
     return counts
 
 
 def build_routes(route_direction: str = "right",
                  transition_cm: Optional[float] = None) -> Tuple[List[Point], List[Point], List[Point]]:
-    """返回进入、中心、退出航迹；左行按同一组折返点反向推进。"""
+    """返回进入、中心、旧退出航迹；当前任务返 A 不使用旧退出航迹。"""
     if route_direction not in ("right", "left"):
         raise ValueError("route direction must be right or left")
     if transition_cm is None:
@@ -848,16 +847,15 @@ class Mission:
         self._nominal_center_start = self.center_route[0]
         self._nominal_center_exit = self.center_route[-1]
         self.route_index = {MissionState.ROUTE_1: 1,
-                            MissionState.CENTER: 1,
-                            MissionState.ROUTE_2: 1}
+                            MissionState.CENTER: 1}
         self.state = MissionState.ROUTE_1
-        self.free_origin = MissionState.ROUTE_1
-        self._completed_free_colors = set()
         self.target: Optional[TargetObservation] = None
         self._mandatory_rejected_target_id: Optional[str] = None
         self._mandatory_rejected_at: Optional[Point] = None
         self.deadline: Optional[float] = None
         self.landed = False
+        self.return_anchor_reached = False
+        self.mandatory_drop_ack_time: Optional[float] = None
         self._latest: Dict[str, TargetObservation] = {}
         self._vision_lock = threading.Lock()
         self._vision_stop = threading.Event()
@@ -921,7 +919,7 @@ class Mission:
                 now = time.monotonic()
                 with self._vision_lock:
                     for observation in observations:
-                        if (observation.color not in FREE_COLORS + (MANDATORY_COLOR,)
+                        if (observation.color != MANDATORY_COLOR
                                 or not observation.target_id
                                 or not math.isfinite(observation.offset_x_px)
                                 or not math.isfinite(observation.offset_y_px)
@@ -952,10 +950,9 @@ class Mission:
                           if now - obs.captured_at <= VISUAL_MAX_AGE
                           and (color is None or obs.color == color)
                           and (target_id is None or obs.target_id == target_id)
-                          and (color is not None or target_id is not None
-                              or (obs.color in FREE_COLORS
-                              and obs.color not in self._completed_free_colors
-                              and self.ledger.has_quota(obs.color)))]
+                           and (color is not None or target_id is not None
+                                or (obs.color == MANDATORY_COLOR
+                                    and self.ledger.has_quota(MANDATORY_COLOR)))]
         return max(candidates, key=lambda obs: obs.captured_at) if candidates else None
 
     def _vision_diagnostic(self, stage: str, observation: TargetObservation,
@@ -1094,15 +1091,11 @@ class Mission:
             # 避障给出新的中间航点，或完成中间航点后继续向原目标前进。
 
     def _follow_route(self, state: MissionState) -> Optional[TargetObservation]:
-        route = {MissionState.ROUTE_1: self._entry_path,
-                 MissionState.ROUTE_2: self.exit_route}[state]
+        route = self._entry_path
         while self.route_index[state] < len(route):
             self._check()
             goal = route[self.route_index[state]]
-            protected = (state is MissionState.ROUTE_2
-                         and self.route_index[state] == 1
-                         and not self._same_point(self.exit_route[0],
-                                                  self._nominal_center_exit))
+            protected = False
             # 沿线前飞到距名义入口 50 cm 的航点后，才检查入口交接段。
             if (state is MissionState.ROUTE_1
                     and self.route_index[state] == len(route) - 1):
@@ -1120,14 +1113,11 @@ class Mission:
                     logger.warning("[CENTER] Entry ends at inflation boundary {} "
                                    "instead of blocked center start {}",
                                    handoff, self._nominal_center_start)
-            observation = self._navigate_leg(
-                goal, detection="free", protected=protected)
-            if observation is not None:
-                return observation
+            self._navigate_leg(goal, protected=protected)
             self.route_index[state] += 1
         return None
 
-    def _escape_center_start(self) -> None:
+    def _escape_center_start(self, check_deadline: bool = True) -> None:
         """已在膨胀区时，只允许沿逐点通过 43 cm 净空检查的短线低速退出。"""
         if self.obstacle is None or not self.obstacle.point_is_inflated(self._position()):
             return
@@ -1140,7 +1130,7 @@ class Mission:
         escape_deadline = time.monotonic() + INFLATION_ESCAPE_TIMEOUT_S
         try:
             while self.obstacle.point_is_inflated(self._position()):
-                self._check()
+                self._check(check_deadline)
                 if time.monotonic() >= escape_deadline:
                     raise RuntimeError("route-3 inflation escape timed out")
                 current = self._position()
@@ -1175,17 +1165,15 @@ class Mission:
             if not self._same_point(self.center_route[-1], nominal):
                 logger.info("[CENTER] Nominal center exit {} clear again", nominal)
                 self.center_route[-1] = nominal
-                self.exit_route[0] = nominal
             return
         boundary = self.obstacle.boundary_crossing(
-            nominal, self.exit_route[1], entering=False)
+            nominal, self.entry_route[0], entering=False)
         if boundary is None or self.obstacle.point_is_inflated(boundary):
-            raise RuntimeError("no free center exit on following outer segment")
+            raise RuntimeError("no free center exit toward return anchor")
         if not self._same_point(self.center_route[-1], boundary):
-            logger.warning("[CENTER] Center exit {} inflated; move endpoint "
-                           "and outer return start to {}", nominal, boundary)
+            logger.warning("[CENTER] Center exit {} inflated; move search endpoint "
+                           "to safe return boundary {}", nominal, boundary)
         self.center_route[-1] = boundary
-        self.exit_route[0] = boundary
 
     def _start_center_path_with_fallback(self, waypoints: Sequence[Point]) -> threading.Thread:
         if self.obstacle is None:
@@ -1338,44 +1326,20 @@ class Mission:
     def _follow_center_route(self) -> Optional[TargetObservation]:
         return self._execute_center_route(detect_mandatory=True)
 
-    def _navigate_center_exit(self) -> None:
-        self._escape_center_start()
-        self._refresh_center_exit()
-        goal = self.exit_route[0]
-        logger.info("[MANDATORY] Exit toward {} outer return start: current={} goal={}",
-                    self.route_direction, self._position(), goal)
-        self.navi.stop_move()  # 完成全部必投后才恢复航迹导航 PID
-        self._navigate_leg(goal, protected=True)
-
-    def _enter_free_drop(self, origin: MissionState,
-                         target: TargetObservation) -> None:
-        if (origin not in (MissionState.ROUTE_1, MissionState.ROUTE_2)
-                or target.color not in FREE_COLORS
-                or target.color in self._completed_free_colors
-                or not self.ledger.has_quota(target.color)):
-            raise RuntimeError("free target cannot trigger another drop state")
-        self.free_origin = origin
-        self.target = target
-        self.state = MissionState.FREE_DROP
-
-    def _resume_route(self, state: MissionState) -> None:
-        if state is MissionState.CENTER:
-            self._resume_center_route()
-            return
-        route = {MissionState.ROUTE_1: self._entry_path,
-                 MissionState.ROUTE_2: self.exit_route}[state]
-        self._check()
-        projection = nearest_point_on_route(self._position(), route)
-        logger.info("[RESCUE] Return to {} segment {} at {}",
-                    state.value, projection.segment_index, projection.point)
-        protected = ((state is MissionState.ROUTE_1
-                      and projection.segment_index >= len(self.entry_route) - 1)
-                     or (state is MissionState.ROUTE_2
-                         and projection.segment_index == 0
-                         and not self._same_point(self.exit_route[0],
-                                                  self._nominal_center_exit)))
-        self._navigate_leg(projection.point, protected=protected)
-        self.route_index[state] = projection.segment_index + 1
+    def _navigate_return_anchor(self, check_deadline: bool = True) -> None:
+        self._check(check_deadline)
+        if self.navi.current_height < CRUISE_HEIGHT - 8.0:
+            self._set_height(CRUISE_HEIGHT, check_deadline=check_deadline,
+                             translation_only=True)
+        self._escape_center_start(check_deadline=check_deadline)
+        self.navi.stop_move()  # 清零视觉平移速度，恢复航迹导航 PID
+        logger.info("[RESCUE] Protected return from {} to A={}",
+                    self._position(), self.entry_route[0])
+        self._navigate_leg(self.entry_route[0], protected=True,
+                           check_deadline=check_deadline)
+        if not self._at_waypoint(self._position(), self.entry_route[0]):
+            raise RuntimeError("return anchor A was not reached")
+        self.return_anchor_reached = True
 
     def _resume_center_route(self) -> None:
         self._check()
@@ -1911,10 +1875,14 @@ class Mission:
     def _drop(self, color: str, target_id: str,
               position_confirmed: bool) -> None:
         self._check()
+        if color != MANDATORY_COLOR:
+            raise RuntimeError("only the mandatory yellow cargo may be released")
         if self._skip_unconfigured_drop(color):
-            return
+            raise RuntimeError("mandatory cargo mapping became unavailable")
         if self.payload is None:
             raise RuntimeError("payload missing")
+        if not self.ledger.has_quota(color):
+            raise RuntimeError("no remaining quota for {}".format(color))
         # Unknown/reused mechanisms fail before a cargo attempt is consumed.
         slot = slot_for_drop_attempt(self.ledger.next_drop_number)
         channel = STM32_CHANNEL_BY_SLOT[slot]
@@ -1922,11 +1890,10 @@ class Mission:
         logger.info("[DROP] Attempt {} slot={} stm32_channel={} target={} color={} position_confirmed={}",
                     drop_number, slot, channel, target_id, color, position_confirmed)
         self.payload.open_servo(channel)
+        ack_time = time.time()
         self.ledger.sent[color] += 1
+        self.mandatory_drop_ack_time = ack_time
         logger.info("[DROP] OPEN ACK stm32_channel={} (release not sensor-verified)", channel)
-        # 只在该颜色的指定投掷次数均已尝试后，禁止再次进入自由投掷。
-        if color in FREE_COLORS and not self.ledger.has_quota(color):
-            self._completed_free_colors.add(color)
 
     def _skip_unconfigured_drop(self, color):
         if drop_plan_ready():
@@ -1936,38 +1903,14 @@ class Mission:
             number = self.ledger.record_skip(color)
             logger.warning('[DROP SKIPPED] number={} color={}; installation/mapping unknown; no release',
                            number, color)
-        if color in FREE_COLORS:
-            self._completed_free_colors.add(color)
         return True
-
-    def _free_drop(self) -> None:
-        target = self.target
-        if target is None or target.color not in FREE_COLORS:
-            raise RuntimeError("free target missing")
-        if self._skip_unconfigured_drop(target.color):
-            self._resume_route(self.free_origin)
-            return
-        if self._approach_target(target, protected=False) is None:
-            self._resume_route(self.free_origin)
-            return
-        self._set_height(FREE_DROP_HEIGHT, preserve_horizontal_hold=True)
-        position_confirmed = self._wait_for_drop_position()
-        logger.info("[DROP] Release remaining {} cargo for target={} "
-                    "without low-altitude visual translation",
-                    target.color, target.target_id)
-        while self.ledger.has_quota(target.color):
-            self._check()
-            self._drop(target.color, target.target_id, position_confirmed)
-        self._set_height(CRUISE_HEIGHT)
-        self._resume_route(self.free_origin)
 
     def _mandatory_drop(self) -> bool:
         target = self.target
         if target is None or target.color != MANDATORY_COLOR:
             raise RuntimeError("mandatory target missing")
         if self._skip_unconfigured_drop(MANDATORY_COLOR):
-            self._navigate_center_exit()
-            return True
+            raise RuntimeError("mandatory cargo mapping became unavailable")
         boundary_result = self._mandatory_boundary_if_needed(target)
         if boundary_result is not None:
             return boundary_result
@@ -2015,7 +1958,6 @@ class Mission:
                 raise RuntimeError("mandatory drop pose lost clearance between releases")
             self._drop(MANDATORY_COLOR, target.target_id, position_confirmed)
         self._set_height(CRUISE_HEIGHT, translation_only=True)
-        self._navigate_center_exit()
         return True
 
     def _mandatory_boundary_if_needed(self,
@@ -2075,7 +2017,6 @@ class Mission:
                            aircraft, predicted_landing, miss_cm)
             self._drop(MANDATORY_COLOR, target.target_id, position_confirmed)
         self._set_height(CRUISE_HEIGHT, translation_only=True)
-        self._navigate_center_exit()
         return True
 
     def _estimate_target_world_xy(self, observation: TargetObservation) -> Point:
@@ -2141,55 +2082,37 @@ class Mission:
             while self.state is not MissionState.DONE:
                 self._check()
                 state_label = self.state.value
-                if self.route_direction == "left":
-                    if self.state is MissionState.ROUTE_1:
-                        state_label = "沿线飞行（左飞、前飞）"
-                    elif self.state is MissionState.ROUTE_2:
-                        state_label = "沿线飞行（后飞、左飞）"
+                if self.route_direction == "left" and self.state is MissionState.ROUTE_1:
+                    state_label = "沿线飞行（左飞、前飞）"
                 logger.info("[RESCUE] State: {}", state_label)
                 if self.state is MissionState.ROUTE_1:
-                    self.target = self._follow_route(self.state)
-                    if self.target is None:
-                        self.state = MissionState.CENTER
-                    else:
-                        self._enter_free_drop(self.state, self.target)
-                elif self.state is MissionState.FREE_DROP:
-                    self._free_drop()
-                    self.state = self.free_origin
+                    self._follow_route(self.state)
+                    self.state = MissionState.CENTER
                 elif self.state is MissionState.CENTER:
                     self.target = self._follow_center_route()
                     if self.target is None:
                         logger.warning("[RESCUE] Mandatory yellow target not found")
-                        self.state = MissionState.ROUTE_2
+                        self.state = MissionState.RETURN_TO_A
                     else:
                         if self.target.color != MANDATORY_COLOR:
                             raise RuntimeError("mandatory drop requires a yellow target")
                         self.state = MissionState.MANDATORY_DROP
                 elif self.state is MissionState.MANDATORY_DROP:
-                    self.state = (MissionState.ROUTE_2 if self._mandatory_drop()
+                    self.state = (MissionState.RETURN_TO_A if self._mandatory_drop()
                                   else MissionState.CENTER)
-                elif self.state is MissionState.ROUTE_2:
-                    self.target = self._follow_route(self.state)
-                    if self.target is None:
-                        self.state = MissionState.DONE
-                    else:
-                        self._enter_free_drop(self.state, self.target)
-
-            if any(self.ledger.remaining.values()):
-                logger.warning("[RESCUE] Free cargo left unattempted: {}",
-                               self.ledger.remaining)
-            self._return_and_land()
+                elif self.state is MissionState.RETURN_TO_A:
+                    self._navigate_return_anchor()
+                    self._return_and_land(check_deadline=False, protected=True)
+                    self.state = MissionState.DONE
         except MissionDeadline:
-            logger.warning("[RESCUE] Deadline reached; stop search and return")
+            logger.warning("[RESCUE] Deadline reached; abort search and recover via A")
             self.navi.navigation_stop_here()
-            if any(self.ledger.remaining.values()):
-                logger.warning("[RESCUE] Free cargo left unattempted: {}",
-                               self.ledger.remaining)
             if not self.navi.pose_is_fresh():
                 raise
-            protected = self.state in (MissionState.CENTER,
-                                       MissionState.MANDATORY_DROP)
-            self._return_and_land(check_deadline=False, protected=protected)
+            if not self.return_anchor_reached:
+                self._navigate_return_anchor(check_deadline=False)
+            self._return_and_land(check_deadline=False, protected=True)
+            raise MissionDeadline("mission deadline recovery completed via A")
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -2206,11 +2129,11 @@ class Mission:
                 self.navi.stop()
 
     def log_drop_summary(self) -> None:
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        for color, name in (("red", "红"), ("yellow", "黄"),
-                            ("blue", "蓝"), ("green", "绿")):
-            logger.opt(raw=True).info("{} 无人机 {}目标区 投放{}个货物\n".format(
-                timestamp, name, self.ledger.sent[color]))
+        timestamp = (time.strftime("%Y-%m-%d %H:%M:%S",
+                                   time.localtime(self.mandatory_drop_ack_time))
+                     if self.mandatory_drop_ack_time is not None else "未投放")
+        logger.opt(raw=True).info("{} 无人机 黄目标区 投放{}个货物\n".format(
+            timestamp, self.ledger.sent[MANDATORY_COLOR]))
 
 
 def emergency_land(fc: FC_Like) -> bool:
@@ -2246,7 +2169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confirm-flight", action="store_true",
                         help="启用真实飞行；默认仅监视 LIO 位姿")
     parser.add_argument("--route-direction", choices=("right", "left"),
-                        default="right", help="任务航迹方向，默认 right（航迹 1→3→2）")
+                        default="right", help="任务航迹方向，默认 right（航迹 1→3→A→O）")
     parser.add_argument("--fc-host", default=FC_SERVER_HOST,
                         help="FC_Server 地址；机上自启动服务默认在本机")
     parser.add_argument("--fc-server-port", type=int, default=FC_SERVER_PORT,
@@ -2258,35 +2181,12 @@ def parse_args() -> argparse.Namespace:
                         help="记录每次目标观测年龄、指令和跳变相邻帧；默认开启")
     parser.add_argument("--no-vision-diagnostics", dest="vision_diagnostics",
                         action="store_false", help="关闭逐帧视觉诊断日志")
-    parser.add_argument("--red-count", type=int)
-    parser.add_argument("--blue-count", type=int)
-    parser.add_argument("--green-count", type=int)
-    control = parser.add_mutually_exclusive_group()
-    control.add_argument("--car-control", action="store_true", default=True,
-                         help="默认使用小车 FleetBus 实际配额及启动请求，经 FC_Server/飞控 UART2")
-    control.add_argument("--manual-control", dest="car_control", action="store_false",
-                         help="从命令行读取红蓝绿数量，并等待终端 start_mission")
     args = parser.parse_args()
     if args.fc_port is not None:
         parser.error("--fc-port cannot be used while FC_Server owns the serial port; "
                      "use --fc-host and --fc-server-port")
     if not 1 <= args.fc_server_port <= 65535:
         parser.error("--fc-server-port must be between 1 and 65535")
-    if args.car_control and FREE_DROP_COUNT != 1:
-        parser.error("--car-control requires the competition's one free-drop item; "
-                     "it is unavailable in altered-quota test entries")
-    if args.car_control and any(count is not None for count in (
-            args.red_count, args.blue_count, args.green_count)):
-        parser.error("--car-control receives counts from the car; do not supply CLI counts")
-    if args.confirm_flight and not args.car_control:
-        if any(count is None for count in (
-                args.red_count, args.blue_count, args.green_count)):
-            parser.error("--confirm-flight requires --red-count, --blue-count "
-                         "and --green-count; their sum must be 1")
-        try:
-            validate_allocation(args.red_count, args.blue_count, args.green_count)
-        except ValueError as exc:
-            parser.error(str(exc))
     return args
 
 
@@ -2303,17 +2203,8 @@ def require_flight_interfaces(vision: VisionInterface,
                            + ", ".join(missing))
 
 
-def wait_for_start_command() -> None:
-    logger.warning("[RESCUE] Enter start_mission to take off")
-    while True:
-        command = input("[RESCUE] start_mission> ")
-        if command == "start_mission":
-            return
-        logger.warning("[RESCUE] Ignored command; enter exactly start_mission")
-
-
 def wait_for_operator_command(expected: str, stop_event: threading.Event) -> None:
-    """Read a confirmation from a real terminal while remaining responsive to STOP."""
+    """Read a terminal confirmation while remaining responsive to local stop."""
     logger.warning("[RESCUE] Enter {} in this terminal to continue", expected)
     while not stop_event.is_set():
         ready, _, _ = select.select([sys.stdin], [], [], 0.2)
@@ -2361,20 +2252,14 @@ def main() -> int:
     vision = None
     obstacle = None
     obstacle_planner = None
-    fleet_node = None
-    task_receiver = None
-    preflight_result = None
-
     try:
         if args.confirm_flight:
             if not 1 <= TOTAL_DROP_COUNT <= PAYLOAD_COUNT:
                 raise RuntimeError("drop count exceeds available servo payload slots")
             if not sys.stdin.isatty():
                 raise RuntimeError("loaded/position_ok require an interactive terminal")
-            if not args.car_control:
-                allocation = validate_allocation(
-                    args.red_count, args.blue_count, args.green_count)
             vision = VisionInterface()
+            vision.set_allocation(allocation)
             obstacle_planner = ObstaclePlanner2D()
             obstacle = ObstacleInterface(obstacle_planner)
             require_flight_interfaces(vision, obstacle)
@@ -2427,36 +2312,15 @@ def main() -> int:
                           route_direction=getattr(args, "route_direction", "right"))
         if args.confirm_flight:
             mission.prepare_navigation(remap_ready=True)
-            if not args.car_control:
-                logger.warning("[RESCUE] FAST-LIO 位姿重建成功")
-        if args.car_control:
-            from fleet_bus.rescue_task import attach_rescue_fleet_node
-            fleet_node, task_receiver = attach_rescue_fleet_node(
-                fc, navi, stop_event, allow_start=args.confirm_flight, payload=payload,
-                validate_plan=mission.validate_payload_ready,
-                preflight_result=preflight_result)
-            if args.confirm_flight:
-                logger.warning("[RESCUE] FAST-LIO 位姿重建成功；无线接收已就绪，现在可启动小车")
-            else:
-                logger.info("[RESCUE] Waiting for car task information and matching START")
-            if not args.confirm_flight:
-                mission.prepare_navigation()
-                mission.monitor_pose()
-                return 0
-            task = task_receiver.wait_for_start()
-            allocation = validate_allocation(task.red, task.blue, task.green)
-            mission.ledger = DropLedger(allocation)
-            mission.prepare_navigation(remap_ready=task_receiver.remap_state == 'ready')
-            logger.info("[RESCUE] Car task {} allocation {}", task.task_id, allocation)
+            if not mission.validate_payload_ready():
+                raise RuntimeError("mandatory cargo release plan is not ready")
+            if not fc.state.is_fresh(0.5) or fc.state.unlock.value:
+                raise RuntimeError("FC lock/telemetry lost before takeoff")
+            logger.warning("[RESCUE] FAST-LIO 位姿重建及飞前检查成功，开始黄色必投任务")
         else:
-            if not args.confirm_flight:
-                mission.prepare_navigation()
-            if not args.confirm_flight:
-                mission.monitor_pose()
-                return 0
-            mission.validate_payload_ready()
-            wait_for_start_command()
-        vision.set_allocation(allocation)
+            mission.prepare_navigation()
+            mission.monitor_pose()
+            return 0
         mission.deadline = time.monotonic() + MISSION_TIMEOUT
         mission._check()
         takeoff_attempted = True
@@ -2499,13 +2363,6 @@ def main() -> int:
             except Exception:
                 logger.exception("[RESCUE] Payload state check or OPEN failed")
 
-        if task_receiver is not None and not task_receiver.join_remap(timeout=35.0):
-            logger.error("[RESCUE] Remap cancellation pending; no navigation reuse")
-        if fleet_node is not None:
-            try:
-                fleet_node.close()
-            except Exception:
-                logger.exception("[RESCUE] Failed to close car task receiver")
         if mission is not None:
             try:
                 mission.stop()

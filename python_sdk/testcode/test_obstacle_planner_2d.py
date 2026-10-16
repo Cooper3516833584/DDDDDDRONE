@@ -96,6 +96,9 @@ class DirectionalRoutesOfflineTests(unittest.TestCase):
         self.assertEqual(right_exit, [(480.0, 355.0), (100.0, 355.0), (100.0, 0.0)])
         self.assertEqual(left_exit, [(480.0, -360.0), (100.0, -360.0), (100.0, 0.0)])
         self.assertEqual(len(right_center), len(left_center))
+        self.assertEqual(len(right_center), 10)
+        self.assertEqual(right_center[-1], (480.0, 355.0))
+        self.assertEqual(left_center[-1], (480.0, -360.0))
         self.assertEqual([point[0] for point in right_center],
                          [point[0] for point in left_center])
         for right, left in zip(right_center, left_center):
@@ -525,14 +528,16 @@ class MissionVelocityTests(unittest.TestCase):
                           "VISUAL_NEAR_CENTER_RADIUS_PX": 100.0,
                           "VISUAL_JUMP_THRESHOLD_PX": 45.0,
                           "VISUAL_JUMP_CONFIRM_MAX_GAP_S": 0.65,
-                          "LOW_CALIBRATION_CENTER_FRAMES": 2}
+                           "LOW_CALIBRATION_CENTER_FRAMES": 2,
+                           "CRUISE_HEIGHT": 150.0}
         exec(compile(tree, str(source), "exec"), self.namespace)
         cls = load_class("rescue_drop_2026.py", "Mission",
-                         names={"_move_translation_only", "_move_toward", "_position",
-                                "_calibrate_low", "_set_height", "_navigate_center_exit"},
+                          names={"_move_translation_only", "_move_toward", "_position",
+                                 "_calibrate_low", "_set_height", "_navigate_return_anchor"},
                          namespace=self.namespace)
         self.mission = cls()
-        self.mission.navi = Mock(current_x=30.0, current_y=40.0, current_yaw=90.0)
+        self.mission.navi = Mock(current_x=30.0, current_y=40.0,
+                                 current_yaw=90.0, current_height=150.0)
         self.mission.obstacle = Mock()
         self.observation = SimpleNamespace(offset_x_px=100.0, offset_y_px=0.0)
 
@@ -587,7 +592,7 @@ class MissionVelocityTests(unittest.TestCase):
             self.mission._move_toward(self.observation, protected=True)
         self.mission.navi.move_by_direction.assert_not_called()
 
-    def test_mandatory_height_keeps_yaw_zero_then_exit_restores_navigation(self):
+    def test_mandatory_height_keeps_yaw_zero_then_return_restores_navigation(self):
         mission = self.mission
         self.namespace["logger"] = Mock()
         mission._check = Mock()
@@ -598,15 +603,16 @@ class MissionVelocityTests(unittest.TestCase):
         mission.navi.stop_move.assert_not_called()
         mission.navi.set_height.assert_called_once_with(100.0)
 
-        mission.route_2 = [(200.0, 160.0)]
-        mission.exit_route = mission.route_2
-        mission.route_direction = "right"
+        mission.entry_route = [(100.0, 0.0)]
         mission._navigate_leg = Mock()
         mission._escape_center_start = Mock()
-        mission._refresh_center_exit = Mock()
-        mission._navigate_center_exit()
+        mission._at_waypoint = Mock(return_value=True)
+        mission.return_anchor_reached = False
+        mission._navigate_return_anchor()
         mission.navi.stop_move.assert_called_once()
-        mission._navigate_leg.assert_called_once_with((200.0, 160.0), protected=True)
+        mission._navigate_leg.assert_called_once_with(
+            (100.0, 0.0), protected=True, check_deadline=True)
+        self.assertTrue(mission.return_anchor_reached)
 
     def test_consecutive_mandatory_calibration_timeouts_never_restore_yaw_pid(self):
         clock = SimpleNamespace(now=0.0)
@@ -785,32 +791,6 @@ class VisualApproachTests(unittest.TestCase):
                 np.testing.assert_allclose(
                     group(numbers, height, (640, 480)),
                     ((first[0] + second[0]) / 2, (first[1] + second[1]) / 2))
-
-    def test_two_free_cargo_drop_together_after_one_position_wait(self):
-        cls = load_class("rescue_drop_2026.py", "Mission",
-                         names={"_free_drop"}, namespace=self.namespace)
-        mission = cls()
-        mission._skip_unconfigured_drop=Mock(return_value=False)
-        mission.target = SimpleNamespace(target_id="blue-1", color="blue")
-        mission.free_origin = "route-1"
-        mission.ledger = SimpleNamespace(remaining={"blue": 2})
-        mission.ledger.has_quota = lambda color: mission.ledger.remaining[color] > 0
-        mission._approach_target = Mock(return_value=mission.target)
-        mission._set_height = Mock()
-        mission._wait_for_drop_position = Mock(return_value=False)
-        mission._check = Mock()
-        mission._calibrate_low = Mock()
-        mission._drop = Mock(side_effect=lambda *args: mission.ledger.remaining.__setitem__(
-            "blue", mission.ledger.remaining["blue"] - 1))
-        mission._resume_route = Mock()
-        mission._free_drop()
-        self.assertEqual([call.args[0] for call in mission._set_height.call_args_list],
-                         [10.0, 150.0])
-        mission._wait_for_drop_position.assert_called_once_with()
-        mission._calibrate_low.assert_not_called()
-        self.assertEqual(mission._drop.call_args_list,
-                         [(("blue", "blue-1", False), {}),
-                          (("blue", "blue-1", False), {})])
 
     def test_low_drop_wait_keeps_pid_target_and_five_cm_per_axis_limit(self):
         clock = SimpleNamespace(now=0.0)
@@ -1070,8 +1050,8 @@ class CenterMissionOfflineTests(unittest.TestCase):
             "_desired_aircraft_group_drop_pose", "_pending_drop_numbers",
             "_mandatory_drop", "_mandatory_boundary_if_needed",
             "_mark_mandatory_pose_rejected", "_refresh_center_exit", "_follow_route",
-            "_escape_center_start", "_resume_route", "_resume_center_route",
-            "_navigate_center_exit",
+            "_escape_center_start", "_resume_center_route",
+            "_navigate_return_anchor",
             "_mandatory_observation_allowed", "_start_center_path_with_fallback",
             "_at_waypoint", "_same_point", "_execute_center_route",
             "_update_center_route_progress",
@@ -1080,6 +1060,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         self.mission._skip_unconfigured_drop=Mock(return_value=False)
         self.mission.navi = Mock(current_x=200.0, current_y=0.0,
                                  current_yaw=0.0, current_height=150.0)
+        self.mission.entry_route = [(100.0, 0.0)]
         self.mission.navi.height_pid.setpoint = 150.0
         self.mission.vision = Mock(frame_size=(640, 480))
         self.mission.obstacle = Mock()
@@ -1101,7 +1082,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         self.mission._drop = Mock(side_effect=lambda *args: setattr(
             self.mission.ledger, "mandatory_remaining",
             self.mission.ledger.mandatory_remaining - 1))
-        self.mission._navigate_center_exit = Mock()
+        self.mission._navigate_return_anchor = Mock()
 
     def test_blocked_drop_pose_never_descends_or_drops(self):
         mission = self.mission
@@ -1132,7 +1113,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission._calibrate_low.assert_not_called()
         mission._wait_for_drop_position.assert_called_once_with()
         mission._drop.assert_called_once_with("yellow", "yellow-1", False)
-        mission._navigate_center_exit.assert_called_once()
+        mission._navigate_return_anchor.assert_not_called()
 
     def test_two_yellow_use_midpoint_clearance_and_drop_without_reposition(self):
         mission = self.mission
@@ -1174,7 +1155,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in mission._set_height.call_args_list],
                          [60.0, 150.0])
 
-    def test_center_exit_migration_is_shared_with_route_two(self):
+    def test_right_center_endpoint_uses_return_anchor_boundary(self):
         mission = self.mission
         mission._refresh_center_exit = type(mission)._refresh_center_exit.__get__(mission)
         mission._nominal_center_exit = (200.0, 157.0)
@@ -1187,16 +1168,16 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission.obstacle.boundary_crossing.return_value = (150.0, 157.0)
         mission._refresh_center_exit()
         self.assertEqual(mission.route_3[-1], (150.0, 157.0))
-        self.assertEqual(mission.route_2[0], mission.route_3[-1])
+        self.assertEqual(mission.route_2[0], (200.0, 157.0))
         mission.obstacle.boundary_crossing.assert_called_once_with(
-            (200.0, 157.0), (0.0, 157.0), entering=False)
+            (200.0, 157.0), (100.0, 0.0), entering=False)
         mission.obstacle.point_is_inflated.side_effect = None
         mission.obstacle.point_is_inflated.return_value = False
         mission._refresh_center_exit()
         self.assertEqual(mission.route_3[-1], (200.0, 157.0))
         self.assertEqual(mission.route_2[0], mission.route_3[-1])
 
-    def test_left_center_exit_migration_targets_route_five(self):
+    def test_left_center_endpoint_uses_return_anchor_boundary(self):
         mission = self.mission
         mission._refresh_center_exit = type(mission)._refresh_center_exit.__get__(mission)
         mission._nominal_center_exit = (200.0, -160.0)
@@ -1207,9 +1188,9 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission.obstacle.boundary_crossing.return_value = (150.0, -160.0)
         mission._refresh_center_exit()
         self.assertEqual(mission.center_route[-1], (150.0, -160.0))
-        self.assertEqual(mission.exit_route[0], (150.0, -160.0))
+        self.assertEqual(mission.exit_route[0], (200.0, -160.0))
         mission.obstacle.boundary_crossing.assert_called_once_with(
-            (200.0, -160.0), (0.0, -160.0), entering=False)
+            (200.0, -160.0), (100.0, 0.0), entering=False)
 
     def test_inflation_escape_timeout_sends_zero_speed(self):
         mission = self.mission
@@ -1223,21 +1204,37 @@ class CenterMissionOfflineTests(unittest.TestCase):
                 mission._escape_center_start()
         mission._move_translation_only.assert_called_once_with(0.0, 0.0)
 
-    def test_shifted_route_two_first_leg_uses_obstacle_planning(self):
+    def test_return_anchor_requires_confirmed_arrival(self):
         mission = self.mission
-        route_one, route_two, center = object(), object(), object()
-        self.namespace["MissionState"] = SimpleNamespace(
-            ROUTE_1=route_one, ROUTE_2=route_two, CENTER=center)
-        mission.route_1 = [(0.0, 0.0)]
-        mission.route_2 = [(150.0, 157.0), (0.0, 157.0), (0.0, 0.0)]
-        mission._entry_path = mission.route_1
-        mission.exit_route = mission.route_2
-        mission.route_index = {route_two: 1}
-        mission._nominal_center_exit = (200.0, 157.0)
-        mission._navigate_leg = Mock(return_value=None)
-        self.assertIsNone(mission._follow_route(route_two))
-        mission._navigate_leg.assert_any_call(
-            (0.0, 157.0), detection="free", protected=True)
+        mission._navigate_return_anchor = type(mission)._navigate_return_anchor.__get__(mission)
+        mission._navigate_leg = Mock()
+        mission.return_anchor_reached = False
+        with self.assertRaisesRegex(RuntimeError, "was not reached"):
+            mission._navigate_return_anchor()
+        self.assertFalse(mission.return_anchor_reached)
+        mission._navigate_leg.assert_called_once_with(
+            (100.0, 0.0), protected=True, check_deadline=True)
+        mission._navigate_leg.reset_mock()
+        mission.navi.current_x, mission.navi.current_y = 100.0, 0.0
+        mission._navigate_return_anchor()
+        self.assertTrue(mission.return_anchor_reached)
+
+    def test_deadline_return_restores_cruise_height_before_horizontal_navigation(self):
+        mission = self.mission
+        mission._navigate_return_anchor = type(mission)._navigate_return_anchor.__get__(mission)
+        mission.navi.current_height = 60.0
+        events = []
+        mission._set_height = Mock(side_effect=lambda *args, **kwargs: events.append("height"))
+        mission._escape_center_start.side_effect = lambda **kwargs: events.append("escape")
+        def arrive(goal, **kwargs):
+            events.append("navigate")
+            mission.navi.current_x, mission.navi.current_y = goal
+        mission._navigate_leg = Mock(side_effect=arrive)
+        mission._navigate_return_anchor(check_deadline=False)
+        self.assertEqual(events, ["height", "escape", "navigate"])
+        mission._set_height.assert_called_once_with(
+            150.0, check_deadline=False, translation_only=True)
+        self.assertTrue(mission.return_anchor_reached)
 
     def test_route_one_hands_off_before_blocked_center_start(self):
         mission = self.mission
@@ -1258,7 +1255,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         self.assertIsNone(mission._follow_route(route_one))
         self.assertEqual(mission._entry_path[-1], (150.0, -160.0))
         mission._navigate_leg.assert_called_once_with(
-            (150.0, -160.0), detection="free", protected=True)
+            (150.0, -160.0), protected=True)
 
     def test_left_entry_hands_off_before_blocked_center_start(self):
         mission = self.mission
@@ -1279,7 +1276,7 @@ class CenterMissionOfflineTests(unittest.TestCase):
         mission.obstacle.boundary_crossing.assert_called_once_with(
             (150.0, 157.0), (200.0, 157.0), entering=True)
         mission._navigate_leg.assert_called_once_with(
-            (175.0, 157.0), detection="free", protected=True)
+            (175.0, 157.0), protected=True)
 
     def test_entry_lookahead_starts_after_transition_waypoint_on_both_sides(self):
         for side_y in (-160.0, 157.0):
@@ -1309,41 +1306,11 @@ class CenterMissionOfflineTests(unittest.TestCase):
                 self.assertEqual(mission._navigate_leg.call_args_list[0][0],
                                  ((150.0, side_y),))
                 self.assertEqual(mission._navigate_leg.call_args_list[0][1],
-                                 {"detection": "free", "protected": False})
+                                 {"protected": False})
                 mission.obstacle.boundary_crossing.assert_called_once_with(
                     (150.0, side_y), (200.0, side_y), entering=True)
                 mission._navigate_leg.assert_any_call(
-                    (175.0, side_y), detection="free", protected=True)
-
-    def test_left_free_return_projects_to_active_route_and_mandatory_exit_uses_route_five(self):
-        mission = self.mission
-        entry = type("Stage", (), {"value": "entry"})()
-        outer_return = type("Stage", (), {"value": "outer return"})()
-        center = object()
-        self.namespace["MissionState"] = SimpleNamespace(
-            ROUTE_1=entry, ROUTE_2=outer_return, CENTER=center)
-        projection = SimpleNamespace(point=(180.0, 157.0), segment_index=2)
-        nearest = Mock(return_value=projection)
-        self.namespace["nearest_point_on_route"] = nearest
-        mission.entry_route = [(0.0, 0.0), (0.0, 157.0), (150.0, 157.0)]
-        mission._entry_path = mission.entry_route + [(200.0, 157.0)]
-        mission.exit_route = [(200.0, -160.0), (0.0, -160.0), (0.0, 0.0)]
-        mission._nominal_center_exit = (200.0, -160.0)
-        mission.route_direction = "left"
-        mission.route_index = {entry: 1, outer_return: 1}
-        mission._navigate_leg = Mock()
-        mission._resume_route(entry)
-        nearest.assert_called_once_with((200.0, 0.0), mission._entry_path)
-        self.assertEqual(mission.route_index[entry], 3)
-        mission._navigate_leg.assert_called_once_with(
-            (180.0, 157.0), protected=True)
-        mission._resume_route(outer_return)
-        self.assertIs(nearest.call_args.args[1], mission.exit_route)
-        mission._escape_center_start = Mock()
-        mission._refresh_center_exit = Mock()
-        mission._navigate_center_exit = type(mission)._navigate_center_exit.__get__(mission)
-        mission._navigate_center_exit()
-        mission._navigate_leg.assert_any_call((200.0, -160.0), protected=True)
+                    (175.0, side_y), protected=True)
 
     def test_payload_sequence_and_yaw_change_desired_pose(self):
         mission = self.mission

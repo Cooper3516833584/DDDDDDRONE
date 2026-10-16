@@ -1,4 +1,4 @@
-"""Four SG90 output positions; two installed for this task. Writes do not confirm shaft position."""
+"""Four SG90 output positions; one installed for this task. Writes do not confirm shaft position."""
 import math
 import threading
 import logging
@@ -14,8 +14,8 @@ SERVO_BODY_POSITIONS_CM = tuple(
     (PAYLOAD_RADIUS_CM * math.cos(math.radians(angle)),
      PAYLOAD_RADIUS_CM * math.sin(math.radians(angle)))
     for angle in PAYLOAD_ANGLES_DEG)
-DROP_SERVO_SEQUENCE = (0, 2)  # installed: 0° then 144°
-PAYLOAD_COUNT = 2
+DROP_SERVO_SEQUENCE = (0,)  # installed: 0° only
+PAYLOAD_COUNT = 1
 LOG = logging.getLogger(__name__)
 
 
@@ -26,7 +26,7 @@ def drop_plan_ready():
 
 def slot_for_drop_attempt(drop_number):
     if isinstance(drop_number, bool) or not isinstance(drop_number, int) or not 1 <= drop_number <= PAYLOAD_COUNT:
-        raise ValueError("drop number must be 1..2")
+        raise ValueError("drop number must be 1..1")
     slot = DROP_SERVO_SEQUENCE[drop_number - 1]
     if isinstance(slot, bool) or not isinstance(slot, int) or slot not in SERVO_CHANNELS:
         raise RuntimeError("physical release mapping is unknown for drop %d" % drop_number)
@@ -46,10 +46,10 @@ def payload_offset_body_cm(drop_number):
 
 def validate_drop_plan():
     if not drop_plan_ready():
-        LOG.warning('PAYLOAD SKIPPED: two-cargo release mapping/positions are unconfigured')
+        LOG.warning('PAYLOAD SKIPPED: single-cargo release mapping/position is unconfigured')
         return False
     if len(DROP_SERVO_SEQUENCE) != PAYLOAD_COUNT or len(SERVO_BODY_POSITIONS_CM) != len(SERVO_CHANNELS):
-        raise ValueError('two-cargo release plan must map to the four physical positions')
+        raise ValueError('single-cargo release plan must map to the four physical positions')
     for number in range(1, PAYLOAD_COUNT + 1):
         payload_offset_body_cm(number)
     return True
