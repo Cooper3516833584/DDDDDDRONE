@@ -34,6 +34,7 @@ htmlcov/
 /python_sdk/.d_task_dispatcher.lock
 
 # Hardware-debug artifacts
+*.uvguix.*
 /python_sdk/radar_resolve_debug.png
 /video*_*.jpg
 
